@@ -83,8 +83,12 @@
 
       <div class="pane-head">
         <h2 id="form-title">Custom run</h2>
-        <button type="button" class="link" id="reset-btn" title="Discard edits and use the .env values">Reset to .env</button>
+        <span class="head-actions">
+          <button type="button" class="link" id="save-env-btn" title="Write your changes to this sandbox's settings in .env" hidden>Save to .env</button>
+          <button type="button" class="link" id="reset-btn" title="Discard edits and use the .env values">Reset to .env</button>
+        </span>
       </div>
+      <p id="save-env-msg" class="hint" hidden></p>
       <div id="version-bar">
         <span id="gw-version" class="muted">AI Gateway version: not checked yet</span>
         <button type="button" class="small-btn" id="version-btn" title="GET /v1/info on the gateway">Check version</button>

@@ -123,6 +123,10 @@ cp .env.example .env && $EDITOR .env      # sandboxes and defaults; .env is git-
 npm start                                 # http://127.0.0.1:4545 (set PORT to change it)
 ```
 
+If the port is in use (for example by another copy of the UI), the server tries the next ones, up to 20, and prints the address it ended up on. It then opens that address in your default browser; set `NO_OPEN=1` to skip that.
+
+On the first start without a `.env`, the server creates one from `.env.example` (mode 600); edit it to add your sandboxes.
+
 - **`.env`:** lists the sandboxes and fills the form, and is re-read on every request.
   - **Sandboxes:** every `<name>.config.json` in `AIGW_CONFIG_DIR` becomes a sandbox. Names in `SANDBOXES` are added too.
   - **Defaults:** bare keys (`REGION`, `CP_USER`, `SCOPE`, `MODE`, `API_KEY_SOURCE`, `MODELS`, …) apply to every sandbox. `<NAME>_<KEY>` sets one sandbox, for example `MY_SANDBOX_TENANT_ID` or `MY_SANDBOX_CP_URL`. See `.env.example`.
@@ -130,6 +134,7 @@ npm start                                 # http://127.0.0.1:4545 (set PORT to c
 - **Layout:** three panes, each scrolling on its own.
   - **Left:** the sandboxes, with the status and counts of each one's last run.
   - **Middle:** the run form. It is filled from `.env`, then your edits, which are kept per sandbox in the browser. **Reset to .env** discards your edits.
+  - **Save to .env:** writes your changes back as that sandbox's `<NAME>_*` keys, including a password or API key you typed. Existing lines are updated in place, a cleared field removes its line, and the previous file is kept as `.env.bak`. Values are checked like run options, so a save can't add other lines.
   - **Right:** the results, with one card per step and a PASS/WARN/FAIL line for each check. The commands and output are folded underneath, and fix commands are shown expanded. Step 7 lists every model request with its question, answer, `X-Cache`, HTTP status and latency. **Problems only** hides the passing checks, and **Raw output** shows the doctor's text.
 - **AI Gateway version:** the version reported by the sandbox's latest run is shown under its title and in the sandbox list. **Check version** fetches it live from `GET /v1/info`, using the same gateway URL and API key as the Playground.
 - **Fleet Manager:** a sandbox's AI gateway config can be downloaded from its Fleet Manager, `https://fm.<env>.<domain>/`. A link appears under the Config file field, on the Config tab and in the Add sandbox form.

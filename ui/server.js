@@ -21,7 +21,9 @@ const SCRIPT = path.resolve(HERE, '..', 'aigw-doctor.sh');
 const PUBLIC_DIR = path.join(HERE, 'public');
 const ENV_FILE = path.resolve(process.env.ENV_FILE || path.join(HERE, '.env'));
 const HOST = '127.0.0.1';
-const PORT = Number(process.env.PORT || 4545);
+const FIRST_PORT = Number(process.env.PORT || 4545);
+const PORT_TRIES = 20; // if the port is taken, try the next ones
+let PORT = FIRST_PORT; // the port actually listened on
 const MAX_BODY = 64 * 1024;
 const MAX_CONFIG_BODY = 2 * 1024 * 1024; // adding a sandbox may upload its config.json
 const DEFAULT_CONFIG_DIR = '~/.aigw-doctor/configs';
@@ -280,6 +282,80 @@ function addSandbox(body) {
   text = `${text.replace(/\n*$/, '')}${text ? '\n\n' : ''}${block}\n`;
   fs.writeFileSync(ENV_FILE, text, { mode: 0o600 });
   return { name, config: configFile };
+}
+
+// ---------- saving form settings to .env ----------
+
+// What each saved field may hold (the run options' patterns, plus the choice fields).
+const SAVE_RULES = {
+  ...Object.fromEntries(Object.entries(OPTIONS).map(([field, [, pattern]]) => [field, pattern])),
+  config: /^[^\s"'#]+$/,
+  apiKeyFile: /^[^\s"'#]+$/,
+  keySource: /^(create|file|paste)$/,
+  scope: /^(all|inference|infra)$/,
+  mode: /^(check|dry-run)$/,
+};
+const FIELD_KEYS = Object.fromEntries(Object.entries(ENV_FIELDS).map(([key, field]) => [field, key]));
+
+// saveSettings: write a sandbox's changed form fields to .env as <NAME>_<KEY> lines. A line
+// already there is replaced in place; new ones join the sandbox's other lines (or a new
+// block); an empty value removes the line so the default applies. The old file is kept
+// as .env.bak.
+function saveSettings(body) {
+  const sandbox = String(body.sandbox || '');
+  if (!SANDBOX_NAME.test(sandbox)) throw new Error('pick a sandbox to save its settings');
+  const prefix = envPrefix(sandbox);
+  const updates = new Map(); // .env key -> value ('' removes)
+  for (const [field, raw] of Object.entries(body.values || {})) {
+    const key = FIELD_KEYS[field];
+    if (!key) continue;
+    const value = String(raw ?? '').trim();
+    if (value && !SAVE_RULES[field]?.test(value)) throw new Error(`invalid ${field}: ${value}`);
+    if (field === 'config' && value) existingFile(value, 'config');
+    updates.set(`${prefix}_${key}`, value);
+  }
+  // Secrets only when typed; .env is git-ignored and mode 600.
+  for (const [field, key] of [['cpPassword', 'CP_PASSWORD'], ['apiKey', 'AIGW_API_KEY']]) {
+    const value = typeof body[field] === 'string' ? body[field] : '';
+    if (!value) continue;
+    if (/[\r\n]/.test(value)) throw new Error(`${field} cannot contain line breaks`);
+    updates.set(`${prefix}_${key}`, value);
+  }
+  if (!updates.size) return { saved: [] };
+
+  // Plain when safe, else quoted with the quote kind the value doesn't contain (the .env
+  // reader takes quoted values literally), so a password is saved exactly as typed.
+  const quote = (v) => {
+    if (/^[^\s"'#\\]*$/.test(v)) return v;
+    if (!v.includes("'")) return `'${v}'`;
+    if (!v.includes('"')) return `"${v}"`;
+    throw new Error('a value with both \' and " cannot be saved; edit .env by hand');
+  };
+  const lines = fs.existsSync(ENV_FILE) ? fs.readFileSync(ENV_FILE, 'utf8').replace(/\n+$/, '').split('\n') : [];
+  if (fs.existsSync(ENV_FILE)) fs.copyFileSync(ENV_FILE, `${ENV_FILE}.bak`);
+  const keyOf = (line) => (line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/) || [])[1];
+  const pending = new Map(updates);
+  const out = [];
+  for (const line of lines) {
+    const key = keyOf(line);
+    if (key && pending.has(key)) {
+      const value = pending.get(key);
+      pending.delete(key);
+      if (value !== '') out.push(`${key}=${quote(value)}`);
+      continue; // an empty value drops the line
+    }
+    out.push(line);
+  }
+  const added = [...pending].filter(([, v]) => v !== '').map(([k, v]) => `${k}=${quote(v)}`);
+  if (added.length) {
+    let at = -1;
+    out.forEach((line, i) => { if ((keyOf(line) || '').startsWith(`${prefix}_`)) at = i; });
+    if (at >= 0) out.splice(at + 1, 0, ...added);
+    else out.push('', `# ${sandbox}: saved from the UI on ${new Date().toISOString().slice(0, 10)}`, ...added);
+  }
+  fs.writeFileSync(ENV_FILE, `${out.join('\n')}\n`, { mode: 0o600 });
+  fs.chmodSync(ENV_FILE, 0o600);
+  return { saved: [...updates.keys()].map((k) => (k.endsWith('PASSWORD') || k.endsWith('API_KEY') ? `${k} (secret)` : k)) };
 }
 
 // ---------- config overview ----------
@@ -850,6 +926,14 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  if (req.method === 'POST' && url.pathname === '/api/sandboxes/save') {
+    try {
+      return send(res, 200, saveSettings(await readJson(req)));
+    } catch (err) {
+      return send(res, 400, { error: err.message });
+    }
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/sandboxes') {
     try {
       return send(res, 200, addSandbox(await readJson(req, MAX_CONFIG_BODY)));
@@ -1017,6 +1101,15 @@ if (!fs.existsSync(SCRIPT)) {
   console.error(`doctor script not found: ${SCRIPT}`);
   process.exit(1);
 }
+// First start: create .env from .env.example (only for the default location), so the UI
+// opens with the documented settings to fill in.
+const ENV_EXAMPLE = path.join(HERE, '.env.example');
+if (!process.env.ENV_FILE && !fs.existsSync(ENV_FILE) && fs.existsSync(ENV_EXAMPLE)) {
+  fs.copyFileSync(ENV_EXAMPLE, ENV_FILE, fs.constants.COPYFILE_EXCL);
+  fs.chmodSync(ENV_FILE, 0o600);
+  console.log(`created ${ENV_FILE} from .env.example; edit it to add your sandboxes`);
+}
+
 fs.mkdirSync(HISTORY_DIR, { recursive: true, mode: 0o700 });
 loadHistory();
 // Delete the playground's temporary API keys on the way out.
@@ -1028,7 +1121,44 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   });
 }
 
-server.listen(PORT, HOST, () => {
-  console.log(`AI Gateway doctor UI: http://${HOST}:${PORT}`);
-  console.log(fs.existsSync(ENV_FILE) ? `settings: ${ENV_FILE}` : `no ${ENV_FILE} yet; copy .env.example to .env`);
-});
+// openBrowser: show the UI in the default browser once it is listening (on whichever port
+// it got). NO_OPEN=1 turns this off, e.g. on a remote machine or in scripts.
+function openBrowser(url) {
+  if (/^(1|true|yes)$/i.test(process.env.NO_OPEN || '')) return;
+  const [cmd, args] = process.platform === 'darwin' ? ['open', [url]]
+    : process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]]
+      : ['xdg-open', [url]];
+  const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+  child.on('error', () => console.log(`open ${url} in your browser`));
+  child.unref();
+}
+
+// listen: start on FIRST_PORT, or the next free port when it is taken (another copy of the
+// UI, say). The Host header check follows PORT, so it accepts only the port in use.
+function listen(port) {
+  PORT = port;
+  // Each attempt has its own handlers, and each removes the other, so a failed attempt
+  // leaves nothing behind for the next one.
+  const onListening = () => {
+    server.removeListener('error', onError);
+    console.log(`AI Gateway doctor UI: http://${HOST}:${PORT}`);
+    console.log(fs.existsSync(ENV_FILE) ? `settings: ${ENV_FILE}` : `no ${ENV_FILE}; set ENV_FILE or create it`);
+    openBrowser(`http://${HOST}:${PORT}/`);
+  };
+  const onError = (err) => {
+    server.removeListener('listening', onListening);
+    if (err.code === 'EADDRINUSE' && port < FIRST_PORT + PORT_TRIES - 1) {
+      console.log(`port ${port} is in use; trying ${port + 1}`);
+      listen(port + 1);
+    } else {
+      console.error(err.code === 'EADDRINUSE'
+        ? `ports ${FIRST_PORT}-${port} are all in use; set PORT to a free one`
+        : `cannot listen on ${HOST}:${port}: ${err.message}`);
+      process.exit(1);
+    }
+  };
+  server.once('listening', onListening);
+  server.once('error', onError);
+  server.listen(port, HOST);
+}
+listen(FIRST_PORT);

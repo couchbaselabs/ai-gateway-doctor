@@ -629,7 +629,8 @@ function fillForm() {
     form.elements[field].placeholder = sb?.secrets[key] ? 'set in .env' : '';
   }
   $('form-title').textContent = sb ? sb.label : 'Custom run';
-  $('reset-btn').hidden = !sb || !edits()[selected];
+  updateEditButtons();
+  $('save-env-msg').hidden = true;
   $('form-error').textContent = '';
   updateVisibility();
   updateFmLink();
@@ -645,8 +646,44 @@ function saveEdits() {
   if (Object.keys(mine).length) all[selected] = mine;
   else delete all[selected];
   localStorage.setItem(EDITS_KEY, JSON.stringify(all));
-  $('reset-btn').hidden = !current() || !all[selected];
+  updateEditButtons();
 }
+
+// updateEditButtons: Reset and Save show for a sandbox from .env when the form differs from
+// it (or a password/API key was typed, which Save can store).
+function updateEditButtons() {
+  const sb = current();
+  const changed = Boolean(edits()[selected]);
+  const secret = Boolean(form.elements.cpPassword.value || form.elements.apiKey.value);
+  $('reset-btn').hidden = !sb || !changed;
+  $('save-env-btn').hidden = !sb || (!changed && !secret);
+}
+
+$('save-env-btn').addEventListener('click', async () => {
+  const resp = await fetch('/api/sandboxes/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sandbox: selected, values: edits()[selected] || {},
+      cpPassword: form.elements.cpPassword.value, apiKey: form.elements.apiKey.value }),
+  });
+  const data = await resp.json();
+  const msg = $('save-env-msg');
+  if (!resp.ok) {
+    msg.hidden = false;
+    msg.className = 'hint error-text';
+    msg.textContent = data.error;
+    return;
+  }
+  // .env now holds these values, so they are no longer edits.
+  const all = edits();
+  delete all[selected];
+  localStorage.setItem(EDITS_KEY, JSON.stringify(all));
+  await loadSandboxes();
+  fillForm();
+  msg.hidden = false;
+  msg.className = 'hint';
+  msg.textContent = data.saved.length ? `Saved to .env: ${data.saved.join(', ')} (previous file kept as .env.bak)` : 'Nothing to save.';
+});
 
 function updateVisibility() {
   const key = radio('keySource');

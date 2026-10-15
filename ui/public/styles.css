@@ -192,6 +192,7 @@ code { color: var(--text-strong); }
 /* ---------- middle: forms ---------- */
 
 .pane-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.head-actions { display: flex; gap: 14px; }
 .pane-head h2 { margin: 0 0 8px; font-size: 20px; font-weight: 700; color: var(--text-strong); letter-spacing: -0.01em; }
 
 .group { border-bottom: 1px solid var(--border); padding: 14px 0 16px; display: flex; flex-direction: column; gap: 10px; }
