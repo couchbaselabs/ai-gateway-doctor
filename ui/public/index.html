@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Gateway Doctor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="layout">
+    <!-- Sandboxes from .env, with the status of each one's last run -->
+    <nav id="nav-pane">
+      <div class="brand">
+        <div class="brand-row"><svg class="logomark" viewBox="0 0 100 100" aria-hidden="true"><path fill="currentColor" d="M83.1,58.6c0,2.9-1.7,5.5-5,6.1c-5.8,1-17.9,1.6-28.1,1.6s-22.3-0.7-28.1-1.6c-3.3-0.6-5-3.2-5-6.1V39.4c0-2.9,2.3-5.7,5-6.1c1.7-0.3,5.6-0.6,8.8-0.6c1.2,0,2.2,0.9,2.2,2.3v13.3c5.9,0,11.1-0.3,17.1-0.3s11.2,0.3,17.2,0.3V35.1c0-1.4,1-2.3,2.2-2.3c3.2,0,7.1,0.3,8.8,0.6c2.7,0.4,5,3.2,5,6.1L83.1,58.6z M50,1C22.9,1,1,22.9,1,50s21.9,49,49,49s49-21.9,49-49S77.1,1,50,1L50,1z"/></svg><h1>AI Gateway Doctor</h1></div>
+        <p>Runs checks against the AI Gateway that serves Model Service inference.</p>
+      </div>
+      <h2 class="pane-title">Sandboxes</h2>
+      <ul id="sandbox-list"></ul>
+      <button type="button" class="link add-btn" id="add-btn">+ Add sandbox</button>
+      <div id="env-info"></div>
+      <footer class="thanks">Thanks from <a href="mailto:jagadesh.munta@couchbase.com">jagadesh.munta@couchbase.com</a></footer>
+    </nav>
+
+    <!-- The run form for the selected sandbox -->
+    <main id="form-pane">
+      <!-- Shown instead of the run form while adding a sandbox -->
+      <form id="add-form" autocomplete="off" hidden>
+        <div class="pane-head"><h2>Add a sandbox</h2></div>
+        <section class="group">
+          <div class="row">
+            <label>Name *
+              <input name="name" required placeholder="my-sandbox" pattern="[A-Za-z0-9][A-Za-z0-9-]{0,40}">
+            </label>
+            <label>Label
+              <input name="label" placeholder="My sandbox">
+            </label>
+          </div>
+          <h3>Gateway config</h3>
+          <div class="segmented" role="radiogroup" aria-label="Config source">
+            <label><input type="radio" name="configSource" value="upload" checked><span>Upload config.json</span></label>
+            <label><input type="radio" name="configSource" value="path"><span>Path on this machine</span></label>
+          </div>
+          <label class="config-upload">Config file
+            <input name="configFile" type="file" accept=".json,application/json">
+          </label>
+          <label class="config-path" hidden>Config path
+            <input name="configPath" placeholder="~/aigw-doctor/configs/my-sandbox.config.json">
+          </label>
+          <p class="hint">Download the AI gateway config from the sandbox's Fleet Manager
+            (<a class="fm-link" target="_blank" rel="noopener">https://fm.&lt;sandbox&gt;.&lt;domain&gt;/</a>).</p>
+        </section>
+        <section class="group">
+          <h3>Deployment</h3>
+          <div class="row">
+            <label>Region
+              <input name="region" placeholder="us-east-2">
+            </label>
+            <label>Tenant (org) id
+              <input name="tenantId" placeholder="tenant (org) UUID">
+            </label>
+          </div>
+          <label>Control plane URL (the console API URL works)
+            <input name="cpUrl" placeholder="https://api.<env>.<domain>/v2/organizations/<org id>">
+          </label>
+          <label>Capella login (email)
+            <input name="cpUser" placeholder="leave empty to use the .env default">
+          </label>
+          <label>Models (comma-separated; empty for all)
+            <input name="models">
+          </label>
+          <p class="hint">Saved to .env as <code id="add-prefix">&lt;NAME&gt;_*</code> keys. Passwords and API keys are not
+            written by the UI: add <code>CP_PASSWORD</code> to .env yourself, or type it in the run form.</p>
+        </section>
+        <div class="actions">
+          <button type="submit" class="cta"><span>Save sandbox</span><span class="cta-arrow" aria-hidden="true">›</span></button>
+          <button type="button" id="add-cancel">Cancel</button>
+          <span id="add-error" role="alert"></span>
+        </div>
+      </form>
+
+      <div class="pane-head">
+        <h2 id="form-title">Custom run</h2>
+        <button type="button" class="link" id="reset-btn" title="Discard edits and use the .env values">Reset to .env</button>
+      </div>
+      <div id="version-bar">
+        <span id="gw-version" class="muted">AI Gateway version: not checked yet</span>
+        <button type="button" class="small-btn" id="version-btn" title="GET /v1/info on the gateway">Check version</button>
+      </div>
+      <div id="console-bar" title="The cache cluster's Couchbase Server web console">
+        <span class="muted">Couchbase console</span>
+        <button type="button" class="small-btn" id="console-open">Open ↗</button>
+        <button type="button" class="small-btn" id="console-user">Copy user</button>
+        <button type="button" class="small-btn" id="console-pass">Copy password</button>
+        <span id="console-msg" class="muted small"></span>
+      </div>
+      <form id="run-form" autocomplete="off">
+        <section class="group">
+          <h3>Deployment</h3>
+          <label>Config file
+            <input name="config" required placeholder="~/aigw-doctor/configs/my-sandbox.config.json">
+          </label>
+          <a class="fm-link small" target="_blank" rel="noopener" hidden>Get this sandbox's AI gateway config from Fleet Manager ↗</a>
+          <div class="row">
+            <label>Region
+              <input name="region" placeholder="us-east-2">
+            </label>
+            <label>Tenant (org) id
+              <input name="tenantId" placeholder="tenant (org) UUID">
+            </label>
+          </div>
+          <details>
+            <summary>Instances, URLs and threshold</summary>
+            <div class="row">
+              <label>Gateway instance id
+                <input name="aigwInstance" placeholder="found from the ASG">
+              </label>
+              <label>Cache node instance id
+                <input name="cbInstance" placeholder="found from the ASG">
+              </label>
+            </div>
+            <div class="row">
+              <label>Gateway URL
+                <input name="aigwUrl" placeholder="looked up in the control plane">
+              </label>
+              <label>Disk threshold %
+                <input name="threshold" inputmode="numeric" placeholder="85">
+              </label>
+            </div>
+          </details>
+        </section>
+
+        <section class="group">
+          <h3>Checks</h3>
+          <div class="segmented" role="radiogroup" aria-label="Scope">
+            <label><input type="radio" name="scope" value="all" checked><span>Infra + models</span></label>
+            <label><input type="radio" name="scope" value="inference"><span>Models only</span></label>
+            <label><input type="radio" name="scope" value="infra"><span>Infra only</span></label>
+          </div>
+          <div class="segmented" role="radiogroup" aria-label="Mode">
+            <label><input type="radio" name="mode" value="check" checked><span>Check</span></label>
+            <label><input type="radio" name="mode" value="dry-run"><span>Dry run</span></label>
+          </div>
+        </section>
+
+        <section class="group" id="models-fields">
+          <h3>Model requests</h3>
+          <div class="row">
+            <label>Capella login (email)
+              <input name="cpUser" autocomplete="username" placeholder="you@couchbase.com">
+            </label>
+            <label>Capella password
+              <input name="cpPassword" type="password" autocomplete="current-password">
+            </label>
+          </div>
+          <p class="hint">The gateway endpoint is looked up in the Capella control plane with this login.
+            Without a login, set the gateway URL above.</p>
+          <details>
+            <summary>Control plane</summary>
+            <label>Control plane API URL
+              <input name="cpUrl" placeholder="from the gateway; https://api.<env>.<domain>/v2/organizations/<org id>">
+            </label>
+            <label>Organization id
+              <input name="orgId" placeholder="defaults to the tenant id">
+            </label>
+          </details>
+          <div class="segmented" role="radiogroup" aria-label="API key">
+            <label><input type="radio" name="keySource" value="create" checked><span>Temporary key</span></label>
+            <label><input type="radio" name="keySource" value="file"><span>Key file</span></label>
+            <label><input type="radio" name="keySource" value="paste"><span>Paste key</span></label>
+          </div>
+          <label class="key-file" hidden>API key file
+            <input name="apiKeyFile" placeholder="~/.aigw-key">
+          </label>
+          <label class="key-paste" hidden>API key
+            <input name="apiKey" type="password">
+          </label>
+          <label>Models (comma-separated; empty for all)
+            <input name="models" placeholder="amazon.nova-lite-v1:0,amazon.titan-embed-text-v2:0">
+          </label>
+        </section>
+
+        <div class="actions">
+          <button type="submit" id="run-btn" class="cta"><span>Run check</span><span class="cta-arrow" aria-hidden="true">›</span></button>
+          <button type="button" id="cancel-btn" hidden>Cancel</button>
+          <span id="form-error" role="alert"></span>
+        </div>
+      </form>
+    </main>
+
+    <!-- Results of the selected sandbox's current or last run -->
+    <section id="results-pane">
+      <div class="tabs" role="tablist">
+        <button type="button" role="tab" class="tab active" data-tab="results">Results</button>
+        <button type="button" role="tab" class="tab" data-tab="config">Config</button>
+        <button type="button" role="tab" class="tab" data-tab="playground">Playground</button>
+        <button type="button" role="tab" class="tab" data-tab="terminals">Terminals</button>
+      </div>
+      <div id="terminals-view" hidden>
+        <div class="term-bar">
+          <div class="segmented term-method" role="radiogroup" aria-label="Connect with">
+            <label><input type="radio" name="termMethod" value="ssm" checked><span>SSM</span></label>
+            <label><input type="radio" name="termMethod" value="ssh"><span>SSH</span></label>
+          </div>
+          <button type="button" class="small-btn" id="term-aigw">+ AI Gateway shell</button>
+          <button type="button" class="small-btn" id="term-cb">+ Couchbase node shell</button>
+          <span id="term-msg" class="muted small"></span>
+        </div>
+        <div id="term-tabs"></div>
+        <div id="term-host"><p class="empty">Open a shell on the sandbox's AI Gateway or Couchbase node.</p></div>
+        <p class="hint">SSM uses <code>aws ssm start-session</code> with your AWS credentials (no SSH keys needed).
+          SSH connects to <code>&lt;NAME&gt;_AIGW_SSH</code> / <code>&lt;NAME&gt;_CB_SSH</code> from .env, or
+          <code>ec2-user@&lt;public DNS&gt;</code>, with <code>SSH_KEY</code> if set. The node is found from its ASG
+          unless the form names its instance id.</p>
+      </div>
+      <div id="config-view" hidden></div>
+      <div id="playground-view" hidden>
+        <form id="play-form" autocomplete="off">
+          <div class="play-row">
+            <label>Model
+              <select name="model"></select>
+            </label>
+            <label>Cache
+              <select name="cacheType">
+                <option value="none">none</option>
+                <option value="standard">standard</option>
+                <option value="semantic">semantic</option>
+              </select>
+            </label>
+            <label class="narrow">Max tokens
+              <input name="maxTokens" type="number" min="1" max="8192" value="256">
+            </label>
+            <label class="narrow">Temperature
+              <input name="temperature" type="number" min="0" max="2" step="0.1" value="0">
+            </label>
+          </div>
+          <details>
+            <summary>System prompt</summary>
+            <textarea name="system" rows="2" placeholder="Optional"></textarea>
+          </details>
+          <label class="check-inline"><input type="checkbox" name="debug">
+            Debug: send <code>X-cb-debug: true</code> (the gateway adds its <code>X-cb-*</code> debug headers to the response)</label>
+          <textarea name="prompt" rows="4" placeholder="Ask something… (Cmd/Ctrl+Enter sends)"></textarea>
+          <div class="actions">
+            <button type="submit" id="play-send" class="cta"><span>Send</span><span class="cta-arrow" aria-hidden="true">›</span></button>
+            <button type="button" id="play-again" disabled title="Send the last request again, e.g. to see a cache HIT">Send again</button>
+            <button type="button" class="link" id="play-new" title="Replace the prompt with a new random question">New question</button>
+            <button type="button" class="link" id="play-clear">Clear</button>
+            <span id="play-msg" class="muted small"></span>
+          </div>
+          <p class="hint">Uses the gateway URL and API key choice from the form (a temporary key is created once and reused
+            for up to an hour). Without a gateway URL, the endpoint found by the last run's control plane lookup is used.</p>
+        </form>
+        <div id="play-log"></div>
+      </div>
+      <div id="results-view">
+      <div id="run-bar">
+        <label for="run-picker">Run</label>
+        <select id="run-picker"><option value="">Latest (live)</option></select>
+        <span id="history-note"></span>
+      </div>
+      <div id="status-bar">
+        <span id="status-text">No run yet</span>
+        <span class="counts">
+          <span class="pill pass" id="count-pass">0 passed</span>
+          <span class="pill warn" id="count-warn">0 warnings</span>
+          <span class="pill fail" id="count-fail">0 failed</span>
+        </span>
+      </div>
+      <div id="toolbar">
+        <label class="toggle"><input type="checkbox" id="problems-only"> Problems only</label>
+        <label class="toggle"><input type="checkbox" id="show-raw"> Raw output</label>
+      </div>
+      <p id="command"></p>
+      <p id="log-path" hidden></p>
+      <div id="steps"><p class="empty">Pick a sandbox and press Run. Results stream in here.</p></div>
+      <pre id="raw" hidden></pre>
+      </div>
+    </section>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

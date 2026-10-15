@@ -1,0 +1,14 @@
+{
+  "name": "aigw-doctor-ui",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local web UI for aigw-doctor.sh",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
