@@ -818,7 +818,8 @@ async function detectCache(body) {
   return { model, ...result, checkedAt: Date.now() };
 }
 
-async function playground(body) {
+// preparePlayground: the target, key and request for a playground call (sandbox or custom).
+async function preparePlayground(body) {
   const cacheType = ['none', 'standard', 'semantic'].includes(body.cacheType) ? body.cacheType : 'none';
   const prompt = String(body.prompt || '');
   if (!prompt.trim()) throw new Error('type a prompt');
@@ -844,6 +845,7 @@ async function playground(body) {
 
   let path_ = '/v1/embeddings';
   let payload = { model: modelName, input: prompt };
+  const stream = body.stream === true && !embedding; // embeddings are not streamed
   if (!embedding) {
     path_ = '/v1/chat/completions';
     const maxTokens = Math.min(Math.max(parseInt(body.maxTokens, 10) || 256, 1), 8192);
@@ -852,29 +854,105 @@ async function playground(body) {
     if (String(body.system || '').trim()) messages.push({ role: 'system', content: String(body.system) });
     messages.push({ role: 'user', content: prompt });
     payload = { model: modelName, messages, max_tokens: maxTokens, temperature };
+    if (stream) payload.stream = true;
   }
   const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-cb-cache': cacheType };
   if (body.debug === true) headers['X-cb-debug'] = 'true'; // the gateway then adds its X-cb-* debug headers
-  const res = await request('POST', `${gw}${path_}`, { headers, body: JSON.stringify(payload), verifyTls });
-  // Headers as sent and received (original casing); the API key is not echoed back.
-  const requestHeaders = Object.entries({ ...headers, Authorization: 'Bearer <redacted>' });
+  return { gw, path_, url: `${gw}${path_}`, key, source, modelName, embedding, kind, verifyTls, cacheType, payload, headers, stream };
+}
+
+// playgroundResult: what the page shows for one call; the API key is not echoed back.
+function playgroundResult(p, res, text, extra = {}) {
+  const requestHeaders = Object.entries({ ...p.headers, Authorization: 'Bearer <redacted>' });
   const responseHeaders = [];
   for (let i = 0; i < res.rawHeaders.length; i += 2) responseHeaders.push([res.rawHeaders[i], res.rawHeaders[i + 1]]);
   let json = null;
   try {
-    json = JSON.parse(res.text);
-  } catch { /* not JSON */ }
-  const content = embedding
-    ? json?.data?.[0]?.embedding ? `${json.data[0].embedding.length}-dimension vector: [${json.data[0].embedding.slice(0, 6).map((x) => x.toFixed(4)).join(', ')}, …]` : ''
-    : json?.choices?.[0]?.message?.content ?? '';
+    json = JSON.parse(text);
+  } catch { /* not JSON (or a stream) */ }
+  const content = extra.content !== undefined ? extra.content
+    : p.embedding
+      ? json?.data?.[0]?.embedding ? `${json.data[0].embedding.length}-dimension vector: [${json.data[0].embedding.slice(0, 6).map((x) => x.toFixed(4)).join(', ')}, …]` : ''
+      : json?.choices?.[0]?.message?.content ?? '';
   return {
-    endpoint: `${gw}${path_}`, keySource: source, status: res.status, ms: res.ms,
-    xcache: res.headers['x-cache'] || '', cacheType, model: modelName, kind,
-    request: payload, requestHeaders, responseHeaders, content, usage: json?.usage || null,
-    insecure: !verifyTls, // for the shareable curl command (-k)
-    error: res.status >= 300 ? json?.error?.message || json?.message || res.text.slice(0, 500) : '',
-    raw: res.text.length > 20000 ? `${res.text.slice(0, 20000)}…` : res.text,
+    endpoint: p.url, keySource: p.source, status: res.status, ms: res.ms,
+    xcache: res.headers['x-cache'] || '', cacheType: p.cacheType, model: p.modelName, kind: p.kind,
+    request: p.payload, requestHeaders, responseHeaders, content, usage: extra.usage || json?.usage || null,
+    insecure: !p.verifyTls, // for the shareable curl command (-k)
+    error: extra.error || (res.status >= 300 ? json?.error?.message || json?.message || text.slice(0, 500) : ''),
+    raw: text.length > 20000 ? `${text.slice(0, 20000)}…` : text,
+    stream: extra.stream || null,
   };
+}
+
+async function playground(body) {
+  const p = await preparePlayground(body);
+  const res = await request('POST', p.url, { headers: p.headers, body: JSON.stringify(p.payload), verifyTls: p.verifyTls });
+  return playgroundResult(p, res, res.text);
+}
+
+// playgroundStream: a chat call with "stream": true. The answer goes to the page as it
+// arrives (one JSON object per line: {"delta": "..."}), then the full result with the time
+// to the first token, the total time and the number of chunks.
+async function playgroundStream(body, out) {
+  const p = await preparePlayground({ ...body, stream: true });
+  if (!p.stream) throw new Error('streaming applies to chat completions');
+  const started = Date.now();
+  const u = new URL(p.url);
+  const lib = u.protocol === 'http:' ? http : https;
+  out.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' });
+  await new Promise((resolve) => {
+    const req = lib.request(u, { method: 'POST', headers: p.headers, timeout: 300000, rejectUnauthorized: p.verifyTls }, (res) => {
+      let raw = '';
+      let pending = '';
+      let content = '';
+      let chunks = 0;
+      let firstMs = null;
+      let usage = null;
+      let streamError = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        raw += chunk;
+        if (res.statusCode >= 300) return;
+        pending += chunk;
+        const events = pending.split(/\r?\n\r?\n/);
+        pending = events.pop();
+        for (const event of events) {
+          for (const line of event.split(/\r?\n/)) {
+            if (!line.startsWith('data:')) continue;
+            const data = line.slice(5).trim();
+            if (!data || data === '[DONE]') continue;
+            try {
+              const j = JSON.parse(data);
+              if (j.error) streamError = j.error.message || JSON.stringify(j.error);
+              if (j.usage) usage = j.usage;
+              const delta = j.choices?.[0]?.delta?.content ?? j.choices?.[0]?.message?.content ?? '';
+              chunks += 1;
+              if (delta) {
+                if (firstMs === null) firstMs = Date.now() - started;
+                content += delta;
+                out.write(`${JSON.stringify({ delta })}\n`);
+              }
+            } catch { /* a partial or non-JSON line */ }
+          }
+        }
+      });
+      res.on('end', () => {
+        const ms = Date.now() - started;
+        const result = playgroundResult(p, { status: res.statusCode, headers: res.headers, rawHeaders: res.rawHeaders, ms },
+          raw, res.statusCode >= 300 ? {} : { content, usage, error: streamError, stream: { firstTokenMs: firstMs, chunks } });
+        out.end(`${JSON.stringify({ done: result })}\n`);
+        resolve();
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('timed out after 300s')));
+    req.on('error', (err) => {
+      out.end(`${JSON.stringify({ error: err.message })}\n`);
+      resolve();
+    });
+    out.on('close', () => req.destroy()); // the page went away: stop the upstream call
+    req.end(JSON.stringify(p.payload));
+  });
 }
 
 // ---------- terminals on the gateway and cache nodes ----------
@@ -1358,6 +1436,15 @@ const server = http.createServer(async (req, res) => {
     try {
       return send(res, 200, await detectCache(await readJson(req)));
     } catch (err) {
+      return send(res, 400, { error: err.message });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/playground/stream') {
+    try {
+      return await playgroundStream(await readJson(req), res);
+    } catch (err) {
+      if (res.headersSent) return res.end(`${JSON.stringify({ error: err.message })}\n`);
       return send(res, 400, { error: err.message });
     }
   }

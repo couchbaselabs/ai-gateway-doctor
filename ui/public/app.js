@@ -386,7 +386,7 @@ playForm.elements.model.addEventListener('change', updatePlayCache);
 
 function playEntry(r) {
   const ok = r.status >= 200 && r.status < 300;
-  const usage = r.usage ? [r.usage.prompt_tokens != null && `${r.usage.prompt_tokens} in`, r.usage.completion_tokens != null && `${r.usage.completion_tokens} out`].filter(Boolean).join(' · ') : '';
+  const tokens = tokensText(r.usage);
   const prompt = r.request.messages ? r.request.messages[r.request.messages.length - 1].content : r.request.input;
   return el('div', { class: `exchange ${ok ? '' : 'bad'}` },
     el('div', { class: 'ex-head' },
@@ -395,7 +395,9 @@ function playEntry(r) {
       r.cacheType !== 'none' && el('span', { class: 'chip' }, `${r.cacheType} cache`),
       r.xcache && el('span', { class: `pill ${r.xcache === 'HIT' ? 'pass' : 'skip'}` }, r.xcache),
       el('span', { class: `pill ${ok ? 'pass' : 'fail'}` }, `HTTP ${r.status}`),
-      usage && el('span', { class: 'chip' }, usage),
+      r.stream && el('span', { class: 'chip' },
+        `streamed · first token ${r.stream.firstTokenMs === null ? '–' : `${(r.stream.firstTokenMs / 1000).toFixed(2)}s`} · ${r.stream.chunks} chunks`),
+      tokens && el('span', { class: 'ex-tokens' }, tokens),
       el('span', { class: 'ex-time' }, `${(r.ms / 1000).toFixed(2)}s · ${new Date(r.at).toLocaleTimeString()}`)),
     el('div', { class: 'ex-body' },
       el('div', { class: 'ex-q' }, el('span', { class: 'ex-label' }, 'Q'), el('span', {}, prompt)),
@@ -418,7 +420,8 @@ function playEntry(r) {
 // $AIGW_API_KEY; -i shows the response headers (X-Cache); -k only when TLS was not verified.
 function curlCommand(r) {
   const q = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
-  const lines = [`curl -sS -i${r.insecure ? ' -k' : ''} -X POST ${q(r.endpoint)}`];
+  // -N prints a streamed answer as it arrives.
+  const lines = [`curl -sS -i${r.request?.stream ? ' -N' : ''}${r.insecure ? ' -k' : ''} -X POST ${q(r.endpoint)}`];
   for (const [k, v] of r.requestHeaders || []) {
     lines.push(/^authorization$/i.test(k) ? '-H "Authorization: Bearer $AIGW_API_KEY"' : `-H ${q(`${k}: ${v}`)}`);
   }
@@ -459,11 +462,67 @@ function debugHeaders(headers) {
     el('span', { class: 'chip' }, el('span', { class: 'muted' }, `${k}: `), v)));
 }
 
+// isEmbeddingRequest: embeddings are never streamed.
+function isEmbeddingRequest(body) {
+  if (body.custom) return body.requestType === 'embeddings';
+  const m = configData?.models.find((x) => x.modelName === body.model);
+  return Boolean(m && /embedding/.test(m.kind));
+}
+
+// sendPlayStream: the answer is written into a live entry as it arrives; when the call
+// ends, the entry becomes the usual one with the stream stats.
+async function sendPlayStream(body) {
+  const answer = el('span', {}, '');
+  const live = el('div', { class: 'exchange' },
+    el('div', { class: 'ex-head' },
+      el('span', { class: 'ex-model' }, body.model || ''),
+      el('span', { class: 'chip' }, 'streaming…')),
+    el('div', { class: 'ex-body' },
+      el('div', { class: 'ex-q' }, el('span', { class: 'ex-label' }, 'Q'), el('span', {}, body.prompt)),
+      el('div', { class: 'ex-a' }, el('span', { class: 'ex-label' }, 'A'), answer)));
+  const resp = await fetch('/api/playground/stream', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    $('play-msg').textContent = (await resp.json()).error;
+    return;
+  }
+  $('play-log').prepend(live);
+  $('play-msg').textContent = 'streaming…';
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const msg = JSON.parse(line);
+      if (msg.delta) answer.textContent += msg.delta;
+      if (msg.done) live.replaceWith(playEntry({ ...msg.done, at: Date.now() }));
+      if (msg.error) {
+        $('play-msg').textContent = msg.error;
+        live.remove();
+        return;
+      }
+    }
+  }
+  $('play-msg').textContent = '';
+  lastPlay = body;
+}
+
 async function sendPlay(body) {
   $('play-send').disabled = true;
   $('play-again').disabled = true;
   $('play-msg').textContent = 'sending…';
   try {
+    if (body.stream && !isEmbeddingRequest(body)) {
+      await sendPlayStream(body);
+      return;
+    }
     const resp = await fetch('/api/playground', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
@@ -640,7 +699,7 @@ playForm.addEventListener('submit', (e) => {
     sendPlay({
       custom: true, ...customBody(), model: customModelName(), requestType: f.requestType.value,
       cacheType: f.cacheType.value, prompt: f.prompt.value, system: f.system.value,
-      maxTokens: f.maxTokens.value, temperature: f.temperature.value, debug: f.debug.checked,
+      maxTokens: f.maxTokens.value, temperature: f.temperature.value, debug: f.debug.checked, stream: f.stream.checked,
     });
     return;
   }
@@ -649,7 +708,7 @@ playForm.addEventListener('submit', (e) => {
     sandbox: run.sandbox, config: run.config, region: run.region, aigwUrl: run.aigwUrl,
     keySource: run.keySource, apiKey: form.elements.apiKey.value, apiKeyFile: form.elements.apiKeyFile.value.trim(),
     model: f.model.value, cacheType: f.cacheType.value, prompt: f.prompt.value, system: f.system.value,
-    maxTokens: f.maxTokens.value, temperature: f.temperature.value, debug: f.debug.checked,
+    maxTokens: f.maxTokens.value, temperature: f.temperature.value, debug: f.debug.checked, stream: f.stream.checked,
   });
 });
 playForm.elements.prompt.addEventListener('keydown', (e) => {
@@ -1195,6 +1254,17 @@ function detailLine(d) {
   return el('span', { class: cls }, d.text + '\n');
 }
 
+// tokensText: "17 tokens · 12 in · 5 out" from an OpenAI usage object (total falls back to
+// in + out; embeddings report only input), or '' when the response had no usage.
+function tokensText(u) {
+  if (!u) return '';
+  const inTok = u.prompt_tokens ?? u.input_tokens;
+  const outTok = u.completion_tokens ?? u.output_tokens;
+  if (inTok == null && outTok == null && u.total_tokens == null) return '';
+  const total = u.total_tokens ?? (inTok ?? 0) + (outTok ?? 0);
+  return [`${total} tokens`, inTok != null && `${inTok} in`, outTok != null && `${outTok} out`].filter(Boolean).join(' · ');
+}
+
 function exchangeRow(x) {
   const ok = x.code === 200;
   const xc = x.xcache === '-' ? '' : x.xcache;
@@ -1205,6 +1275,7 @@ function exchangeRow(x) {
       x.cache !== 'none' && el('span', { class: 'chip' }, `${x.cache} cache`),
       xc && el('span', { class: `pill ${xc === 'HIT' ? 'pass' : 'skip'}` }, xc),
       el('span', { class: `pill ${ok ? 'pass' : 'fail'}` }, `HTTP ${x.code}`),
+      tokensText(x.usage) && el('span', { class: 'ex-tokens' }, tokensText(x.usage)),
       el('span', { class: 'ex-time' }, `${x.secs}s`)),
     el('div', { class: 'ex-body' },
       el('div', { class: 'ex-q' }, el('span', { class: 'ex-label' }, 'Q'), el('span', {}, String(x.request ?? ''))),
@@ -1534,3 +1605,28 @@ document.addEventListener('visibilitychange', () => {
     loadSandboxes();
   }
 });
+
+
+// Show/hide for secret fields (API keys, password): an eye button inside each password
+// input switches it between hidden and visible. Nothing else about the value changes.
+const EYE = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/></svg>';
+
+function addRevealButtons() {
+  for (const input of document.querySelectorAll('input[type="password"]')) {
+    if (input.parentElement.classList.contains('secret-field')) continue;
+    const wrap = el('span', { class: 'secret-field' });
+    input.replaceWith(wrap);
+    const button = el('button', { type: 'button', class: 'reveal', title: 'Show', 'aria-label': 'Show' });
+    button.innerHTML = EYE;
+    button.addEventListener('click', () => {
+      const show = input.type === 'password';
+      input.type = show ? 'text' : 'password';
+      button.innerHTML = show ? EYE_OFF : EYE;
+      button.title = show ? 'Hide' : 'Show';
+      button.setAttribute('aria-label', button.title);
+    });
+    wrap.append(input, button);
+  }
+}
+addRevealButtons();

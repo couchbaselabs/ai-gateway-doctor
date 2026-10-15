@@ -163,8 +163,9 @@ On the first start without a `.env`, the server creates one from `.env.example` 
 - **Raw config:** **Raw JSON** on the Config tab shows the config file, with **Copy** and **Download**. Private keys (also base64-encoded ones) and password, token and secret fields are redacted. Public certificates and Secrets Manager names are shown.
 - **Playground tab:** send your own requests to any model in the config.
   - **Choices:** the model, the cache mode (`none`, `standard` or `semantic`, marked when the config has it off), max tokens, temperature and an optional system prompt. Embedding models get an embeddings request.
-  - **Each answer shows:** `X-Cache`, HTTP status, token usage, latency, the answer, the request and response headers, the raw response, and a **curl command** to share. It has the same headers and body, with the API key as `$AIGW_API_KEY`, `-i` to show the response headers, and `-k` only when TLS wasn't verified. **Send again** repeats the last request, which is the quickest way to see a cache HIT.
+  - **Each answer shows:** `X-Cache`, HTTP status, the token count (total, in and out; streamed answers get it from the gateway's final usage chunk), latency, the answer, the request and response headers, the raw response, and a **curl command** to share. It has the same headers and body, with the API key as `$AIGW_API_KEY`, `-i` to show the response headers, and `-k` only when TLS wasn't verified. **Send again** repeats the last request, which is the quickest way to see a cache HIT.
   - **Headers:** shown with their original casing. The Authorization value is redacted, and cache and `X-cb-*` headers are highlighted.
+  - **Stream:** sends `"stream": true` for chat requests and writes the answer into the page as the chunks arrive. The finished entry shows the time to the first token, the total time and the number of chunks. `X-Cache` still shows, because it arrives with the response headers. Embeddings aren't streamed, and the curl command gets `-N`.
   - **Debug:** sends `X-cb-debug: true`. The gateway then adds its `X-cb-*` debug headers (cache type, match threshold and so on), which are listed under the answer.
   - **Gateway URL:** taken from the form, else the endpoint found by the last run's control plane lookup.
   - **API key:** follows the form's choice. A temporary key is created once per sandbox, reused for up to an hour, and deleted when the server stops.
@@ -186,6 +187,7 @@ On the first start without a `.env`, the server creates one from `.env.example` 
   - The server runs the doctor with your shell's AWS credentials and listens only on `127.0.0.1`.
   - It rejects requests with another Host header, accepts only JSON posts, and checks every field against a pattern before it becomes a doctor argument.
   - Passwords and API keys reach the doctor only through its environment, and are never stored in the browser.
+  - Password and API key fields are masked. The eye icon in each one shows or hides what you typed or pasted.
 - **No `--fix`:** fix mode asks for confirmation on the terminal, so the UI offers only check and dry run. To repair, run the script with `--fix` in a terminal.
 
 ## License

@@ -284,6 +284,8 @@
             <summary>System prompt</summary>
             <textarea name="system" rows="2" placeholder="Optional"></textarea>
           </details>
+          <label class="check-inline"><input type="checkbox" name="stream">
+            Stream: send <code>"stream": true</code> and show the answer as it arrives (chat only)</label>
           <label class="check-inline"><input type="checkbox" name="debug">
             Debug: send <code>X-cb-debug: true</code> (the gateway adds its <code>X-cb-*</code> debug headers to the response)</label>
           <textarea name="prompt" rows="4" placeholder="Ask something… (Cmd/Ctrl+Enter sends)"></textarea>

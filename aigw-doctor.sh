@@ -990,6 +990,7 @@ exchange_line() {
 		($body | fromjson) as $q | ($r | try fromjson catch null) as $j |
 		{path: $path, model: $q.model, cache: $cache, request: ($q.messages[-1].content // $q.input),
 			code: ($code | tonumber? // 0), xcache: $xc, secs: ($secs | tonumber? // 0),
+			usage: ($j.usage? // null),
 			response: ((if $j == null then $r
 				elif $j.choices then ($j.choices[0].message.content // "")
 				elif $j.data then "\($j.data[0].embedding | length)-dimension vector"
