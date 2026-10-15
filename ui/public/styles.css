@@ -374,7 +374,9 @@ a.fm-link[hidden] { display: none; }
 #status-text.running { color: var(--cb-orange); }
 .counts { display: flex; gap: 6px; margin-left: auto; }
 
-#toolbar { display: flex; gap: 18px; padding: 12px 2px 0; }
+#toolbar { display: flex; align-items: center; gap: 18px; padding: 12px 2px 0; }
+#clear-btn { margin-left: auto; }
+#clear-btn:disabled { opacity: 0.45; cursor: default; }
 .toggle { flex-direction: row; align-items: center; color: var(--text); font-size: 12.5px; gap: 6px; font-weight: 600; }
 
 #command, #log-path { color: var(--muted); font: 11.5px/1.5 var(--mono); word-break: break-all; margin: 8px 2px 0; }

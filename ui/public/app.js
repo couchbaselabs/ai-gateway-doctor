@@ -107,6 +107,9 @@ function select(name) {
   if (!addForm.hidden) showAdd(false);
   selected = name;
   viewing = '';
+  cleared = false;
+  skipRunId = null;
+  skipping = false;
   versionChecked = false;
   localStorage.setItem(SELECTED_KEY, name);
   history.replaceState(null, '', name === CUSTOM ? location.pathname : `#${encodeURIComponent(name)}`);
@@ -759,6 +762,27 @@ $('cancel-btn').addEventListener('click', () => {
 });
 
 $('problems-only').addEventListener('change', queueRender);
+
+// Clear output: empty the results window before the next run. The stream stays open, so
+// the next run of this sandbox shows up here; saved runs stay in the Run list.
+// The latest run at the time of clearing is skipped if the server replays it (when
+// switching back from an earlier run, or after a reconnect); a new run shows normally.
+let cleared = false;
+let skipRunId = null;
+let skipping = false;
+$('clear-btn').addEventListener('click', async () => {
+  if (state?.running) return;
+  const { runs } = await (await fetch(`/api/runs?sandbox=${encodeURIComponent(sandboxParam())}`)).json();
+  skipRunId = runs[0]?.id || null;
+  state = null;
+  cleared = true;
+  if (viewing) {
+    viewing = ''; // back to following the latest run
+    $('run-picker').value = '';
+    follow();
+  }
+  queueRender();
+});
 $('show-raw').addEventListener('change', queueRender);
 
 // ---------- output parsing ----------
@@ -828,13 +852,20 @@ function handleEvent(event) {
       state = null;
       break;
     case 'start':
+      skipping = Boolean(skipRunId) && event.id === skipRunId;
+      if (skipping) {
+        state = null;
+        break;
+      }
+      cleared = false;
+      skipRunId = null;
       state = newState(event);
       break;
     case 'line':
-      if (state) handleLine(event.text, event.stream);
+      if (state && !skipping) handleLine(event.text, event.stream);
       break;
     case 'exit':
-      if (!state) return;
+      if (!state || skipping) return;
       state.running = false;
       state.endedAt = event.endedAt;
       state.exit = event;
@@ -962,7 +993,7 @@ function render() {
   $('count-fail').className = `pill ${counts.fail ? 'fail' : 'skip'}`;
   document.querySelector('#status-bar .counts').hidden = !state;
 
-  let status = 'No run yet for this sandbox';
+  let status = cleared ? 'Output cleared' : 'No run yet for this sandbox';
   let cls = '';
   if (state) {
     if (running) status = `Running… ${elapsed()}`;
@@ -979,8 +1010,11 @@ function render() {
   const raw = $('show-raw').checked;
   $('raw').hidden = !raw || !state;
   $('steps').hidden = raw && Boolean(state);
+  $('clear-btn').disabled = running || !state;
   if (!state) {
-    $('steps').replaceChildren(el('p', { class: 'empty' }, 'Press Run to check this sandbox. Results stream in here.'));
+    $('steps').replaceChildren(el('p', { class: 'empty' }, cleared
+      ? 'Output cleared. Press Run check; the new run streams in here (earlier runs are in the Run list).'
+      : 'Press Run to check this sandbox. Results stream in here.'));
     return;
   }
   if (raw) {
