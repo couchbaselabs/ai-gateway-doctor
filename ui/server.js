@@ -779,6 +779,45 @@ async function customConnect(body) {
   };
 }
 
+// detectCache: which cache types a model has on, as seen by a client. For each type, one
+// small chat request (1 output token, a unique prompt) with X-cb-debug: true; the gateway
+// answers with X-cb-cache-enabled (and, for semantic, the threshold and embedding model).
+// Without debug headers, an X-Cache header still shows the cache path ran.
+async function detectCache(body) {
+  const { gw, key, verifyTls } = customTarget(body);
+  const model = String(body.model || '').trim();
+  if (!/^[\w.:/@+-]{1,200}$/.test(model)) throw new Error('pick a model first');
+  const result = {};
+  for (const type of ['standard', 'semantic']) {
+    const payload = {
+      model, max_tokens: 1, temperature: 0,
+      messages: [{ role: 'user', content: `aigw-doctor cache check ${Date.now()}-${Math.random().toString(36).slice(2)}: reply OK` }],
+    };
+    const res = await request('POST', `${gw}/v1/chat/completions`, {
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-cb-cache': type, 'X-cb-debug': 'true' },
+      body: JSON.stringify(payload), timeout: 60000, verifyTls,
+    });
+    const h = res.headers;
+    if (res.status >= 300) {
+      let msg = '';
+      try {
+        const j = JSON.parse(res.text);
+        msg = j.error?.message || j.message || '';
+      } catch { /* not JSON */ }
+      result[type] = { enabled: null, error: `HTTP ${res.status}${msg ? `: ${msg}` : ''}` };
+      continue;
+    }
+    const flag = h['x-cb-cache-enabled'];
+    result[type] = {
+      enabled: flag !== undefined ? flag === 'true' : Boolean(h['x-cache']),
+      how: flag !== undefined ? 'X-cb-cache-enabled' : 'X-Cache present',
+      threshold: type === 'semantic' ? h['x-cb-semantic-cache-match-threshold'] || '' : '',
+      embeddingModel: type === 'semantic' ? h['x-cb-semantic-cache-embedding-model'] || '' : '',
+    };
+  }
+  return { model, ...result, checkedAt: Date.now() };
+}
+
 async function playground(body) {
   const cacheType = ['none', 'standard', 'semantic'].includes(body.cacheType) ? body.cacheType : 'none';
   const prompt = String(body.prompt || '');
@@ -832,6 +871,7 @@ async function playground(body) {
     endpoint: `${gw}${path_}`, keySource: source, status: res.status, ms: res.ms,
     xcache: res.headers['x-cache'] || '', cacheType, model: modelName, kind,
     request: payload, requestHeaders, responseHeaders, content, usage: json?.usage || null,
+    insecure: !verifyTls, // for the shareable curl command (-k)
     error: res.status >= 300 ? json?.error?.message || json?.message || res.text.slice(0, 500) : '',
     raw: res.text.length > 20000 ? `${res.text.slice(0, 20000)}…` : res.text,
   };
@@ -1311,6 +1351,14 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
       return send(res, 400, { error: err.code === 'DEPTH_ZERO_SELF_SIGNED_CERT' || /certificate/i.test(err.message)
         ? `${err.message} (untick "Verify TLS certificate" for a self-signed gateway)` : err.message });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/custom/detect-cache') {
+    try {
+      return send(res, 200, await detectCache(await readJson(req)));
+    } catch (err) {
+      return send(res, 400, { error: err.message });
     }
   }
 

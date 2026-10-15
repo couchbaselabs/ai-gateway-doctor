@@ -163,7 +163,7 @@ On the first start without a `.env`, the server creates one from `.env.example` 
 - **Raw config:** **Raw JSON** on the Config tab shows the config file, with **Copy** and **Download**. Private keys (also base64-encoded ones) and password, token and secret fields are redacted. Public certificates and Secrets Manager names are shown.
 - **Playground tab:** send your own requests to any model in the config.
   - **Choices:** the model, the cache mode (`none`, `standard` or `semantic`, marked when the config has it off), max tokens, temperature and an optional system prompt. Embedding models get an embeddings request.
-  - **Each answer shows:** `X-Cache`, HTTP status, token usage, latency, the answer, the request and response headers, and the raw response. **Send again** repeats the last request, which is the quickest way to see a cache HIT.
+  - **Each answer shows:** `X-Cache`, HTTP status, token usage, latency, the answer, the request and response headers, the raw response, and a **curl command** to share. It has the same headers and body, with the API key as `$AIGW_API_KEY`, `-i` to show the response headers, and `-k` only when TLS wasn't verified. **Send again** repeats the last request, which is the quickest way to see a cache HIT.
   - **Headers:** shown with their original casing. The Authorization value is redacted, and cache and `X-cb-*` headers are highlighted.
   - **Debug:** sends `X-cb-debug: true`. The gateway then adds its `X-cb-*` debug headers (cache type, match threshold and so on), which are listed under the answer.
   - **Gateway URL:** taken from the form, else the endpoint found by the last run's control plane lookup.
@@ -171,6 +171,7 @@ On the first start without a `.env`, the server creates one from `.env.example` 
   - **Custom endpoint:** switch the target to **Custom endpoint** to check any environment (dev, stage or prod) the way a client does, with just the gateway URL and an API key. No sandbox, config or AWS is needed.
     - **Connect:** shows the gateway's version, build and commit from `GET /v1/info`, and lists every model the key can use from `GET /v1/models` in a dropdown, with their status. **Other (type a name)…** takes a model that isn't listed.
     - **Request type:** pick **Chat completions** or **Embeddings**; it is guessed from the model name.
+    - **Detect cache:** a client can't read a model's cache settings, so this sends one tiny chat request per cache type (1 output token, `X-cb-debug: true`, a unique prompt). It reads `X-cb-cache-enabled` from each response, falling back to the presence of `X-Cache` on gateways without debug headers. The cache options then show which types are on, with the semantic threshold and embedding model. It runs only when clicked, and each check leaves a cache entry.
     - **TLS:** certificates are verified. Untick **Verify TLS certificate** for a self-signed gateway.
     - **Key:** the API key stays in the page and is never saved. The URL is remembered.
   - **Shortcuts:** `?tab=playground` opens the tab directly, and Cmd/Ctrl+Enter sends.

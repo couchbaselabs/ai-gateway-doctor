@@ -267,6 +267,11 @@
                 <option value="standard">standard</option>
                 <option value="semantic">semantic</option>
               </select>
+              <span class="cache-detect custom-only" hidden>
+                <button type="button" class="link" id="detect-cache"
+                  title="Sends one tiny chat request per cache type (1 output token, X-cb-debug: true) to see which are on; each leaves a cache entry">Detect cache</button>
+                <span id="cache-detected" class="muted small"></span>
+              </span>
             </label>
             <label class="narrow">Max tokens
               <input name="maxTokens" type="number" min="1" max="8192" value="256">

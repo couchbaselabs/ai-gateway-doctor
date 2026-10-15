@@ -598,3 +598,5 @@ table.headers tr.notable td:first-child { color: var(--cb-red); }
 .custom-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 8px; }
 #custom-target[hidden], .custom-only[hidden], .sandbox-only[hidden], #play-form input[hidden], #play-form select[hidden] { display: none; }
 #play-form select[name="requestType"] { margin-top: 6px; }
+.cache-detect { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-top: 5px; font-weight: 400; }
+.cache-detect[hidden] { display: none; }

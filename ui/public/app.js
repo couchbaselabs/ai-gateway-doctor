@@ -401,6 +401,7 @@ function playEntry(r) {
       el('div', { class: 'ex-q' }, el('span', { class: 'ex-label' }, 'Q'), el('span', {}, prompt)),
       el('div', { class: 'ex-a' }, el('span', { class: 'ex-label' }, 'A'), el('span', {}, ok ? r.content : r.error))),
     debugHeaders(r.responseHeaders),
+    curlBlock(r),
     headerTable('Request headers', r.requestHeaders, `POST ${r.endpoint}`),
     headerTable('Response headers', r.responseHeaders, `HTTP ${r.status}`),
     el('details', {}, el('summary', { class: 'small' }, `Raw response · ${r.keySource} · ${r.endpoint}`),
@@ -411,6 +412,32 @@ function playEntry(r) {
           return r.raw;
         }
       })())));
+}
+
+// curlCommand: the request as a shareable curl command. The API key is left as
+// $AIGW_API_KEY; -i shows the response headers (X-Cache); -k only when TLS was not verified.
+function curlCommand(r) {
+  const q = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
+  const lines = [`curl -sS -i${r.insecure ? ' -k' : ''} -X POST ${q(r.endpoint)}`];
+  for (const [k, v] of r.requestHeaders || []) {
+    lines.push(/^authorization$/i.test(k) ? '-H "Authorization: Bearer $AIGW_API_KEY"' : `-H ${q(`${k}: ${v}`)}`);
+  }
+  lines.push(`-d ${q(JSON.stringify(r.request))}`);
+  return lines.join(' \\\n  ');
+}
+
+function curlBlock(r) {
+  const text = curlCommand(r);
+  const copy = el('button', { type: 'button', class: 'small-btn' }, 'Copy');
+  copy.addEventListener('click', async (e) => {
+    e.preventDefault();
+    await navigator.clipboard.writeText(text);
+    copy.textContent = 'Copied';
+  });
+  return el('details', {},
+    el('summary', { class: 'small' }, 'curl command (API key as $AIGW_API_KEY)'),
+    el('div', { class: 'raw-head' }, el('span', { class: 'muted small' }, 'export AIGW_API_KEY=<your key>, then run:'), copy),
+    el('pre', { class: 'raw-json' }, text));
 }
 
 // The gateway's cache and debug headers stand out in the header lists.
@@ -469,10 +496,71 @@ function updatePlayTarget() {
   updateCustomModel();
   for (const x of playForm.querySelectorAll('.custom-only')) x.hidden = !custom;
   for (const x of playForm.querySelectorAll('.sandbox-only')) x.hidden = custom;
-  // "(off in config)" describes the sandbox's config, so a custom endpoint shows plain names.
-  if (custom) for (const opt of playForm.elements.cacheType.options) opt.textContent = opt.value;
+  // "(off in config)" describes the sandbox's config; a custom endpoint shows what Detect
+  // cache found for the model, or plain names.
+  if (custom) showDetectedCache();
   else updatePlayCache();
 }
+
+// ---- Detect cache (custom endpoint) ----
+const detectedCache = new Map(); // "<url>|<model>" -> result of /api/custom/detect-cache
+
+function detectKey() {
+  return `${playForm.elements.customUrl.value.trim()}|${customModelName()}`;
+}
+
+function showDetectedCache() {
+  const found = detectedCache.get(detectKey());
+  const embeddings = playForm.elements.requestType.value === 'embeddings';
+  for (const opt of playForm.elements.cacheType.options) {
+    const r = found?.[opt.value];
+    opt.textContent = !r ? opt.value
+      : r.enabled === null ? `${opt.value} (unknown)`
+        : `${opt.value} (${r.enabled ? 'on' : 'off'})`;
+  }
+  const line = $('cache-detected');
+  if (embeddings) {
+    line.textContent = 'the cache applies to chat completions';
+  } else if (!found) {
+    line.textContent = '';
+  } else {
+    const sem = found.semantic;
+    const parts = ['standard', 'semantic'].map((t) => {
+      const r = found[t];
+      if (r.enabled === null) return `${t}: ${r.error}`;
+      return `${t}: ${r.enabled ? 'on' : 'off'}`;
+    });
+    if (sem?.enabled && (sem.threshold || sem.embeddingModel)) {
+      parts.push([sem.threshold && `threshold ${sem.threshold}`, sem.embeddingModel && `embedding ${sem.embeddingModel}`].filter(Boolean).join(', '));
+    }
+    line.textContent = `${parts.join(' · ')} · checked ${new Date(found.checkedAt).toLocaleTimeString()}`;
+  }
+  $('detect-cache').disabled = embeddings || !customModelName();
+}
+
+$('detect-cache').addEventListener('click', async () => {
+  const line = $('cache-detected');
+  line.className = 'muted small';
+  line.textContent = 'checking…';
+  const resp = await fetch('/api/custom/detect-cache', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...customBody(), model: customModelName() }),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    line.className = 'small error-text';
+    line.textContent = data.error;
+    return;
+  }
+  detectedCache.set(detectKey(), data);
+  line.className = 'muted small';
+  showDetectedCache();
+  // Pick a cache type that is on, if the current one is not.
+  const sel = playForm.elements.cacheType;
+  if (sel.value !== 'none' && data[sel.value]?.enabled === false) {
+    sel.value = data.semantic?.enabled ? 'semantic' : data.standard?.enabled ? 'standard' : 'none';
+  }
+});
 
 // The custom model: picked from the /v1/models list, or typed after "Other (type a name)…".
 function customModelName() {
@@ -492,11 +580,16 @@ function guessRequestType() {
 playForm.elements.customModelPick.addEventListener('change', () => {
   updateCustomModel();
   guessRequestType();
+  showDetectedCache();
   if (playForm.elements.customModelPick.value === '__other') playForm.elements.customModel.focus();
 });
 
 for (const input of playForm.querySelectorAll('input[name="playTarget"]')) input.addEventListener('change', updatePlayTarget);
-playForm.elements.customModel.addEventListener('change', guessRequestType);
+playForm.elements.customModel.addEventListener('change', () => {
+  guessRequestType();
+  showDetectedCache();
+});
+playForm.elements.requestType.addEventListener('change', showDetectedCache);
 playForm.elements.customUrl.value = localStorage.getItem(CUSTOM_URL_KEY) || '';
 playForm.elements.customUrl.addEventListener('change', () => localStorage.setItem(CUSTOM_URL_KEY, playForm.elements.customUrl.value.trim()));
 
@@ -531,6 +624,7 @@ $('custom-connect').addEventListener('click', async () => {
   else if (!data.models.length) pick.value = '__other';
   updateCustomModel();
   guessRequestType();
+  showDetectedCache();
   const version = data.version
     ? `AI Gateway ${data.version}${data.buildTime ? `, built ${data.buildTime}` : ''}${data.commit ? `, commit ${data.commit.slice(0, 12)}` : ''}`
     : `no version (${data.infoError || '/v1/info gave none'})`;
