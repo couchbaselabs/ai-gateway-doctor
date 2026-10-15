@@ -514,7 +514,6 @@ pre.raw-json {
 /* ---------- Terminals tab ---------- */
 
 .term-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
-.term-method { width: 150px; }
 #term-tabs { display: flex; flex-wrap: wrap; gap: 4px; }
 .term-tab {
   display: flex;

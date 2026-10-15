@@ -204,20 +204,16 @@
       </div>
       <div id="terminals-view" hidden>
         <div class="term-bar">
-          <div class="segmented term-method" role="radiogroup" aria-label="Connect with">
-            <label><input type="radio" name="termMethod" value="ssm" checked><span>SSM</span></label>
-            <label><input type="radio" name="termMethod" value="ssh"><span>SSH</span></label>
-          </div>
           <button type="button" class="small-btn" id="term-aigw">+ AI Gateway shell</button>
           <button type="button" class="small-btn" id="term-cb">+ Couchbase node shell</button>
           <span id="term-msg" class="muted small"></span>
         </div>
         <div id="term-tabs"></div>
         <div id="term-host"><p class="empty">Open a shell on the sandbox's AI Gateway or Couchbase node.</p></div>
-        <p class="hint">SSM uses <code>aws ssm start-session</code> with your AWS credentials (no SSH keys needed).
-          SSH connects to <code>&lt;NAME&gt;_AIGW_SSH</code> / <code>&lt;NAME&gt;_CB_SSH</code> from .env, or
-          <code>ec2-user@&lt;public DNS&gt;</code>, with <code>SSH_KEY</code> if set. The node is found from its ASG
-          unless the form names its instance id.</p>
+        <p class="hint">Connects with <code>aws ssm start-session</code> and your AWS credentials (no SSH keys needed),
+          or over SSH when .env sets <code>&lt;NAME&gt;_AIGW_SSH</code> / <code>&lt;NAME&gt;_CB_SSH</code> (with <code>SSH_KEY</code> if set).
+          Both open a login shell as <code>ec2-user</code> (<code>sudo su - ec2-user</code>); set <code>TERMINAL_USER</code> in .env
+          to change it, or <code>none</code> to keep the login user. The node is found from its ASG unless the form names its instance id.</p>
       </div>
       <div id="config-view" hidden></div>
       <div id="playground-view" hidden>

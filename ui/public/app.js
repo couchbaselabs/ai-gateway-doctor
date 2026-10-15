@@ -1178,7 +1178,7 @@ async function openTerm(node) {
   const run = formBody();
   const resp = await post('/api/terminals', {
     sandbox: run.sandbox, config: run.config, region: run.region, aigwInstance: run.aigwInstance, cbInstance: run.cbInstance,
-    node, method: document.querySelector('input[name="termMethod"]:checked').value, rows: 30, cols: 120,
+    node, rows: 30, cols: 120,
   });
   const data = await resp.json();
   if (!resp.ok) {

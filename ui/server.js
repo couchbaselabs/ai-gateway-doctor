@@ -669,26 +669,41 @@ async function nodeInstance(ctx, role, body) {
   return id;
 }
 
+// terminalUser: the user both terminals switch to (TERMINAL_USER, default ec2-user), or ''
+// when TERMINAL_USER=none keeps the login shell.
+function terminalUser(ctx) {
+  const u = envValue(ctx.env, ctx.sandbox, 'TERMINAL_USER') || 'ec2-user';
+  if (/^none$/i.test(u)) return '';
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(u)) throw new Error(`invalid TERMINAL_USER: ${u}`);
+  return u;
+}
+
+// terminalCommand: SSH when .env names an SSH target for the node (<NAME>_AIGW_SSH or
+// <NAME>_CB_SSH), else SSM. Either way the shell becomes a login shell of TERMINAL_USER
+// (ec2-user): SSM sessions start as ssm-user, so they run "sudo su - <user>" through
+// AWS-StartInteractiveCommand; SSH does the same when it logs in as another user.
 async function terminalCommand(ctx, roleName, body) {
   const role = NODE_ROLES[roleName];
   if (!role) throw new Error('node must be aigw or cb');
-  if (body.method === 'ssh') {
-    let target = envValue(ctx.env, ctx.sandbox, role.sshKey);
-    if (!target) {
-      const id = await nodeInstance(ctx, role, body);
-      const dns = await aws(['ec2', 'describe-instances', '--region', ctx.region, '--instance-ids', id,
-        '--query', 'Reservations[0].Instances[0].PublicDnsName', '--output', 'text']);
-      if (!dns || dns === 'None') throw new Error(`${id} has no public DNS name; use SSM`);
-      target = `${envValue(ctx.env, ctx.sandbox, 'SSH_USER') || 'ec2-user'}@${dns}`;
-    }
-    if (!/^[\w.-]+@[\w.-]+$/.test(target)) throw new Error(`invalid SSH target: ${target}`);
+  const user = terminalUser(ctx);
+  const target = envValue(ctx.env, ctx.sandbox, role.sshKey);
+  if (target) {
+    if (!/^[\w.-]+@[\w.-]+$/.test(target)) throw new Error(`invalid ${role.sshKey}: ${target}`);
     const key = envValue(ctx.env, ctx.sandbox, 'SSH_KEY');
     const args = ['ssh', '-t', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ServerAliveInterval=30'];
     if (key) args.push('-i', existingFile(key, 'SSH key'));
-    return { args: [...args, target], title: `${role.label} · ssh ${target}` };
+    args.push(target);
+    const login = target.split('@')[0];
+    if (user && user !== login) args.push(`sudo su - ${user}`);
+    return { args, title: `${role.label} · ssh ${target}${user && user !== login ? ` → ${user}` : ''}` };
   }
   const id = await nodeInstance(ctx, role, body);
-  return { args: ['aws', 'ssm', 'start-session', '--region', ctx.region, '--target', id], title: `${role.label} · ${id} (SSM)` };
+  const args = ['aws', 'ssm', 'start-session', '--region', ctx.region, '--target', id];
+  if (user) {
+    args.push('--document-name', 'AWS-StartInteractiveCommand',
+      '--parameters', JSON.stringify({ command: [`sudo su - ${user}`] }));
+  }
+  return { args, title: `${role.label} · ${id} (SSM${user ? ` → ${user}` : ''})` };
 }
 
 function termSend(t, event) {
