@@ -1024,6 +1024,9 @@ function renderStep(step, isLast) {
   const checks = onlyProblems ? step.checks.filter((c) => c.status === 'fail' || c.status === 'warn') : step.checks;
   if (onlyProblems && !checks.length) return null;
   if (step.title === 'Start' && !step.checks.length && !step.details.length) return null;
+  // The AWS credentials step is shown only when it did not pass (it is in Raw output either way).
+  if (/^0\. AWS credentials/.test(step.title) && !(isLast && state.running)
+    && !step.checks.some((c) => c.status === 'fail' || c.status === 'warn')) return null;
 
   const active = isLast && state.running;
   const status = active ? 'running' : worst(step.checks);
