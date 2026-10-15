@@ -521,9 +521,10 @@ function showAdd(show) {
 }
 
 function updateAddVisibility() {
-  const upload = addForm.querySelector('input[name="configSource"]:checked').value === 'upload';
-  addForm.querySelector('.config-upload').hidden = !upload;
-  addForm.querySelector('.config-path').hidden = upload;
+  const source = addForm.querySelector('input[name="configSource"]:checked').value;
+  addForm.querySelector('.config-upload').hidden = source !== 'upload';
+  addForm.querySelector('.config-path').hidden = source !== 'path';
+  addForm.querySelector('.config-later').hidden = source !== 'later';
   const name = addForm.elements.name.value.trim();
   $('add-prefix').textContent = `${name ? name.toUpperCase().replace(/[^A-Z0-9]/g, '_') : '<NAME>'}_*`;
   const fm = fleetManagerUrl(addForm.elements.cpUrl.value.trim(), name, '');
@@ -544,7 +545,10 @@ addForm.addEventListener('submit', async (e) => {
   const f = addForm.elements;
   const body = {};
   for (const k of ['name', 'label', 'region', 'tenantId', 'cpUrl', 'cpUser', 'models']) body[k] = f[k].value.trim();
-  if (addForm.querySelector('input[name="configSource"]:checked').value === 'upload') {
+  const source = addForm.querySelector('input[name="configSource"]:checked').value;
+  if (source === 'later') {
+    // No config yet; the sandbox is saved by name.
+  } else if (source === 'upload') {
     const file = f.configFile.files[0];
     if (!file) {
       $('add-error').textContent = 'choose the sandbox config.json';
@@ -574,17 +578,22 @@ addForm.addEventListener('submit', async (e) => {
 // SANDBOX_DOMAIN from .env (via /api/sandboxes); without it, the link comes from the control plane URL only.
 let sandboxDomain = '';
 
-// fleetManagerUrl: where to download a sandbox's AI gateway config. FM_URL in .env wins;
-// else it follows the control plane host (api.<env>.<domain> -> fm.<env>.<domain>), or the
-// sandbox name with SANDBOX_DOMAIN from .env (fm.<sandbox>.<SANDBOX_DOMAIN>).
-function fleetManagerUrl(cpUrl, name, override) {
+// sandboxUrl: a sandbox web app at <sub>.<env>.<domain> ("fm" Fleet Manager, where the
+// AI gateway config is downloaded; "ui" the Capella console). An override from .env wins;
+// else it follows the control plane host (api.<env>.<domain>, or <env>.internal-api.<domain>),
+// or the sandbox name with the sandbox domain.
+function sandboxUrl(sub, cpUrl, name, override) {
   if (override) return override;
   let m = (cpUrl || '').match(/^https:\/\/api\.([^/:]+)/);
-  if (m) return `https://fm.${m[1]}/`;
+  if (m) return `https://${sub}.${m[1]}/`;
   m = (cpUrl || '').match(/^https:\/\/([^./]+)\.internal-api\.([^/:]+)/);
-  if (m) return `https://fm.${m[1]}.${m[2]}/`;
-  if (sandboxDomain && /^[a-z0-9][a-z0-9-]*$/i.test(name || '')) return `https://fm.${name.toLowerCase()}.${sandboxDomain}/`;
+  if (m) return `https://${sub}.${m[1]}.${m[2]}/`;
+  if (sandboxDomain && /^[a-z0-9][a-z0-9-]*$/i.test(name || '')) return `https://${sub}.${name.toLowerCase()}.${sandboxDomain}/`;
   return '';
+}
+
+function fleetManagerUrl(cpUrl, name, override) {
+  return sandboxUrl('fm', cpUrl, name, override);
 }
 
 function setFmLinks(scope, url) {
@@ -598,7 +607,48 @@ function setFmLinks(scope, url) {
 }
 
 function updateFmLink() {
-  setFmLinks(form, fleetManagerUrl(form.elements.cpUrl.value.trim(), selected === CUSTOM ? '' : selected, current()?.values.fmUrl));
+  const cpUrl = form.elements.cpUrl.value.trim();
+  const name = selected === CUSTOM ? '' : selected;
+  const fm = fleetManagerUrl(cpUrl, name, current()?.values.fmUrl);
+  const ui = sandboxUrl('ui', cpUrl, name, current()?.values.uiUrl);
+  setFmLinks(form, fm);
+  showLinks(ui, fm, '');
+  // Nothing in .env or the form: ask the server, which reads it from the gateway instance.
+  if (!ui && !fm && name) lookupLinks(name);
+}
+
+// showLinks: the links row under the sandbox title, or a hint when there are none.
+function showLinks(ui, fm, hint) {
+  for (const [id, url] of [['capella-ui-link', ui], ['fm-ui-link', fm]]) {
+    $(id).hidden = !url;
+    if (url) $(id).href = url;
+  }
+  if (fm) setFmLinks(form, fm);
+  $('links-hint').hidden = Boolean(ui || fm);
+  $('links-hint').textContent = hint || 'set a control plane URL to get links';
+}
+
+const linkLookups = new Map(); // sandbox -> pending or finished lookup
+
+async function lookupLinks(name) {
+  if (!linkLookups.has(name)) {
+    const run = formBody();
+    linkLookups.set(name, fetch('/api/links', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sandbox: name, config: run.config, region: run.region, tenantId: run.tenantId, aigwInstance: run.aigwInstance }),
+    }).then(async (resp) => ({ ok: resp.ok, data: await resp.json() })));
+  }
+  showLinks('', '', 'looking up the sandbox links…');
+  const { ok, data } = await linkLookups.get(name);
+  if (selected !== name) return; // the user moved on
+  if (!ok) {
+    linkLookups.delete(name); // try again next time
+    showLinks('', '', `no links: ${data.error}`);
+    return;
+  }
+  showLinks(data.ui, data.fm, '');
+  if (!form.elements.cpUrl.value) form.elements.cpUrl.placeholder = `found: ${data.cpUrl}/v2/organizations/<org id>`;
 }
 
 // ---------- form (middle) ----------
@@ -659,8 +709,38 @@ function updateEditButtons() {
   const changed = Boolean(edits()[selected]);
   const secret = Boolean(form.elements.cpPassword.value || form.elements.apiKey.value);
   $('reset-btn').hidden = !sb || !changed;
+  $('delete-btn').hidden = !sb;
   $('save-env-btn').hidden = !sb || (!changed && !secret);
 }
+
+// Delete: remove the sandbox from .env (and move its config in AIGW_CONFIG_DIR to .deleted/).
+$('delete-btn').addEventListener('click', async () => {
+  const sb = current();
+  if (!sb) return;
+  const ok = window.confirm(`Delete sandbox "${sb.label}"?\n\n`
+    + `Its settings are removed from .env (the old file is kept as .env.bak), and its config file in the config folder `
+    + `is moved to .deleted/ there. Saved runs and logs are kept.`);
+  if (!ok) return;
+  const resp = await fetch('/api/sandboxes/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sandbox: sb.name }),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    $('save-env-msg').hidden = false;
+    $('save-env-msg').className = 'hint error-text';
+    $('save-env-msg').textContent = data.error;
+    return;
+  }
+  const all = edits();
+  delete all[sb.name];
+  localStorage.setItem(EDITS_KEY, JSON.stringify(all));
+  await loadSandboxes();
+  select(CUSTOM);
+  $('save-env-msg').hidden = false;
+  $('save-env-msg').className = 'hint';
+  $('save-env-msg').textContent = `Deleted ${sb.name}: ${data.removedKeys} .env line(s) removed`
+    + (data.configMovedTo ? `, config moved to ${data.configMovedTo}` : '') + '.';
+});
 
 $('save-env-btn').addEventListener('click', async () => {
   const resp = await fetch('/api/sandboxes/save', {
@@ -1087,7 +1167,7 @@ async function showTerminals() {
     // Reattach to terminals that are still open on the server (e.g. after a reload).
     termsRestored = true;
     const { terminals } = await (await fetch('/api/terminals')).json();
-    for (const t of terminals) attachTerm(t.id, t.title);
+    for (const t of terminals) attachTerm(t.id, t.title); // the first opens the shared stream, which replays all
   }
   fitActive();
 }
@@ -1135,7 +1215,7 @@ function attachTerm(id, title) {
   const fit = new window.FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(pane);
-  const t = { term, fit, pane, title, done: false, source: null };
+  const t = { term, fit, pane, title, done: false };
   terms.set(id, t);
 
   // Keystrokes are batched briefly and sent in order.
@@ -1153,18 +1233,42 @@ function attachTerm(id, title) {
   });
   term.onResize(({ rows, cols }) => post('/api/terminals/resize', { id, rows, cols }));
 
-  t.source = new EventSource(`/api/terminals/stream?id=${encodeURIComponent(id)}`);
-  t.source.onmessage = (e) => {
-    const event = JSON.parse(e.data);
-    if (event.type === 'data') term.write(Uint8Array.from(atob(event.data), (c) => c.charCodeAt(0)));
-    if (event.type === 'exit') {
-      term.write(`\r\n\x1b[33m[session ended${event.code ? `, exit ${event.code}` : ''}]\x1b[0m\r\n`);
-      t.done = true;
-      t.source.close();
-      renderTermTabs();
-    }
-  };
+  // Output that arrived before this terminal was attached.
+  for (const event of termPending.get(id) || []) termEvent(t, event);
+  termPending.delete(id);
+  if (!termSource && !document.hidden) openTermEvents();
   activate(id);
+}
+
+// One stream carries every terminal's output (see /api/terminals/events).
+let termSource = null;
+const termPending = new Map(); // id -> events for terminals not attached yet
+
+function termEvent(t, event) {
+  if (event.type === 'data') t.term.write(Uint8Array.from(atob(event.data), (c) => c.charCodeAt(0)));
+  if (event.type === 'exit' && !t.done) {
+    t.term.write(`\r\n\x1b[33m[session ended${event.code ? `, exit ${event.code}` : ''}]\x1b[0m\r\n`);
+    t.done = true;
+    renderTermTabs();
+  }
+}
+
+// openTermEvents: (re)connect; the server replays each terminal's output, so the screens
+// are cleared first and redrawn from it.
+function openTermEvents() {
+  termSource?.close();
+  termPending.clear();
+  for (const t of terms.values()) {
+    t.term.reset();
+    t.done = false;
+  }
+  termSource = new EventSource('/api/terminals/events');
+  termSource.onmessage = (e) => {
+    const event = JSON.parse(e.data);
+    const t = terms.get(event.id);
+    if (t) termEvent(t, event);
+    else termPending.set(event.id, [...(termPending.get(event.id) || []), event]);
+  };
 }
 
 async function openTerm(node) {
@@ -1199,7 +1303,6 @@ function closeTerm(id) {
   const t = terms.get(id);
   if (!t) return;
   post('/api/terminals/close', { id });
-  t.source?.close();
   t.term.dispose();
   t.pane.remove();
   terms.delete(id);
@@ -1214,3 +1317,22 @@ function closeTerm(id) {
 $('term-aigw').addEventListener('click', () => openTerm('aigw'));
 $('term-cb').addEventListener('click', () => openTerm('cb'));
 window.addEventListener('resize', fitActive);
+
+
+// A tab in the background closes its streams and reconnects when shown again (the server
+// replays what it missed). Browsers allow only six open connections per server, so tabs
+// left open in the background could otherwise block every request from this page.
+let streamsPaused = false;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    source?.close();
+    termSource?.close();
+    termSource = null;
+    streamsPaused = true;
+  } else if (streamsPaused) {
+    streamsPaused = false;
+    follow();
+    if (terms.size) openTermEvents();
+    loadSandboxes();
+  }
+});

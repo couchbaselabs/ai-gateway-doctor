@@ -300,6 +300,8 @@ button.cta:hover:not(:disabled) { background: var(--cb-dark-grey); }
 button.link { background: none; border: 0; color: var(--link); padding: 0; font-weight: 600; font-size: 12.5px; border-radius: 0; }
 button.link:hover:not(:disabled) { background: none; color: var(--link-hover); text-decoration: underline; }
 button.link[hidden] { display: none; }
+button.link.danger { color: var(--cb-red); }
+button.link.danger:hover:not(:disabled) { color: var(--cb-burgundy); }
 #form-error, #add-error { color: var(--cb-red); font-weight: 600; font-size: 12.5px; }
 
 .add-btn { align-self: flex-start; margin: 10px 10px 0; }
@@ -316,6 +318,9 @@ a.fm-link[hidden] { display: none; }
 .thanks { padding: 12px 8px 0; font-size: 11.5px; color: var(--muted); }
 .thanks a { color: var(--link); text-decoration: none; font-weight: 600; }
 .thanks a:hover { color: var(--link-hover); text-decoration: underline; }
+
+#links-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 6px; font-size: 12px; }
+a.small-btn[hidden], #links-hint[hidden] { display: none; }
 
 #console-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 6px; font-size: 12px; }
 .small-btn {
@@ -574,3 +579,4 @@ table.headers tr.notable td:first-child { color: var(--cb-red); }
 @media (prefers-color-scheme: dark) {
   .cta-arrow { background: var(--cb-black); }
 }
+.config-later[hidden] { display: none; }

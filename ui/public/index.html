@@ -42,7 +42,11 @@
           <div class="segmented" role="radiogroup" aria-label="Config source">
             <label><input type="radio" name="configSource" value="upload" checked><span>Upload config.json</span></label>
             <label><input type="radio" name="configSource" value="path"><span>Path on this machine</span></label>
+            <label><input type="radio" name="configSource" value="later"><span>Later</span></label>
           </div>
+          <p class="hint config-later" hidden>Without a config you can still open the sandbox's Capella UI, Fleet Manager,
+            Couchbase console and terminals (set the tenant id below). Add the config later by setting its path and
+            Save to .env, or by putting <code>&lt;name&gt;.config.json</code> in the config folder.</p>
           <label class="config-upload">Config file
             <input name="configFile" type="file" accept=".json,application/json">
           </label>
@@ -86,12 +90,19 @@
         <span class="head-actions">
           <button type="button" class="link" id="save-env-btn" title="Write your changes to this sandbox's settings in .env" hidden>Save to .env</button>
           <button type="button" class="link" id="reset-btn" title="Discard edits and use the .env values">Reset to .env</button>
+          <button type="button" class="link danger" id="delete-btn" title="Remove this sandbox from .env" hidden>Delete</button>
         </span>
       </div>
       <p id="save-env-msg" class="hint" hidden></p>
       <div id="version-bar">
         <span id="gw-version" class="muted">AI Gateway version: not checked yet</span>
         <button type="button" class="small-btn" id="version-btn" title="GET /v1/info on the gateway">Check version</button>
+      </div>
+      <div id="links-bar">
+        <span class="muted">Sandbox</span>
+        <a class="small-btn" id="capella-ui-link" target="_blank" rel="noopener" title="The sandbox's Capella console" hidden>Capella UI ↗</a>
+        <a class="small-btn" id="fm-ui-link" target="_blank" rel="noopener" title="Fleet Manager, where the AI gateway config is downloaded" hidden>Fleet Manager ↗</a>
+        <span id="links-hint" class="muted small" hidden>set a control plane URL to get links</span>
       </div>
       <div id="console-bar" title="The cache cluster's Couchbase Server web console">
         <span class="muted">Couchbase console</span>

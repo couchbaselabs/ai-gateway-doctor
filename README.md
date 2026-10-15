@@ -142,15 +142,21 @@ On the first start without a `.env`, the server creates one from `.env.example` 
   - **Override:** set `FM_URL` or `<NAME>_FM_URL` in `.env` for other environments.
 - **Adding a sandbox:** click **+ Add sandbox** under the list.
   - **Fields:** a name (e.g. `my-sandbox`), a label, and the gateway config, either uploaded or as a path on this machine. Then the region, tenant id, control plane URL (the console API URL with `/v2/organizations/<org id>` works), Capella login and models.
+  - **Without a config (Later):** the sandbox is saved by name, region and tenant id, so you can use its Capella UI and Fleet Manager links, its Couchbase console and its terminals right away. The nodes are found from the tenant's running instances by their ASG names (`capella-ai-gateway-*`, `capella-ds-*`). Runs, the Config tab, the Playground and copying the Couchbase credentials need the config. Add it later by setting the Config file path and pressing **Save to .env**, or by putting `<name>.config.json` in the config folder.
   - **Upload:** an uploaded config is saved as `<name>.config.json` in `AIGW_CONFIG_DIR` (default `~/.aigw-doctor/configs`), with mode 600.
   - **`.env`:** the settings are appended as a commented `<NAME>_*` block, and a path-based sandbox is also added to `SANDBOXES`.
   - **Passwords and API keys:** not written by the UI. Add `CP_PASSWORD` or `<NAME>_CP_PASSWORD` to `.env` yourself, or type them in the run form.
-  - **By hand:** you can instead drop `<name>.config.json` into `AIGW_CONFIG_DIR` and add `<NAME>_*` keys to `.env`. To change or remove a sandbox, edit `.env`.
+  - **By hand:** you can instead drop `<name>.config.json` into `AIGW_CONFIG_DIR` and add `<NAME>_*` keys to `.env`.
+- **Deleting a sandbox:** **Delete** next to the sandbox title, after a confirmation, removes the sandbox's `<NAME>_*` lines, the comment header the UI wrote for it, and its `SANDBOXES` entry from `.env` (the previous file is kept as `.env.bak`).
+  - **Config file:** one in `AIGW_CONFIG_DIR` is moved to `.deleted/` there, or the sandbox would be found again. A config elsewhere is left alone.
+  - **Kept:** saved runs and logs.
+  - **Refused:** while the sandbox has a run in progress.
 - **Config tab:** next to **Results**, it shows what the selected sandbox's config sets up.
   - **Cache store:** the cluster host and keyspaces, and the Secrets Manager entries (by name only).
   - **Models:** one card per model, with its kind, backend and status, and its cache settings: the top-level and per-type flags, default type and expiry. Each card also shows which cache types the doctor will test, or why it won't.
   - **Details:** the semantic cache's embedding model, threshold, dimensions, similarity and index; guardrail, jailbreak and batch flags; and qps, queue and timeout.
   - **Not shown:** certificates, model keys and other secret values are never sent to the page. `?tab=config` opens this tab directly.
+- **Sandbox links:** under the sandbox title, **Capella UI ↗** opens the sandbox's Capella console (`https://ui.<env>.<domain>/`) and **Fleet Manager ↗** opens `https://fm.<env>.<domain>/`, where the AI gateway config is downloaded. They come from the sandbox's control plane URL in `.env` or the form. Without one, the server reads it once from the gateway instance (found from its ASG): only the `api` field of its EC2 user data, `https://<env>.internal-api.<domain>`, is used. The form's control plane URL field then shows what was found. A sandbox known only by name, such as `sbx-18`, gets `ui.sbx-18.<domain>` and `fm.sbx-18.<domain>`. The domain comes from `SANDBOX_DOMAIN`, which the server learns from the first sandbox whose links it finds and saves to `.env`. Override the links with `UI_URL` / `<NAME>_UI_URL` and `FM_URL` / `<NAME>_FM_URL` in `.env`.
 - **Couchbase console:** the buttons under the sandbox title help you log in to the cache cluster's web console.
   - **Open ↗:** opens `https://<cache node public DNS>:18091`. The host comes from the sandbox's last run, or from an AWS lookup of the `capella-ds-<deployment id>` ASG. Expect a certificate warning, because the sandbox uses a self-signed certificate.
   - **Copy user / Copy password:** read the config's `dbCredKey` credential from Secrets Manager with your AWS credentials and put it on your clipboard. The password is fetched only when you click, and is not stored anywhere.

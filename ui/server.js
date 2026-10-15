@@ -77,6 +77,7 @@ const ENV_FIELDS = {
   SCOPE: 'scope',
   MODE: 'mode',
   FM_URL: 'fmUrl', // Fleet Manager, where the gateway config can be downloaded
+  UI_URL: 'uiUrl', // the sandbox's Capella console
 };
 const SECRETS = ['CP_PASSWORD', 'AIGW_API_KEY'];
 
@@ -267,7 +268,9 @@ function addSandbox(body) {
     lines.unshift(`${prefix}_CONFIG=${configFile}`);
     listed = true;
   } else {
-    throw new Error('upload a config.json or give its path');
+    // No config yet: list it by name; its config can be set later.
+    configFile = null;
+    listed = true;
   }
 
   let text = fs.existsSync(ENV_FILE) ? fs.readFileSync(ENV_FILE, 'utf8') : '';
@@ -356,6 +359,144 @@ function saveSettings(body) {
   fs.writeFileSync(ENV_FILE, `${out.join('\n')}\n`, { mode: 0o600 });
   fs.chmodSync(ENV_FILE, 0o600);
   return { saved: [...updates.keys()].map((k) => (k.endsWith('PASSWORD') || k.endsWith('API_KEY') ? `${k} (secret)` : k)) };
+}
+
+// ---------- sandbox links (Capella UI, Fleet Manager) ----------
+
+// webBase: "<env>.<domain>" from a control plane URL (https://api.<env>.<domain>/... or the
+// internal https://<env>.internal-api.<domain>), or '' when it is neither.
+function webBase(url) {
+  let m = String(url || '').match(/^https:\/\/api\.([^/:]+)/);
+  if (m) return m[1];
+  m = String(url || '').match(/^https:\/\/([^./]+)\.internal-api\.([^/:]+)/);
+  return m ? `${m[1]}.${m[2]}` : '';
+}
+
+// The sandbox's <env>.<domain>, found once per sandbox and config.
+const linkCache = new Map();
+
+// knownDomain: the domain sandboxes live under: SANDBOX_DOMAIN in .env, else the domain of
+// any sandbox's control plane URL or of a gateway lookup this session (sandboxes of one
+// environment share it).
+function knownDomain(env) {
+  if (/^[\w.-]+$/.test(env.SANDBOX_DOMAIN || '')) return env.SANDBOX_DOMAIN;
+  const bases = [...linkCache.values()].map((c) => c.base);
+  for (const [key, value] of Object.entries(env)) if (/(^|_)CP_URL$/.test(key)) bases.push(webBase(value));
+  const base = bases.find(Boolean);
+  return base ? base.split('.').slice(1).join('.') : '';
+}
+
+// rememberDomain: keep a learned domain in .env (SANDBOX_DOMAIN) so a sandbox known only by
+// name gets links after a restart too. Nothing is written when .env already sets it.
+function rememberDomain(base) {
+  const domain = base.split('.').slice(1).join('.');
+  if (!domain || readEnv().SANDBOX_DOMAIN) return;
+  const text = fs.existsSync(ENV_FILE) ? fs.readFileSync(ENV_FILE, 'utf8').replace(/\n*$/, '\n') : '';
+  fs.writeFileSync(ENV_FILE, `${text}\n# Learned from a sandbox's gateway; links for sandboxes known only by name use it.\nSANDBOX_DOMAIN=${domain}\n`, { mode: 0o600 });
+}
+
+// sandboxLinks: the Capella UI and Fleet Manager URLs. In order: UI_URL / FM_URL in .env; a
+// control plane URL (form or .env); an earlier lookup; the gateway instance's user data (its
+// "api" field), when the config or tenant id can find the gateway; or the sandbox name
+// under the known domain (fm.<name>.<domain>).
+async function sandboxLinks(body, learning = false) {
+  const env = readEnv();
+  const name = String(body.sandbox || '');
+  const ui = envValue(env, name, 'UI_URL');
+  const fm = envValue(env, name, 'FM_URL');
+  const values = sandboxList(env).find((s) => s.name === name)?.values || {};
+  let base = webBase(String(body.cpUrl || '') || envValue(env, name, 'CP_URL'));
+  let source = base ? 'control plane URL' : '';
+  const key = `${name}|${body.config || values.config || ''}|${body.region || values.region || ''}`;
+  if (!base && linkCache.has(key)) ({ base, source } = linkCache.get(key));
+  const canLookUp = Boolean(body.config || values.config || body.tenantId || values.tenantId || body.aigwInstance || values.aigwInstance);
+  if (!base && canLookUp) {
+    const ctx = sandboxContext(body);
+    const id = await nodeInstance(ctx, NODE_ROLES.aigw, body);
+    const data = await aws(['ec2', 'describe-instance-attribute', '--region', ctx.region, '--instance-id', id,
+      '--attribute', 'userData', '--query', 'UserData.Value', '--output', 'text']);
+    let api = '';
+    try {
+      api = JSON.parse(Buffer.from(data, 'base64').toString('utf8')).api || '';
+    } catch { /* not JSON */ }
+    base = webBase(api);
+    if (!base) throw new Error(`the gateway instance ${id} does not report a control plane URL`);
+    source = `gateway ${id}`;
+    linkCache.set(key, { base, source });
+    rememberDomain(base);
+  }
+  if (!base && SANDBOX_NAME.test(name)) {
+    // No domain known yet: learn it from another sandbox whose gateway can be found.
+    if (!knownDomain(env) && !learning) {
+      for (const other of sandboxList(env)) {
+        if (other.name === name || !(other.values.config || other.values.tenantId || other.values.aigwInstance)) continue;
+        try {
+          await sandboxLinks({ sandbox: other.name }, true);
+          break;
+        } catch { /* try the next one */ }
+      }
+    }
+    const domain = knownDomain(readEnv());
+    if (domain) {
+      base = `${name.toLowerCase()}.${domain}`;
+      source = 'sandbox name';
+    }
+  }
+  if (!base) {
+    throw new Error('set its tenant id or config, or SANDBOX_DOMAIN in .env (learned automatically from any sandbox whose links were found)');
+  }
+  return { ui: ui || `https://ui.${base}/`, fm: fm || `https://fm.${base}/`, cpUrl: `https://api.${base}`, source };
+}
+
+// ---------- deleting a sandbox ----------
+
+// deleteSandbox: remove a sandbox's settings from .env (its <NAME>_* lines, the comment
+// header the UI wrote for it, and its SANDBOXES entry; the old file is kept as .env.bak).
+// A config file in AIGW_CONFIG_DIR is moved to .deleted/ there, or the sandbox would be
+// found again; a config elsewhere is left alone. Run history is kept.
+function deleteSandbox(body) {
+  const name = String(body.sandbox || '');
+  const env = readEnv();
+  const sb = sandboxList(env).find((s) => s.name === name);
+  if (!SANDBOX_NAME.test(name) || !sb) throw Object.assign(new Error(`no sandbox ${name}`), { status: 404 });
+  if (runs.get(name)?.done === false) throw Object.assign(new Error(`${name} is running; wait or cancel first`), { status: 409 });
+
+  const prefix = `${envPrefix(name)}_`;
+  let removed = 0;
+  if (fs.existsSync(ENV_FILE)) {
+    const lines = fs.readFileSync(ENV_FILE, 'utf8').split('\n');
+    const kept = [];
+    for (const line of lines) {
+      const key = (line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/) || [])[1];
+      if (key && key.startsWith(prefix)) {
+        removed += 1;
+        continue;
+      }
+      if (line.trim() === `# ${name}` || line.startsWith(`# ${name}: `)) continue; // its block header
+      const list = line.match(/^(\s*(?:export\s+)?SANDBOXES\s*=\s*)(.*)$/);
+      if (list) {
+        const names = list[2].replace(/^["']|["']$/g, '').split(',').map((x) => x.trim()).filter((x) => x && x !== name);
+        if (names.length) kept.push(`SANDBOXES=${names.join(',')}`);
+        continue;
+      }
+      kept.push(line);
+    }
+    fs.copyFileSync(ENV_FILE, `${ENV_FILE}.bak`);
+    const text = kept.join('\n').replace(/\n{3,}/g, '\n\n').replace(/\n*$/, '\n');
+    fs.writeFileSync(ENV_FILE, text, { mode: 0o600 });
+    fs.chmodSync(ENV_FILE, 0o600);
+  }
+
+  let moved = null;
+  const dir = env.AIGW_CONFIG_DIR && path.resolve(expandHome(env.AIGW_CONFIG_DIR));
+  const config = sb.values.config && path.resolve(expandHome(sb.values.config));
+  if (dir && config && path.dirname(config) === dir && fs.existsSync(config)) {
+    const trash = path.join(dir, '.deleted');
+    fs.mkdirSync(trash, { recursive: true, mode: 0o700 });
+    moved = path.join(trash, `${path.basename(config)}.${new Date().toISOString().replace(/[:.]/g, '-')}`);
+    fs.renameSync(config, moved);
+  }
+  return { sandbox: name, removedKeys: removed, configMovedTo: moved };
 }
 
 // ---------- config overview ----------
@@ -477,13 +618,20 @@ function sandboxContext(body) {
   const sandbox = body.sandbox || '';
   const values = sandboxList(env).find((s) => s.name === sandbox)?.values || {};
   const pick = (k) => String(body[k] || values[k] || '').trim();
-  const configFile = existingFile(pick('config'), 'config');
-  const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  // A sandbox may have no config yet (added to check its consoles first); callers that need
+  // the config say so through needConfig().
+  const configFile = pick('config') ? existingFile(pick('config'), 'config') : '';
+  const config = configFile ? JSON.parse(fs.readFileSync(configFile, 'utf8')) : {};
   const region = pick('region');
   if (region && !OPTIONS.region[1].test(region)) throw new Error(`invalid region: ${region}`);
   const dbCredKey = config.modelServiceStoreConfig?.defaults?.dbCredKey || '';
   const deployId = (dbCredKey.match(/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_/) || [])[1] || '';
-  return { env, sandbox: sandbox || CUSTOM, values, pick, config, configFile, region: region || 'us-east-2', dbCredKey, deployId };
+  const tenantId = pick('tenantId');
+  return { env, sandbox: sandbox || CUSTOM, values, pick, config, configFile, region: region || 'us-east-2', dbCredKey, deployId, tenantId };
+}
+
+function needConfig(ctx) {
+  if (!ctx.configFile) throw new Error(`no config file yet: download it from Fleet Manager, then set the Config file field and Save to .env`);
 }
 
 // lastRunMatch: the first match of RE in the sandbox's latest runs (live, then saved).
@@ -513,21 +661,17 @@ async function consoleInfo(ctx) {
   let host = lastRunMatch(ctx.sandbox, /from this machine: host (\S+), admin (\S+)/)?.[1];
   let source = 'last run';
   if (!host || host.startsWith('<')) {
-    if (!ctx.deployId) throw new Error('the config has no dbCredKey with a deployment id');
-    const asg = `${ctx.env.DS_ASG_PREFIX || 'capella-ds-'}${ctx.deployId}`;
-    const ids = await aws(['autoscaling', 'describe-auto-scaling-groups', '--region', ctx.region,
-      '--auto-scaling-group-names', asg, '--query', 'AutoScalingGroups[0].Instances[].InstanceId', '--output', 'text']);
-    const id = ids.split(/\s+/).find((x) => x.startsWith('i-'));
-    if (!id) throw new Error(`no instance in ASG ${asg} (${ctx.region})`);
+    const id = await nodeInstance(ctx, NODE_ROLES.cb, {});
     host = await aws(['ec2', 'describe-instances', '--region', ctx.region, '--instance-ids', id,
       '--query', 'Reservations[0].Instances[0].PublicDnsName', '--output', 'text']);
     if (!host || host === 'None') throw new Error(`instance ${id} has no public DNS name`);
-    source = `ASG ${asg}`;
+    source = `instance ${id}`;
   }
   return { url: `https://${host}:18091/ui/index.html`, host, source };
 }
 
 async function consoleCredentials(ctx) {
+  needConfig(ctx); // the credential's name is in the config
   if (!ctx.dbCredKey) throw new Error('the config has no dbCredKey');
   const secret = await aws(['secretsmanager', 'get-secret-value', '--region', ctx.region,
     '--secret-id', ctx.dbCredKey, '--query', 'SecretString', '--output', 'text']);
@@ -596,6 +740,7 @@ async function deletePlayKeys() {
 // playground: one request to a model in the config, through the gateway.
 async function playground(body) {
   const ctx = sandboxContext(body);
+  needConfig(ctx);
   const model = (ctx.config.modelConfig?.models || []).find((m) => m.modelName === body.model);
   if (!model) throw new Error(`model ${body.model} is not in the config`);
   const cacheType = ['none', 'standard', 'semantic'].includes(body.cacheType) ? body.cacheType : 'none';
@@ -660,13 +805,28 @@ async function nodeInstance(ctx, role, body) {
     if (!OPTIONS[role.field][1].test(typed)) throw new Error(`invalid ${role.field}: ${typed}`);
     return typed;
   }
-  if (!ctx.deployId) throw new Error('the config has no dbCredKey with a deployment id to find the node');
-  const asg = `${role.prefix(ctx.env)}${ctx.deployId}`;
-  const ids = await aws(['autoscaling', 'describe-auto-scaling-groups', '--region', ctx.region,
-    '--auto-scaling-group-names', asg, '--query', 'AutoScalingGroups[0].Instances[].InstanceId', '--output', 'text']);
-  const id = ids.split(/\s+/).find((x) => /^i-[0-9a-f]{8,17}$/.test(x));
-  if (!id) throw new Error(`no instance in ASG ${asg} (${ctx.region})`);
-  return id;
+  if (ctx.deployId) {
+    const asg = `${role.prefix(ctx.env)}${ctx.deployId}`;
+    const ids = await aws(['autoscaling', 'describe-auto-scaling-groups', '--region', ctx.region,
+      '--auto-scaling-group-names', asg, '--query', 'AutoScalingGroups[0].Instances[].InstanceId', '--output', 'text']);
+    const id = ids.split(/\s+/).find((x) => /^i-[0-9a-f]{8,17}$/.test(x));
+    if (!id) throw new Error(`no instance in ASG ${asg} (${ctx.region})`);
+    return id;
+  }
+  // No config (so no deployment id): the tenant's running instances, by ASG name prefix.
+  if (!/^[0-9a-fA-F-]{8,64}$/.test(ctx.tenantId)) {
+    throw new Error('set the tenant (org) id, or a config file, to find the sandbox nodes');
+  }
+  const out = await aws(['ec2', 'describe-instances', '--region', ctx.region,
+    '--filters', `Name=tag-value,Values=${ctx.tenantId}`, 'Name=instance-state-name,Values=running',
+    '--query', "Reservations[].Instances[].[InstanceId, Tags[?Key=='aws:autoscaling:groupName'].Value | [0]]",
+    '--output', 'text']);
+  const prefix = role.prefix(ctx.env);
+  const ids = out.split('\n').map((l) => l.trim().split(/\s+/)).filter(([id, asg]) => /^i-/.test(id || '') && (asg || '').startsWith(prefix)).map(([id]) => id);
+  if (ids.length === 1) return ids[0];
+  throw new Error(ids.length
+    ? `several ${prefix}* instances for this tenant (${ids.join(', ')}); set the instance id under "Instances, URLs and threshold"`
+    : `no running ${prefix}* instance for tenant ${ctx.tenantId} in ${ctx.region}`);
 }
 
 // terminalUser: the user both terminals switch to (TERMINAL_USER, default ec2-user), or ''
@@ -706,9 +866,16 @@ async function terminalCommand(ctx, roleName, body) {
   return { args, title: `${role.label} · ${id} (SSM${user ? ` → ${user}` : ''})` };
 }
 
+// Pages follow all terminals over one stream (/api/terminals/events), tagged by id. A
+// browser allows only six open connections per server, so one stream per terminal could
+// leave no room for ordinary requests.
+const termWatchers = new Set();
+
 function termSend(t, event) {
   const frame = `data: ${JSON.stringify(event)}\n\n`;
   for (const res of t.viewers) res.write(frame);
+  const tagged = `data: ${JSON.stringify({ id: t.id, ...event })}\n\n`;
+  for (const res of termWatchers) res.write(tagged);
 }
 
 async function openTerminal(body) {
@@ -773,7 +940,7 @@ function existingFile(value, label) {
 
 // buildArgs turns the form into doctor arguments, rejecting anything unexpected.
 function buildArgs(body) {
-  if (!body.config) throw new Error('config path is required');
+  if (!body.config) throw new Error('no config file yet: download it from Fleet Manager, then set the Config file field and Save to .env');
   if (!['dry-run', 'check'].includes(body.mode)) throw new Error('mode must be dry-run or check');
   const args = ['--config', existingFile(body.config, 'config'), `--${body.mode}`, '--verbose'];
   for (const [field, [flag, pattern]] of Object.entries(OPTIONS)) {
@@ -941,6 +1108,22 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  if (req.method === 'POST' && url.pathname === '/api/links') {
+    try {
+      return send(res, 200, await sandboxLinks(await readJson(req)));
+    } catch (err) {
+      return send(res, 400, { error: err.message });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/sandboxes/delete') {
+    try {
+      return send(res, 200, deleteSandbox(await readJson(req)));
+    } catch (err) {
+      return send(res, err.status || 400, { error: err.message });
+    }
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/sandboxes/save') {
     try {
       return send(res, 200, saveSettings(await readJson(req)));
@@ -963,6 +1146,7 @@ const server = http.createServer(async (req, res) => {
     const typed = url.searchParams.get('path') || '';
     const fromEnv = sandboxList(readEnv()).find((s) => s.name === sandbox)?.values.config || '';
     try {
+      if (!typed && !fromEnv) throw new Error('no config file yet: download it from Fleet Manager, then set the Config file field and Save to .env');
       const file = existingFile(typed || fromEnv, 'config');
       if (!file.endsWith('.json')) throw new Error('config must be a .json file');
       return send(res, 200, configSummary(file));
@@ -976,6 +1160,7 @@ const server = http.createServer(async (req, res) => {
     const typed = url.searchParams.get('path') || '';
     const fromEnv = sandboxList(readEnv()).find((s) => s.name === sandbox)?.values.config || '';
     try {
+      if (!typed && !fromEnv) throw new Error('no config file yet: download it from Fleet Manager, then set the Config file field and Save to .env');
       const file = existingFile(typed || fromEnv, 'config');
       if (!file.endsWith('.json')) throw new Error('config must be a .json file');
       const json = redact(JSON.parse(fs.readFileSync(file, 'utf8')));
@@ -1009,6 +1194,18 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
       return send(res, 400, { error: err.message });
     }
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/terminals/events') {
+    // Every terminal: replay its output so far, then follow all of them.
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
+    for (const t of terminals.values()) {
+      if (t.buffer.length) res.write(`data: ${JSON.stringify({ id: t.id, type: 'data', data: Buffer.concat(t.buffer).toString('base64') })}\n\n`);
+      if (t.done) res.write(`data: ${JSON.stringify({ id: t.id, type: 'exit', code: t.exitCode })}\n\n`);
+    }
+    termWatchers.add(res);
+    req.on('close', () => termWatchers.delete(res));
+    return;
   }
 
   if (req.method === 'GET' && url.pathname === '/api/terminals/stream') {
