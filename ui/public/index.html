@@ -229,9 +229,37 @@
       <div id="config-view" hidden></div>
       <div id="playground-view" hidden>
         <form id="play-form" autocomplete="off">
+          <div class="segmented play-target" role="radiogroup" aria-label="Target">
+            <label><input type="radio" name="playTarget" value="sandbox" checked><span>Sandbox</span></label>
+            <label><input type="radio" name="playTarget" value="custom"><span>Custom endpoint</span></label>
+          </div>
+          <div id="custom-target" hidden>
+            <div class="custom-row">
+              <label>Gateway URL
+                <input name="customUrl" placeholder="https://<gateway endpoint>">
+              </label>
+              <label>API key (kept in this page only)
+                <input name="customKey" type="password" autocomplete="off">
+              </label>
+            </div>
+            <div class="custom-actions">
+              <label class="check-inline"><input type="checkbox" name="verifyTls" checked> Verify TLS certificate</label>
+              <button type="button" class="small-btn" id="custom-connect" title="GET /v1/info and /v1/models with this key">Connect</button>
+              <span id="custom-info" class="muted small"></span>
+            </div>
+          </div>
           <div class="play-row">
             <label>Model
               <select name="model"></select>
+              <select name="customModelPick" hidden>
+                <option value="">Connect to list the models</option>
+                <option value="__other">Other (type a name)…</option>
+              </select>
+              <input name="customModel" placeholder="model name" hidden>
+              <select name="requestType" class="custom-only" hidden title="The endpoint to call">
+                <option value="chat">Chat completions</option>
+                <option value="embeddings">Embeddings</option>
+              </select>
             </label>
             <label>Cache
               <select name="cacheType">
@@ -261,8 +289,11 @@
             <button type="button" class="link" id="play-clear">Clear</button>
             <span id="play-msg" class="muted small"></span>
           </div>
-          <p class="hint">Uses the gateway URL and API key choice from the form (a temporary key is created once and reused
+          <p class="hint sandbox-only">Uses the gateway URL and API key choice from the form (a temporary key is created once and reused
             for up to an hour). Without a gateway URL, the endpoint found by the last run's control plane lookup is used.</p>
+          <p class="hint custom-only" hidden>Talks to the gateway like any client: just its URL and an API key, so dev, stage
+            and prod can be checked the same way. Connect shows its version (<code>/v1/info</code>) and the models the
+            key can use (<code>/v1/models</code>). The key stays in this page and is never saved.</p>
         </form>
         <div id="play-log"></div>
       </div>

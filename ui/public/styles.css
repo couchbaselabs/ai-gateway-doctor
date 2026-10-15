@@ -591,3 +591,10 @@ table.headers tr.notable td:first-child { color: var(--cb-red); }
   .fix-hints { background: rgba(151, 0, 15, 0.28); color: var(--cb-peach); }
   .fix-label { color: var(--cb-orange); }
 }
+
+/* Playground: custom endpoint */
+.play-target { max-width: 460px; }
+.custom-row { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 10px; }
+.custom-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 8px; }
+#custom-target[hidden], .custom-only[hidden], .sandbox-only[hidden], #play-form input[hidden], #play-form select[hidden] { display: none; }
+#play-form select[name="requestType"] { margin-top: 6px; }

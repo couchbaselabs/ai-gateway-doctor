@@ -590,12 +590,12 @@ function aws(args) {
 
 // request: an HTTPS (or HTTP) call that, like the doctor's curl -k, accepts the sandbox's
 // self-signed certificates. Resolves to { status, headers, text, ms }.
-function request(method, url, { headers = {}, body, timeout = 120000 } = {}) {
+function request(method, url, { headers = {}, body, timeout = 120000, verifyTls = false } = {}) {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const u = new URL(url);
     const lib = u.protocol === 'http:' ? http : https;
-    const req = lib.request(u, { method, headers, timeout, rejectUnauthorized: false }, (res) => {
+    const req = lib.request(u, { method, headers, timeout, rejectUnauthorized: verifyTls }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({
@@ -738,20 +738,73 @@ async function deletePlayKeys() {
 }
 
 // playground: one request to a model in the config, through the gateway.
+// customTarget: a gateway URL and API key typed in the playground, for any environment
+// (dev, stage, prod), used like a client would: no sandbox, config or AWS.
+const CUSTOM_URL = /^https?:\/\/[\w.-]+(:\d+)?(\/[\w.~/-]*)?$/;
+function customTarget(body) {
+  const gw = String(body.aigwUrl || '').trim().replace(/\/+$/, '');
+  if (!CUSTOM_URL.test(gw)) throw new Error('enter the gateway URL, e.g. https://<gateway endpoint>');
+  const key = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+  if (!key) throw new Error('enter an API key for that gateway');
+  return { gw, key, verifyTls: body.verifyTls !== false };
+}
+
+// customConnect: what a client sees on that gateway: its version (GET /v1/info) and the
+// models its key can use (GET /v1/models).
+async function customConnect(body) {
+  const { gw, key, verifyTls } = customTarget(body);
+  const headers = { Authorization: `Bearer ${key}` };
+  const get = async (path) => {
+    const res = await request('GET', `${gw}${path}`, { headers, timeout: 30000, verifyTls });
+    let json = null;
+    try {
+      json = JSON.parse(res.text);
+    } catch { /* not JSON */ }
+    if (res.status !== 200) throw new Error(`GET ${path}: HTTP ${res.status}${json?.error?.message || json?.message ? `: ${json.error?.message || json.message}` : ''}`);
+    return json || {};
+  };
+  const [info, models] = await Promise.allSettled([get('/v1/info'), get('/v1/models')]);
+  if (models.status === 'rejected' && info.status === 'rejected') throw models.reason;
+  const seen = new Map();
+  for (const m of models.value?.data || []) {
+    const name = m.model_name || m.id;
+    if (name && !seen.has(name)) seen.set(name, { name, status: m.status || '', reachable: m.server_reachable, serverKind: m.server_kind || '' });
+  }
+  return {
+    gateway: gw,
+    version: info.value?.version || '', buildTime: info.value?.build_time || '', commit: info.value?.commit_hash || '',
+    infoError: info.status === 'rejected' ? info.reason.message : '',
+    modelsError: models.status === 'rejected' ? models.reason.message : '',
+    models: [...seen.values()],
+  };
+}
+
 async function playground(body) {
-  const ctx = sandboxContext(body);
-  needConfig(ctx);
-  const model = (ctx.config.modelConfig?.models || []).find((m) => m.modelName === body.model);
-  if (!model) throw new Error(`model ${body.model} is not in the config`);
   const cacheType = ['none', 'standard', 'semantic'].includes(body.cacheType) ? body.cacheType : 'none';
   const prompt = String(body.prompt || '');
   if (!prompt.trim()) throw new Error('type a prompt');
-  const embedding = /embedding/.test(model.kind || '');
-  const gw = gatewayUrl(ctx, body);
-  const { key, source } = await playgroundKey(ctx, body, gw);
+  let gw; let key; let source; let modelName; let embedding; let kind; let verifyTls = false;
+  if (body.custom === true) {
+    ({ gw, key, verifyTls } = customTarget(body));
+    source = 'your API key';
+    modelName = String(body.model || '').trim();
+    if (!/^[\w.:/@+-]{1,200}$/.test(modelName)) throw new Error('pick or type a model name');
+    embedding = body.requestType === 'embeddings';
+    kind = embedding ? 'embeddings' : 'chat';
+  } else {
+    const ctx = sandboxContext(body);
+    needConfig(ctx);
+    const model = (ctx.config.modelConfig?.models || []).find((m) => m.modelName === body.model);
+    if (!model) throw new Error(`model ${body.model} is not in the config`);
+    embedding = /embedding/.test(model.kind || '');
+    modelName = model.modelName;
+    kind = model.kind;
+    gw = gatewayUrl(ctx, body);
+    ({ key, source } = await playgroundKey(ctx, body, gw));
+  }
 
   let path_ = '/v1/embeddings';
-  let payload = { model: model.modelName, input: prompt };
+  let payload = { model: modelName, input: prompt };
   if (!embedding) {
     path_ = '/v1/chat/completions';
     const maxTokens = Math.min(Math.max(parseInt(body.maxTokens, 10) || 256, 1), 8192);
@@ -759,11 +812,11 @@ async function playground(body) {
     const messages = [];
     if (String(body.system || '').trim()) messages.push({ role: 'system', content: String(body.system) });
     messages.push({ role: 'user', content: prompt });
-    payload = { model: model.modelName, messages, max_tokens: maxTokens, temperature };
+    payload = { model: modelName, messages, max_tokens: maxTokens, temperature };
   }
   const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-cb-cache': cacheType };
   if (body.debug === true) headers['X-cb-debug'] = 'true'; // the gateway then adds its X-cb-* debug headers
-  const res = await request('POST', `${gw}${path_}`, { headers, body: JSON.stringify(payload) });
+  const res = await request('POST', `${gw}${path_}`, { headers, body: JSON.stringify(payload), verifyTls });
   // Headers as sent and received (original casing); the API key is not echoed back.
   const requestHeaders = Object.entries({ ...headers, Authorization: 'Bearer <redacted>' });
   const responseHeaders = [];
@@ -777,7 +830,7 @@ async function playground(body) {
     : json?.choices?.[0]?.message?.content ?? '';
   return {
     endpoint: `${gw}${path_}`, keySource: source, status: res.status, ms: res.ms,
-    xcache: res.headers['x-cache'] || '', cacheType, model: model.modelName, kind: model.kind,
+    xcache: res.headers['x-cache'] || '', cacheType, model: modelName, kind,
     request: payload, requestHeaders, responseHeaders, content, usage: json?.usage || null,
     error: res.status >= 300 ? json?.error?.message || json?.message || res.text.slice(0, 500) : '',
     raw: res.text.length > 20000 ? `${res.text.slice(0, 20000)}…` : res.text,
@@ -1249,6 +1302,15 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { gateway: gw, version: info.version || '', buildTime: info.build_time || '', commit: info.commit_hash || '', models });
     } catch (err) {
       return send(res, 400, { error: err.message });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/custom/connect') {
+    try {
+      return send(res, 200, await customConnect(await readJson(req)));
+    } catch (err) {
+      return send(res, 400, { error: err.code === 'DEPTH_ZERO_SELF_SIGNED_CERT' || /certificate/i.test(err.message)
+        ? `${err.message} (untick "Verify TLS certificate" for a self-signed gateway)` : err.message });
     }
   }
 

@@ -168,6 +168,11 @@ On the first start without a `.env`, the server creates one from `.env.example` 
   - **Debug:** sends `X-cb-debug: true`. The gateway then adds its `X-cb-*` debug headers (cache type, match threshold and so on), which are listed under the answer.
   - **Gateway URL:** taken from the form, else the endpoint found by the last run's control plane lookup.
   - **API key:** follows the form's choice. A temporary key is created once per sandbox, reused for up to an hour, and deleted when the server stops.
+  - **Custom endpoint:** switch the target to **Custom endpoint** to check any environment (dev, stage or prod) the way a client does, with just the gateway URL and an API key. No sandbox, config or AWS is needed.
+    - **Connect:** shows the gateway's version, build and commit from `GET /v1/info`, and lists every model the key can use from `GET /v1/models` in a dropdown, with their status. **Other (type a name)…** takes a model that isn't listed.
+    - **Request type:** pick **Chat completions** or **Embeddings**; it is guessed from the model name.
+    - **TLS:** certificates are verified. Untick **Verify TLS certificate** for a self-signed gateway.
+    - **Key:** the API key stays in the page and is never saved. The URL is remembered.
   - **Shortcuts:** `?tab=playground` opens the tab directly, and Cmd/Ctrl+Enter sends.
 - **Terminals tab:** opens a shell on the sandbox's AI Gateway or Couchbase node inside the page, for checking disks and logs or restarting services by hand. Several sessions can be open at once, each with its own tab; up to 6 are allowed. They survive a page reload, and all of them close when the server stops.
   - **How it connects:** with `aws ssm start-session` and your AWS credentials, so no SSH keys are needed (it requires the Session Manager plugin). It uses SSH instead when `.env` sets `<NAME>_AIGW_SSH` / `<NAME>_CB_SSH` for that node, with `SSH_KEY` if set. The tab title shows which one is in use.

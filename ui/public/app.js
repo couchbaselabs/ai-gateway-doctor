@@ -454,9 +454,102 @@ async function sendPlay(body) {
   }
 }
 
+// ---- custom endpoint (any environment) ----
+const CUSTOM_URL_KEY = 'aigw-doctor-custom-url'; // the URL is remembered; the API key never is
+
+function playTarget() {
+  return playForm.querySelector('input[name="playTarget"]:checked').value;
+}
+
+function updatePlayTarget() {
+  const custom = playTarget() === 'custom';
+  $('custom-target').hidden = !custom;
+  playForm.elements.model.hidden = custom;
+  playForm.elements.customModelPick.hidden = !custom;
+  updateCustomModel();
+  for (const x of playForm.querySelectorAll('.custom-only')) x.hidden = !custom;
+  for (const x of playForm.querySelectorAll('.sandbox-only')) x.hidden = custom;
+  // "(off in config)" describes the sandbox's config, so a custom endpoint shows plain names.
+  if (custom) for (const opt of playForm.elements.cacheType.options) opt.textContent = opt.value;
+  else updatePlayCache();
+}
+
+// The custom model: picked from the /v1/models list, or typed after "Other (type a name)…".
+function customModelName() {
+  const pick = playForm.elements.customModelPick.value;
+  return pick === '__other' ? playForm.elements.customModel.value.trim() : pick;
+}
+
+function updateCustomModel() {
+  const custom = playTarget() === 'custom';
+  playForm.elements.customModel.hidden = !custom || playForm.elements.customModelPick.value !== '__other';
+}
+
+function guessRequestType() {
+  playForm.elements.requestType.value = /embed/i.test(customModelName()) ? 'embeddings' : 'chat';
+}
+
+playForm.elements.customModelPick.addEventListener('change', () => {
+  updateCustomModel();
+  guessRequestType();
+  if (playForm.elements.customModelPick.value === '__other') playForm.elements.customModel.focus();
+});
+
+for (const input of playForm.querySelectorAll('input[name="playTarget"]')) input.addEventListener('change', updatePlayTarget);
+playForm.elements.customModel.addEventListener('change', guessRequestType);
+playForm.elements.customUrl.value = localStorage.getItem(CUSTOM_URL_KEY) || '';
+playForm.elements.customUrl.addEventListener('change', () => localStorage.setItem(CUSTOM_URL_KEY, playForm.elements.customUrl.value.trim()));
+
+function customBody() {
+  const f = playForm.elements;
+  return { aigwUrl: f.customUrl.value.trim(), apiKey: f.customKey.value, verifyTls: f.verifyTls.checked };
+}
+
+$('custom-connect').addEventListener('click', async () => {
+  const info = $('custom-info');
+  info.className = 'muted small';
+  info.textContent = 'connecting…';
+  const resp = await fetch('/api/custom/connect', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(customBody()),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    info.className = 'small error-text';
+    info.textContent = data.error;
+    return;
+  }
+  // Every model the key can use, with its status; keep the current choice if it is still there.
+  const pick = playForm.elements.customModelPick;
+  const before = customModelName();
+  pick.replaceChildren(
+    ...data.models.map((m) => {
+      const note = [m.status && m.status !== 'healthy' ? m.status : '', m.reachable === false ? 'unreachable' : ''].filter(Boolean).join(', ');
+      return el('option', { value: m.name }, note ? `${m.name} (${note})` : m.name);
+    }),
+    el('option', { value: '__other' }, 'Other (type a name)…'));
+  if (data.models.some((m) => m.name === before)) pick.value = before;
+  else if (!data.models.length) pick.value = '__other';
+  updateCustomModel();
+  guessRequestType();
+  const version = data.version
+    ? `AI Gateway ${data.version}${data.buildTime ? `, built ${data.buildTime}` : ''}${data.commit ? `, commit ${data.commit.slice(0, 12)}` : ''}`
+    : `no version (${data.infoError || '/v1/info gave none'})`;
+  const models = data.modelsError ? `models: ${data.modelsError}` : `${data.models.length} model(s) for this key`;
+  info.className = 'small';
+  info.textContent = `${version} · ${models}`;
+});
+
 playForm.addEventListener('submit', (e) => {
   e.preventDefault();
   const f = playForm.elements;
+  if (playTarget() === 'custom') {
+    sendPlay({
+      custom: true, ...customBody(), model: customModelName(), requestType: f.requestType.value,
+      cacheType: f.cacheType.value, prompt: f.prompt.value, system: f.system.value,
+      maxTokens: f.maxTokens.value, temperature: f.temperature.value, debug: f.debug.checked,
+    });
+    return;
+  }
   const run = formBody();
   sendPlay({
     sandbox: run.sandbox, config: run.config, region: run.region, aigwUrl: run.aigwUrl,
