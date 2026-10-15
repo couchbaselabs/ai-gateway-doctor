@@ -63,7 +63,7 @@ Checks why the semantic cache stopped working, typically because the cache Couch
 | `--fix` | Runs the checks, then the fixes. Asks for confirmation before each step that changes anything. |
 | `--check --inference-only` | Runs only step 7, against the models in the config. Needs no AWS access when `--aigw-url` and an API key are given. |
 
-Output is one `PASS`/`WARN`/`FAIL` line per check, followed by a result count. `--verbose` adds the step headers, every command and remote script, and the listings (ASGs, instances, `df`, nodes). The fix commands are always shown.
+Output is one `PASS`/`WARN`/`FAIL` line per check, followed by a result count. Each `FAIL` or `WARN` is followed by `HINT` lines on how to fix it, such as the command to run, the setting to change or the likely cause. The UI shows them under the check. `--verbose` adds the step headers, every command and remote script, and the listings (ASGs, instances, `df`, nodes). The fix commands are always shown.
 
 The API key for step 7 can come from three places:
 - `--api-key-file FILE`

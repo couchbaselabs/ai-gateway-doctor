@@ -915,9 +915,14 @@ function handleLine(rawText, stream) {
     if (!state.summary) state.steps.push(newStep(m[1]));
   } else if (state.summary) {
     // The verbose summary repeats every check; the cards already show them.
+  } else if ((m = text.match(/^ {3}HINT (.+)$/))) {
+    // How to fix the check just above it.
+    const last = currentStep().checks[currentStep().checks.length - 1];
+    if (last) last.hints.push(m[1]);
+    else currentStep().details.push({ text: text.replace(/^ {3}/, ''), stream });
   } else if ((m = text.match(/^ {3}(PASS|WARN|FAIL|SKIP) (.+)$/))) {
     const status = m[1].toLowerCase();
-    currentStep().checks.push({ status, message: m[2] });
+    currentStep().checks.push({ status, message: m[2], hints: [] });
     if (status in state.counts) state.counts[status] += 1;
   } else if (/^Result:/.test(text) || /^\s*$/.test(text)) {
     // The counts come from the checks themselves.
@@ -1037,7 +1042,10 @@ function renderStep(step, isLast) {
 
   if (checks.length) {
     card.append(el('ul', { class: 'checks' }, checks.map((c) =>
-      el('li', { class: c.status }, el('span', { class: `pill ${c.status}` }, c.status.toUpperCase()), el('span', {}, c.message)))));
+      el('li', { class: c.status }, el('span', { class: `pill ${c.status}` }, c.status.toUpperCase()),
+        el('div', { class: 'check-body' }, el('span', {}, c.message),
+          c.hints?.length > 0 && el('ul', { class: 'fix-hints' },
+            c.hints.map((h) => el('li', {}, el('span', { class: 'fix-label' }, 'Fix'), el('span', {}, h)))))))));
   }
   if (step.exchanges.length && !onlyProblems) {
     card.append(el('details', { open: '' },

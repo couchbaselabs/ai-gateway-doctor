@@ -210,6 +210,8 @@ fail() {
 	FAILED=1
 }
 skip() { printf '   %sSKIP%s %s\n' "$DIM" "$RST" "$*"; }
+# hint TEXT: how to fix the FAIL/WARN printed just before it (always shown, and in the log).
+hint() { printf '   %sHINT%s %s\n' "$YEL" "$RST" "$*"; }
 indent() { sed 's/^/      /'; }
 vindent() { indent | detail; }  # listing, --verbose only
 
@@ -320,6 +322,7 @@ step_aws() {
 	step "0. AWS credentials"
 	if ! CALLER=$(run check aws sts get-caller-identity --region "$REGION" --query Arn --output text); then
 		fail "AWS credentials missing or expired; refresh them (e.g. aws sso login, or re-export the session) and re-run"
+		hint "check with: aws sts get-caller-identity --region $REGION"
 		exit 1
 	fi
 	allowed check && pass "AWS credentials: ${CALLER##*/}"
@@ -355,8 +358,10 @@ step_config() {
 		pass "config: $N_MODELS model(s)"
 	elif [[ -z "$CONNECT" ]]; then
 		fail "config: modelServiceStoreConfig.couchbaseConnectString is missing"
+		hint "download the sandbox's AI gateway config from its Fleet Manager; it must include modelServiceStoreConfig"
 	elif [[ -z "$CRED_KEY" ]]; then
 		fail "config: modelServiceStoreConfig.defaults.dbCredKey is missing"
+		hint "download the sandbox's AI gateway config from its Fleet Manager; it must include modelServiceStoreConfig.defaults.dbCredKey"
 	else
 		pass "config: cache cluster $CB_HOST, $N_MODELS model(s)"
 	fi
@@ -441,6 +446,7 @@ step_locate_tenant() {
 				CB_INSTANCE=$(asg_pick "$DS_ASG_PREFIX")
 				if [[ -z "$CB_INSTANCE" && -n "$(in_asg "$DS_ASG_PREFIX")" ]]; then
 					warn "several ${DS_ASG_PREFIX}* instances; re-run with --cb-instance:"
+					hint "re-run with --cb-instance <one of the ids below>"
 					in_asg "$DS_ASG_PREFIX" | indent
 				fi
 			fi
@@ -470,6 +476,7 @@ step_locate_tenant() {
 			pass "ai-gateway: $AIGW_INSTANCE${AIGW_ASG:+ ($AIGW_ASG)}"
 		elif $INFRA && [[ -z "$AIGW_SSH" ]]; then
 			warn "ai-gateway not identified; log, reachability and gateway disk checks run from here or are skipped"
+			hint "pass --tenant-id <org id> (or --aigw-instance <id>) so the gateway can be found"
 		fi
 	fi
 }
@@ -512,6 +519,7 @@ except OSError: pass' "$CB_HOST")
 	fi
 	if allowed check && [[ "$CB_INSTANCE" != i-* && -z "$CB_SSH" ]]; then
 		fail "cache node not identified for $CB_HOST (pick one with --cb-instance; --verbose lists the tenant's instances)"
+		hint "check --tenant-id and --region, or name the node with --cb-instance <id> (--verbose lists the tenant instances)"
 		CB_INSTANCE=""
 	fi
 
@@ -523,12 +531,15 @@ except OSError: pass' "$CB_HOST")
 			:
 		elif [[ -z "$GW_IP" ]]; then
 			fail "ai-gateway cannot resolve $CB_HOST"
+			hint "on the gateway (Terminals tab, or aws ssm start-session): getent hosts $CB_HOST"
+			hint "check the cache cluster's DNS record (Route 53); a replaced cache node may have a new address"
 		elif [[ -z "$priv_ip$pub_ip" ]]; then
 			pass "ai-gateway resolves $CB_HOST to $GW_IP"
 		elif [[ "$GW_IP" == "$priv_ip" || "$GW_IP" == "$pub_ip" ]]; then
 			pass "ai-gateway resolves $CB_HOST to the cache node ($GW_IP)"
 		else
 			fail "ai-gateway resolves $CB_HOST to $GW_IP, but the cache node is ${priv_ip:-?}/${pub_ip:-?}"
+			hint "the DNS record for $CB_HOST points at another node: update the record, or the config's couchbaseConnectString"
 		fi
 	fi
 	allowed check || PUBLIC_HOST="${PUBLIC_HOST:-<public-dns>}"
@@ -537,6 +548,7 @@ except OSError: pass' "$CB_HOST")
 	LOCAL_HOST="${PUBLIC_HOST:-$CB_HOST}"
 	if allowed check && [[ -z "$PUBLIC_HOST" ]]; then
 		warn "no public DNS/IP for the cache node; using $CB_HOST from this machine (override with --cb-host)"
+		hint "admin checks then run from the gateway; or pass --cb-host <host reachable from here>"
 	fi
 	ADMIN_URL="${ADMIN_URL:-$SCHEME://$LOCAL_HOST:$ADMIN_PORT}"
 	info "from this machine: host $LOCAL_HOST, admin $ADMIN_URL"
@@ -575,6 +587,7 @@ grep -Ei '$pattern' \"\$f\" | tail -n 10"
 	n=$(sed -n 's/^MATCHES //p' <<<"$out")
 	if [[ "${n:-0}" -gt 0 ]]; then
 		warn "gateway log: $n Couchbase connection error lines (latest below)"
+		hint "connection errors usually mean the cache cluster is down or its disk is full: see the reachability, admin and disk checks"
 		grep -Ev '^(MATCHES|LOG) ' <<<"$out" | tail -n "$($VERBOSE && echo 10 || echo 3)" |
 			cut -c1-200 | indent
 	else
@@ -598,6 +611,8 @@ step_reachability() {
 		pass "reachability: ${from%% (*} -> $host, ports $ADMIN_PORT and $KV_PORT open"
 	else
 		fail "reachability: ${from%% (*} -> $host, port(s)$closed not reachable"
+		hint "on the cache node: sudo systemctl status couchbase-server (a full disk stops it: see the disk check)"
+		hint "check that the cache node's security group allows ports $ADMIN_PORT and $KV_PORT from the gateway"
 	fi
 }
 
@@ -636,6 +651,7 @@ report_nodes() {
 		vindent <<<"$nodes"
 	else
 		fail "admin REST $where: unhealthy Couchbase node(s)"
+		hint "open the Couchbase console (port 18091) and check Servers; on the node: sudo systemctl restart couchbase-server"
 		indent <<<"$nodes"
 	fi
 }
@@ -649,6 +665,7 @@ check_admin_local() {
 			info "admin REST $ADMIN_URL not reachable from this machine; retrying from the ai-gateway"
 		else
 			fail "admin REST $ADMIN_URL not responding"
+			hint "on the cache node: sudo systemctl status couchbase-server; a full root volume is the usual cause (--fix grows it)"
 		fi
 		return 1
 	fi
@@ -663,6 +680,7 @@ check_admin_local() {
 			<<<"$bucket" | vindent
 	else
 		fail "cache bucket '$CACHE_BUCKET' not found"
+		hint "check cacheKeyspace in the config and the bucket list in the Couchbase console; the gateway creates the cache bucket on first use"
 	fi
 }
 
@@ -683,11 +701,13 @@ rm -f \"\$t\"")
 	allowed check || return 0
 	if grep -q '^SECRET_ERR' <<<"$out"; then
 		fail "admin REST: ai-gateway could not read secret '$CRED_KEY': $(sed -n 's/^SECRET_ERR //p' <<<"$out" | head -n1)"
+		hint "the gateway's instance role needs secretsmanager:GetSecretValue on $CRED_KEY, and the gateway needs the AWS CLI"
 		return 1
 	fi
 	code=$(awk '$1 == "HTTP" && $3 == "/pools/default" {print $2}' <<<"$out")
 	if [[ "$code" != 200 ]]; then
 		fail "admin REST $url (from the ai-gateway): HTTP ${code:-none}"
+		hint "HTTP 401: the dbCredKey password differs from the cluster; HTTP 000: couchbase-server is down (sudo systemctl status couchbase-server)"
 		return 1
 	fi
 	ADMIN_OK=true
@@ -696,8 +716,12 @@ rm -f \"\$t\"")
 		"$url (from the ai-gateway)"
 	if [[ -n "$CACHE_BUCKET" ]]; then
 		code=$(awk '$1 == "HTTP" && $3 ~ /buckets/ {print $2}' <<<"$out")
-		[[ "$code" == 200 ]] && pass "cache bucket '$CACHE_BUCKET' exists" ||
+		if [[ "$code" == 200 ]]; then
+			pass "cache bucket '$CACHE_BUCKET' exists"
+		else
 			fail "cache bucket '$CACHE_BUCKET' not found (HTTP ${code:-none})"
+			hint "check cacheKeyspace in the config and the bucket list in the Couchbase console"
+		fi
 	fi
 }
 
@@ -711,6 +735,7 @@ step_admin() {
 		skip "admin REST: no dbCredKey in config"
 	elif ! fetch_creds; then
 		fail "admin REST: could not read secret '$CRED_KEY' in $SM_REGION (expected 'user:password')"
+		hint "check with: aws secretsmanager describe-secret --secret-id $CRED_KEY --region $SM_REGION (use --sm-region if it lives in another region)"
 	else
 		info "credential fetched for user '$CB_USER'"
 		check_admin
@@ -743,6 +768,7 @@ $svc")
 	SVC_STATE=$(sed -n 's/^SERVICE //p' <<<"$out")
 	if ! grep -q '^FS ' <<<"$out"; then
 		fail "disk: could not read filesystem usage on $label"
+		hint "SSM must be able to run commands on the node: check its SSM agent and your ssm:SendCommand permission, or use --cb-ssh / --aigw-ssh"
 		return 1
 	fi
 	while read -r tag mount use; do
@@ -753,10 +779,14 @@ $svc")
 			if ((use >= THRESHOLD)); then
 				FULL_MOUNTS+="$mount "
 				fail "disk: $label $mount ${use}% used (threshold ${THRESHOLD}%)"
+				hint "grow it: re-run with --fix (asks before each change)"
+				hint "or free space: sudo du -xh $mount --max-depth=2 | sort -h | tail (old logs are often under /opt/couchbase/var/lib/couchbase/logs and /var/log)"
 				bad=true
 			fi
 		elif ((use >= THRESHOLD)); then
 			fail "disk: $label $mount inodes ${use}% used (threshold ${THRESHOLD}%): too many files"
+			hint "find the directories with the most files: sudo find $mount -xdev -type f | cut -d/ -f2-4 | sort | uniq -c | sort -n | tail"
+			hint "delete old logs or temp files there; growing an ext4 volume (--fix) also adds inodes"
 			bad=true
 		fi
 	done < <(grep -E '^(FS|INODE) ' <<<"$out")
@@ -779,8 +809,13 @@ step_disk() {
 		check_disk "$CB_TARGET" "echo SERVICE couchbase-server=\$(systemctl is-active couchbase-server)"
 		CB_FULL_MOUNTS="$FULL_MOUNTS"
 		if allowed check && [[ -n "$SVC_STATE" ]]; then
-			[[ "$SVC_STATE" == couchbase-server=active ]] &&
-				pass "service: couchbase-server active" || fail "service: couchbase-server ${SVC_STATE#*=}"
+			if [[ "$SVC_STATE" == couchbase-server=active ]]; then
+				pass "service: couchbase-server active"
+			else
+				fail "service: couchbase-server ${SVC_STATE#*=}"
+				hint "start it: sudo systemctl start couchbase-server; see why it stopped: sudo journalctl -u couchbase-server -n 50"
+				hint "if a disk is full, grow it first (--fix)"
+			fi
 		fi
 	fi
 
@@ -790,8 +825,12 @@ step_disk() {
 		check_disk "$AIGW_TARGET" "pgrep -x ai-gateway >/dev/null || pgrep -f 'bin/ai-gateway' >/dev/null && echo SERVICE ai-gateway=running || echo SERVICE ai-gateway=stopped"
 		AIGW_FULL_MOUNTS="$FULL_MOUNTS"
 		if allowed check && [[ -n "$SVC_STATE" ]]; then
-			[[ "$SVC_STATE" == ai-gateway=running ]] &&
-				pass "service: ai-gateway process running" || fail "service: ai-gateway process not running"
+			if [[ "$SVC_STATE" == ai-gateway=running ]]; then
+				pass "service: ai-gateway process running"
+			else
+				fail "service: ai-gateway process not running"
+				hint "see why it stopped in the gateway log (step 3), then restart the AI Gateway service on the node"
+			fi
 		fi
 	fi
 }
@@ -838,9 +877,11 @@ step_cp_endpoint() {
 	allowed check || { CP_URL="${CP_URL:-<cp-url>}"; org="${org:-<org-id>}"; }
 	if [[ -z "$CP_URL" ]]; then
 		fail "control plane: no API URL (pass --cp-url, or --tenant-id to read it from the gateway)"
+		hint "pass --cp-url https://api.<env>.<domain>/v2/organizations/<org id> (the Capella console API URL)"
 		return 0
 	elif [[ -z "$org" ]]; then
 		fail "control plane: no organization id (pass --org-id or --tenant-id)"
+		hint "pass --org-id <org id> (the UUID after /organizations/ in the console URL)"
 		return 0
 	fi
 	if allowed check && [[ -z "${CP_PASSWORD:-}" ]]; then
@@ -851,6 +892,7 @@ step_cp_endpoint() {
 		fi
 		if [[ -z "${CP_PASSWORD:-}" ]]; then
 			fail "control plane: no password (set CP_PASSWORD or run from a terminal)"
+			hint "export CP_PASSWORD=... (or set it in the UI .env), or run in a terminal to be prompted"
 			return 0
 		fi
 	fi
@@ -869,12 +911,14 @@ step_cp_endpoint() {
 	: >"$RESP_FILE"
 	if [[ "$code" == 000 ]]; then
 		fail "control plane: cannot reach $CP_URL (check --cp-url)"
+		hint "check the URL and that your network or VPN can reach the sandbox"
 		return 0
 	elif [[ "$code" == 404 ]]; then
 		fail "control plane: $CP_URL has no /sessions login (not the public API?); pass --cp-url https://api.<env>.<domain>"
 		return 0
 	elif [[ -z "$jwt" ]]; then
 		fail "control plane: login as $CP_USER failed (HTTP $code)"
+		hint "HTTP 401: wrong password, or the user is not in this sandbox; the API needs a password login, not SSO"
 		return 0
 	fi
 	info "logged in to $CP_URL as $CP_USER"
@@ -885,6 +929,7 @@ step_cp_endpoint() {
 			"$CP_URL/v2/organizations/$org/languagemodels?page=$page&perPage=100")
 		if [[ "$code" != 200 ]]; then
 			fail "control plane: listing language models in org $org returned HTTP $code: $(resp_error)"
+			hint "HTTP 403/404: the org id may be wrong; pass --org-id <the UUID after /organizations/ in the console URL>"
 			return 0
 		fi
 		# Items are wrapped as {"data": {...model...}}; accept unwrapped items too.
@@ -902,6 +947,7 @@ step_cp_endpoint() {
 		.network.endpoint // empty' <<<"$all" | sort -u)
 	if [[ -z "$endpoints" ]]; then
 		fail "control plane: no language model with an endpoint in $REGION (found: $(jq -r '[.[] | "\(.modelConfig.cloudConfig.region.name // "?")"] | unique | join(", ")' <<<"$all"))"
+		hint "deploy a model in $REGION in the Capella console, or pass --region with a region listed above"
 		return 0
 	fi
 	AIGW_URL=$(head -n1 <<<"$endpoints")
@@ -958,12 +1004,14 @@ create_api_key() {
 	local body code
 	if [[ -z "$ADMIN_KEY_NAME" ]]; then
 		fail "api key: adminConfig.adminKey is missing in the config"
+		hint "use an existing key instead: --api-key-file FILE (or AIGW_API_KEY)"
 		return 1
 	fi
 	ADMIN_SECRET=$(run check aws secretsmanager get-secret-value --region "$SM_REGION" \
 		--secret-id "$ADMIN_KEY_NAME" --query SecretString --output text)
 	if allowed check && [[ "$ADMIN_SECRET" != *:* ]]; then
 		fail "api key: could not read admin secret '$ADMIN_KEY_NAME' in $SM_REGION (expected 'user:password')"
+		hint "check with: aws secretsmanager describe-secret --secret-id $ADMIN_KEY_NAME --region $SM_REGION"
 		return 1
 	fi
 	body=$(jq -nc --arg n "aigw-doctor-$RUN_ID" '{name: $n,
@@ -976,9 +1024,11 @@ create_api_key() {
 		-o "$RESP_FILE" -w '%{http_code}' -X POST --data "$body" "$AIGW_URL/v1/apikeys")
 	if [[ "$code" == 000 ]]; then
 		fail "api key: cannot reach $AIGW_URL (pass --cp-user to look up the endpoint, or --aigw-url)"
+		hint "the gateway is reached through its load balancer on 443: pass --cp-user to look it up, or --aigw-url https://<endpoint>"
 		return 1
 	elif [[ "$code" != 200 && "$code" != 201 ]]; then
 		fail "api key: create returned HTTP $code${code:+: $(resp_error)}"
+		hint "HTTP 401: the admin secret doesn't match the gateway's; HTTP 5xx: check the gateway log"
 		return 1
 	fi
 	API_KEY=$(jq -r '.apiKey // empty' "$RESP_FILE")
@@ -986,6 +1036,7 @@ create_api_key() {
 	: >"$RESP_FILE"
 	if [[ -z "$API_KEY" ]]; then
 		fail "api key: create response has no apiKey"
+		hint "check the gateway log for the /v1/apikeys request"
 		return 1
 	fi
 	if [[ -n "$SAVE_KEY_FILE" ]]; then
@@ -1008,6 +1059,7 @@ delete_api_key() {
 		info "temporary API key $id deleted"
 	else
 		warn "api key: could not delete temporary key $id (HTTP $code); it expires in 1 hour"
+		hint "delete it in the Capella console (API keys), or let it expire"
 	fi
 }
 
@@ -1043,9 +1095,11 @@ cache_test() {
 		allowed check || return 0
 		if [[ "$code" != 200 ]]; then
 			fail "inference: $model $type cache: request returned HTTP $code: $(resp_error)"
+			hint "see the gateway log for this request; HTTP 401/403 means the key has no access to the model"
 			return 0
 		elif [[ "$x1" == - ]]; then
 			fail "inference: $model $type cache: no X-Cache header, although the config enables it (is the API key's cache role missing?)"
+			hint "keys get the cache role when they are created: use --create-api-key for a fresh key after enabling the cache"
 			return 0
 		elif [[ "$x1" == MISS ]]; then
 			break
@@ -1054,6 +1108,7 @@ cache_test() {
 	done
 	if [[ "$x1" != MISS ]]; then
 		warn "inference: $model $type cache: three new questions all hit at once; the cache may match too loosely (threshold $threshold)"
+		hint "raise semanticCache.scoreThreshold for this model (now $threshold)"
 		return 0
 	fi
 	# The cache is written after the response, so give it a moment and retry once.
@@ -1067,6 +1122,8 @@ cache_test() {
 		pass "inference: $model $type cache MISS -> HIT"
 	else
 		fail "inference: $model $type cache: the repeated question was ${x2/-/answered without X-Cache} (HTTP $c2), expected HIT"
+		hint "check the cache cluster (reachability, admin and disk checks) and the gateway log for cache write errors"
+		hint "semantic cache: the model's vector index must exist (Search/GSI indexes in the Couchbase console)"
 		return 0
 	fi
 	# A reworded question hits only above the score threshold, so this is information only.
@@ -1088,12 +1145,16 @@ probe_chat() {
 	if allowed check; then
 		if [[ "$code" == 000 ]]; then
 			fail "inference: cannot reach $AIGW_URL (pass --cp-user to look up the endpoint, or --aigw-url)"
+		hint "the gateway is reached through its load balancer on 443; check its target health, or open a shell on the gateway (Terminals tab)"
+			hint "the gateway is reached through its load balancer on 443; check its target health, or open a shell on the gateway (Terminals tab)"
 			return 2
 		elif [[ "$code" == 401 || "$code" == 403 ]]; then
 			warn "inference: $model skipped, the API key has no access (HTTP $code: $(resp_error))"
+			hint "use --create-api-key (all models), or a key that allows $model"
 			return 0
 		elif [[ "$code" != 200 ]]; then
 			fail "inference: $model chat HTTP $code: $(resp_error)"
+			hint "HTTP 5xx: the model backend failed (see the gateway log; for Bedrock check model access and region); HTTP 4xx: check the model name and request"
 			return 0
 		fi
 		INFERENCE_RAN=true
@@ -1124,9 +1185,11 @@ gateway_info() {
 	code=$(curl -sk --max-time 30 -K <(bearer_config "$API_KEY") -o "$RESP_FILE" -w '%{http_code}' "$AIGW_URL/v1/info")
 	if [[ "$code" == 000 ]]; then
 		fail "inference: cannot reach $AIGW_URL (pass --cp-user to look up the endpoint, or --aigw-url)"
+		hint "the gateway is reached through its load balancer on 443; check its target health, or open a shell on the gateway (Terminals tab)"
 		return 1
 	elif [[ "$code" != 200 ]]; then
 		warn "gateway: /v1/info returned HTTP $code: $(resp_error)"
+		hint "HTTP 401: the API key is invalid or expired"
 		return 0
 	fi
 	v=$(jq -r '.version // empty' "$RESP_FILE")
@@ -1136,7 +1199,10 @@ gateway_info() {
 	jq -r '.models[]? | "\(.model_name)  status=\(.status)  reachable=\(.server_reachable)\(if .server_message then "  \(.server_message)" else "" end)"' \
 		"$RESP_FILE" | vindent
 	unreachable=$(jq -r '[.models[]? | select(.server_reachable == false) | .model_name] | unique | join(", ")' "$RESP_FILE")
-	[[ -z "$unreachable" ]] || warn "gateway: reports these models unreachable: $unreachable"
+	if [[ -n "$unreachable" ]]; then
+		warn "gateway: reports these models unreachable: $unreachable"
+		hint "check those model servers (NIM/vLLM endpoints) or their Bedrock access in this region"
+	fi
 	return 0
 }
 
@@ -1149,18 +1215,22 @@ probe_embedding() {
 	allowed check || return 0
 	if [[ "$code" == 000 ]]; then
 		fail "inference: cannot reach $AIGW_URL (pass --cp-user to look up the endpoint, or --aigw-url)"
+		hint "the gateway is reached through its load balancer on 443; check its target health, or open a shell on the gateway (Terminals tab)"
 		return 2
 	elif [[ "$code" == 401 || "$code" == 403 ]]; then
 		warn "inference: $model skipped, the API key has no access (HTTP $code: $(resp_error))"
+		hint "use --create-api-key (all models), or a key that allows $model"
 		return 0
 	elif [[ "$code" != 200 ]]; then
 		fail "inference: $model embeddings HTTP $code: $(resp_error)"
+		hint "HTTP 5xx: the embedding backend failed (see the gateway log); HTTP 4xx: check the model name"
 		return 0
 	fi
 	INFERENCE_RAN=true
 	n=$(jq '.data[0].embedding | length' "$RESP_FILE" 2>/dev/null)
 	if [[ "$dims" != - && -n "$n" && "$n" != "$dims" ]]; then
 		warn "inference: $model embeddings returned $n dimensions, config says $dims"
+		hint "set embeddingDimensions in the model config to match, or check which embedding model is deployed"
 	else
 		pass "inference: $model embeddings OK (${n:-?} dimensions, ${secs}s)"
 	fi
@@ -1276,6 +1346,7 @@ fix_volume() {
 	vol="${vol:-<vol-id>}"
 	if allowed check && [[ "$vol" != vol-* ]]; then
 		fail "fix: could not find the EBS volume behind $mount on $label"
+		hint "list the node's volumes: aws ec2 describe-instances --instance-ids $inst --query 'Reservations[0].Instances[0].BlockDeviceMappings'"
 		return 0
 	fi
 	cur=$(run check aws ec2 describe-volumes --region "$REGION" --volume-ids "$vol" \
@@ -1292,6 +1363,7 @@ fix_volume() {
 
 	if allowed fix && [[ "$cur" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ ]] && ((size <= cur)); then
 		fail "fix: --size $size must be larger than the current $cur GiB of $vol"
+		hint "pass a larger --size (GiB), or leave it out to double the volume"
 		return 0
 	fi
 	if $SNAPSHOT && { [[ "$MODE" != fix ]] || confirm "snapshot $vol first?"; }; then
@@ -1310,8 +1382,12 @@ fix_volume() {
 				[[ "$state" == optimizing || "$state" == completed ]] && break
 				sleep 5
 			done
-			[[ "$state" == optimizing || "$state" == completed ]] && resized=true ||
+			if [[ "$state" == optimizing || "$state" == completed ]]; then
+				resized=true
+			else
 				fail "fix: modification of $vol did not progress (state=$state); AWS allows one change per volume every 6 hours"
+				hint "wait and retry later, or snapshot the volume and create a larger one"
+			fi
 		fi
 	fi
 
