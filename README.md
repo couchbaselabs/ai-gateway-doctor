@@ -2,6 +2,8 @@
 
 Checks the AI Gateway that serves Couchbase Capella Model Service inference, end to end: the gateway's cache cluster, the gateway node, and the deployed models. It also helps repair the most common failure, a full disk on the cache cluster node.
 
+It knows the Keystone 2 controls of serverless (Bedrock) models: per-deployment rate limits, spend caps, Bedrock Guardrails and Bedrock batch. See [Keystone 2 checks](#keystone-2-checks).
+
 It comes as a command-line script, `aigw-doctor.sh`, and a local web UI in `ui/` that runs the script and shows its results.
 
 > **Not an official Couchbase product.** This is a debugging aid from Couchbase Labs, provided as is and without support. It runs with your own AWS and Capella credentials and only does what those credentials allow. Read-only checks are the default; nothing changes without `--fix`, and `--fix` asks before every change.
@@ -38,22 +40,25 @@ The gateway config is the AI Gateway's `config.json`; a sandbox's Fleet Manager 
 Checks why the semantic cache stopped working, typically because the cache Couchbase cluster became unreachable when a volume on its EC2 node filled up. Then it confirms end to end that the deployed models answer and that repeated requests hit the cache. It runs these steps:
 
 0. Checks that the AWS credentials are valid, and stops if they are expired.
-1. Reads the gateway config: `couchbaseConnectString`, `dbCredKey`, `cacheKeyspace`, `adminKey` and the models.
+1. Reads the gateway config: `couchbaseConnectString`, `dbCredKey`, `cacheKeyspace`, `adminKey` and the models. It also checks the Keystone 2 settings against the gateway's own rules. A config with no connect string and no cache-enabled model is a gateway without Couchbase, and the cache cluster checks (part of 2, then 4, 5 and the cache node in 6) are skipped.
 2. Lists the ASGs and running instances tagged with the tenant (org) id, then picks:
    - the **cache node** from ASG `capella-ds-<deployment id>`
    - the **gateway** from ASG `capella-ai-gateway-<deployment id>`
 
    The deployment id is the UUID at the start of `dbCredKey`. It also checks that the gateway resolves the connect-string host to the cache node.
-3. Searches the gateway log for Couchbase connection timeouts. Without `--log-file`, the script finds the log from the running `ai-gateway` process.
+3. Searches the gateway log for Couchbase connection timeouts, and for settings the gateway rejected when it loaded its config (`Invalid … config` lines). Without `--log-file`, the script finds the log from the running `ai-gateway` process.
 4. Checks, from the gateway, that the cluster's TLS ports are reachable: admin `18091` and data `11207`.
 5. Fetches the admin credential (`dbCredKey`) from AWS Secrets Manager, then checks node health and the cache bucket through `https://<host>:18091`. It tries from your machine first. If the security group blocks that, it repeats the check on the gateway, where the gateway's instance role reads the secret itself.
 6. Checks every real filesystem on both nodes, for space and for inodes. It also checks that `couchbase-server` is active on the cache node and the `ai-gateway` process is running on the gateway node.
+   - **6b, Keystone 2 only:** checks that each Bedrock guardrail, batch S3 bucket and batch service role named in the config exists, and reads the rate-limit and spend-cap counters from the gateway's metrics.
 7. Reads the gateway's version, build time and commit from `GET /v1/info` and reports them, for example "AI Gateway 1.42.0, built …, commit …". It warns about any model the gateway itself reports as unreachable. Then it probes every model in the config:
    - **Text-generation models:** a chat request. Then each cache type the config enables is tested. A type counts as enabled only when both `cacheConfig.isEnabled` and the type's own `isEnabled` are true: the top-level flag gives the API key its cache role, and without it the gateway skips the cache. Types turned off by the top-level flag are reported as SKIP.
      - **Test:** a newly generated question (two random topics and a reference number) is sent with `X-cb-cache: standard|semantic`. The first answer should be `X-Cache: MISS`, and the same question repeated must be a `HIT`.
      - **Retry:** if the first answer is already a HIT, because an older entry matched, the script tries a new question, up to three times.
      - **Reworded question (semantic only):** shown with `--verbose` for information. It depends on the score threshold, so it isn't counted as a pass or a failure.
+     - **Why a repeat missed:** the repeat is sent with `X-cb-debug: true`, so a failed HIT reports the gateway's miss reason and match score.
    - **Embedding models:** an embeddings request. The vector length is checked against `embeddingDimensions` when the config sets it.
+   - **Refused requests:** a request refused by a rate limit, a spend cap or a guardrail is reported as that, with its fix. See [Keystone 2 checks](#keystone-2-checks).
 8. With `--fix`: for each full filesystem on either node, finds its EBS volume, grows it, then runs `growpart` and `resize2fs` or `xfs_growfs`. It restarts `couchbase-server` if the admin API is still down, then checks again. If a node is in an ASG, the script warns you to also raise the launch template's volume size.
 
 | Mode | Behaviour |
@@ -100,12 +105,51 @@ Notes:
   - **Override:** `--aigw-url` still takes precedence when you already know the endpoint.
   - **Fallback:** without either option, the script tries the instance directly at `https://<gateway public DNS>:8081`, which its security group usually blocks.
 - **Secrets:** API keys and passwords reach curl through a file descriptor, so they never appear on a command line or in an SSM command. That is also why step 7 always runs from your machine.
-- **Inference cost:** each chat request asks for at most 8 output tokens. Cache prompts include a run id, so every run starts with a cache miss. A model the API key has no access to is reported as a warning and skipped.
+- **Rate limits and spend:** the probes count against a deployment's rate limit and spend cap like any other request. A deployment with a very low limit makes the run slower, because the doctor waits for `Retry-After`.
+- **Inference cost:** each chat request asks for at most 16 output tokens. Cache prompts include a run id, so every run starts with a cache miss. A model the API key has no access to is reported as a warning and skipped.
 - **Temporary key scope:** a temporary key allows all models and all IPs (`0.0.0.0/0`), as in the `create-api-key` skill. It is short-lived and deleted at the end of the run.
 - **Resizing volumes:** `--size GB` applies to every volume `--fix` grows. AWS allows one size change per volume every 6 hours. Filesystems on LVM are reported, not resized.
 - **Remote commands:** run through SSM (`AWS-RunShellScript`). Use `--cb-ssh` or `--aigw-ssh` to connect over ssh instead.
 - **Capella:** connect strings that point at Capella have no EC2 node, so steps 6 and 8 don't apply to them.
 - **Exit code:** non-zero if any check fails. Run `--help` to see all options.
+
+## Keystone 2 checks
+Keystone 2 adds production controls to serverless (Bedrock) models. The doctor follows the gateway branch `aigateway_keystone2_bedrock`. A config without these settings gets no extra checks.
+
+**Config (step 1).** A `WARN` means the gateway ignores the setting; a `FAIL` means it refuses the model's requests or the feature cannot work.
+
+| Setting | Reported when |
+|---|---|
+| `rateLimit.requestsPerMinute` | outside 1–100000 (ignored: no limit) |
+| `spendCap`, `regionSpendCap` | limit outside 0.000001–1e12, unit not `credits` or `tokens`, behavior not `warn` or `stop`, a credits cap without a `rateCard`, `cycleEnd` not after `cycleStart` (ignored: no cap) |
+| `rateCard[]` | negative `value`, `per` of 0 or less, or a `charge` the gateway does not price |
+| `guardrailConfig`, `jailbreakConfig` on a Bedrock model | enabled with neither a guardrail model nor `bedrockConfig.guardrail.id`; a guardrail without a version, with `DRAFT`, or set together with `guardrailIdentifier` (requests get 400 `guardrail_initialization_error`) |
+| `bedrockConfig.guardrail` | set while both switches are off (not applied) |
+| `bedrockConfig.batch` | enabled without `s3Bucket` or `serviceRoleArn`, `timeoutHours` outside 24–168, `guardrailMode` not `enforce` or `detect`; `detect` is flagged because nothing is blocked |
+| `features.deploymentRateLimit`, `features.spendCap` | `false` while limits or caps are configured (not enforced) |
+| `usageReport` | `spendStore` not `auto`, `local`, `couchbase` or `controlplane`; `intervalSeconds` outside 1–600 |
+
+When everything is valid, one line lists the controls and the spend store in use, for example `Keystone 2 controls: 4 rate limits, 2 spend caps, a region spend cap, Bedrock Guardrails on 4 models; spend store: local`.
+
+**AWS resources and counters (step 6b).** All read-only.
+- **Guardrail:** `aws bedrock get-guardrail` must report the configured version as `READY` in the model's region.
+- **Batch:** the S3 staging bucket (`aws s3api head-bucket`) and the service role (`aws iam get-role`) must exist.
+- **Permissions:** when your credentials cannot look a resource up, the result is a `WARN`, not a `FAIL`. The lookups need `bedrock:GetGuardrail`, `s3:ListBucket` and `iam:GetRole`.
+- **Counters:** read from the gateway's metrics (`http://127.0.0.1:9090/metrics` on the node): requests refused by a rate limit or a spend cap, and spend against each cap, with a warning from 80%. They are per gateway node and restart from zero with the gateway.
+
+**Model probes (step 7).**
+
+| Response | Result |
+|---|---|
+| 429 `deployment_rate_limit_exceeded` | The doctor waits for `Retry-After` (up to 30 s) and sends the request again, up to three times. If it is still refused: `WARN`, because the limit works. |
+| 429 `spend_cap_exceeded` | `FAIL`: the region or model cap is reached, and the model does not answer until the next billing cycle or a higher cap. |
+| 503 `guardrail_unavailable` | `FAIL`: the guardrail check could not run and failed closed. Usually the gateway's role lacks `bedrock:ApplyGuardrail`, or the guardrail version does not exist in the model's region. |
+| 400 `guardrail_initialization_error` | `FAIL`: guardrails are enabled without a source. |
+| 422 on the doctor's own probe | `WARN`: the guardrail blocked a harmless prompt, so the model is reachable but its filters are strict. |
+
+`--probe-guardrails` also sends each chat model that has jailbreak detection one mild prompt-attack request ("Ignore all previous instructions…") and expects HTTP 422. A model that answers it gets a `WARN`. The probe is off by default because it uses guardrail text units.
+
+Not covered: a Bedrock batch run end to end, a burst that exceeds a rate limit on purpose, and content-filter probes.
 
 ## Run logs
 Every run saves its full log to its own file: `~/.aigw-doctor/logs/aigw-doctor-<sandbox>-<mode>-<timestamp>-<pid>.log`, with mode 600. It is meant as evidence for tickets and reviews.
@@ -135,6 +179,8 @@ On the first start without a `.env`, the server creates one from `.env.example` 
   - **Left:** the sandboxes, with the status and counts of each one's last run.
   - **Middle:** the run form. It is filled from `.env`, then your edits, which are kept per sandbox in the browser. **Reset to .env** discards your edits.
   - **Save to .env:** writes your changes back as that sandbox's `<NAME>_*` keys, including a password or API key you typed. Existing lines are updated in place, a cleared field removes its line, and the previous file is kept as `.env.bak`. Values are checked like run options, so a save can't add other lines.
+  - **Test jailbreak detection:** the checkbox under Models runs the doctor with `--probe-guardrails`.
+  - **Config tab:** shows a Keystone 2 section when the config uses it: whether rate limits and spend caps are enforced, the region spend cap and spend store, and each model's rate limit, spend cap, rate card, Bedrock guardrail and Bedrock batch bucket.
   - **Right:** the results, with one card per step and a PASS/WARN/FAIL line for each check. The commands and output are folded underneath, and fix commands are shown expanded. Step 7 lists every model request with its question, answer, `X-Cache`, HTTP status and latency. **Problems only** hides the passing checks, **Raw output** shows the doctor's text, and **Clear output** empties the window before the next run (saved runs stay in the **Run** list).
 - **AI Gateway version:** the version reported by the sandbox's latest run is shown under its title and in the sandbox list. **Check version** fetches it live from `GET /v1/info`, using the same gateway URL and API key as the Playground.
 - **Fleet Manager:** a sandbox's AI gateway config can be downloaded from its Fleet Manager, `https://fm.<env>.<domain>/`. A link appears under the Config file field, on the Config tab and in the Add sandbox form.

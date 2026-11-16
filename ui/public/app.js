@@ -235,6 +235,18 @@ function renderConfig(c) {
       kv('Service', c.serviceName),
       kv('Rate limit', c.rateLimit)));
 
+  // Keystone 2: shown only when the config uses a rate limit, spend cap or Bedrock control.
+  const k2 = c.keystone2 || {};
+  const k2Used = k2.regionSpendCap || c.models.some((m) => m.requestsPerMinute != null || m.spendCap || m.bedrockGuardrail || m.bedrockBatch);
+  const controls = k2Used ? el('article', { class: 'step info' },
+    el('header', {}, el('h3', {}, 'Keystone 2 controls')),
+    el('div', { class: 'pills' }, onOff('rate limits enforced', k2.rateLimitsOn), onOff('spend caps enforced', k2.spendCapsOn)),
+    el('div', { class: 'kv-grid' },
+      kv('Region spend cap', k2.regionSpendCap),
+      kv('Billing cycle start', k2.cycleStart),
+      kv('Spend store', k2.spendStore || (k2.spendKeyspace ? 'auto (Couchbase)' : 'auto (per node)')),
+      kv('Spend keyspace', k2.spendKeyspace))) : null;
+
   const cards = c.models.map((m) => {
     const v = cacheVerdict(m);
     const cc = m.cache;
@@ -260,12 +272,18 @@ function renderConfig(c) {
           el('div', { class: 'pills' }, m.guardrail && onOff('guardrail', true), m.jailbreak && onOff('jailbreak', true),
             m.hallucination && onOff('hallucination', true), m.batch && onOff('batch', true)),
           kv('qps', m.qps), kv('queue', m.queueLength), kv('timeout', duration(m.requestTimeout)),
-          kv('embedding dims', /embedding/.test(m.kind) ? m.embeddingDimensions : null))));
+          kv('embedding dims', /embedding/.test(m.kind) ? m.embeddingDimensions : null)),
+        (m.requestsPerMinute != null || m.spendCap || m.bedrockGuardrail || m.bedrockBatch) && section('Keystone 2',
+          kv('rate limit', m.requestsPerMinute != null ? `${m.requestsPerMinute} requests/min` : null),
+          kv('spend cap', m.spendCap),
+          kv('rate card', m.rateCard ? `${m.rateCard} charge${m.rateCard === 1 ? '' : 's'}` : null),
+          kv('Bedrock guardrail', m.bedrockGuardrail),
+          kv('Bedrock batch', m.bedrockBatch && ([m.bedrockBatch.bucket, m.bedrockBatch.guardrailMode && `guardrail ${m.bedrockBatch.guardrailMode}`].filter(Boolean).join(' · ') || 'enabled')))));
   });
   const models = el('article', { class: 'step info' },
     el('header', {}, el('h3', {}, `Models (${c.models.length})`)),
     el('div', { class: 'model-cards' }, cards));
-  return [head, rawBox, store, models];
+  return [head, rawBox, store, controls, models].filter(Boolean);
 }
 
 // ---------- Couchbase console (middle pane) ----------
@@ -1037,6 +1055,7 @@ function formBody() {
     cpUser: models ? v('cpUser') : '',
     cpPassword: models ? form.elements.cpPassword.value : '',
     models: models ? v('models') : '',
+    probeGuardrails: models && form.elements.probeGuardrails.checked,
   });
 }
 

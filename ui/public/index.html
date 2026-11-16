@@ -195,6 +195,8 @@
           <label>Models (comma-separated; empty for all)
             <input name="models" placeholder="amazon.nova-lite-v1:0,amazon.titan-embed-text-v2:0">
           </label>
+          <label class="check-inline" title="Sends each chat model with jailbreak detection a mild prompt-attack request and expects HTTP 422. Counts against the model's rate limit and guardrail usage.">
+            <input type="checkbox" name="probeGuardrails"> Test jailbreak detection (one prompt-attack probe per model)</label>
         </section>
 
         <div class="actions">
