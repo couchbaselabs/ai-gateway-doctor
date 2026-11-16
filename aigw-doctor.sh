@@ -29,7 +29,10 @@
 #      cache-enabled chat model the same prompt twice per cache type (standard,
 #      semantic) and expect X-Cache: HIT on the repeat; needs an API key.
 #      A request refused by a deployment's rate limit is retried after its
-#      Retry-After; spend-cap and guardrail refusals are reported as such
+#      Retry-After; spend-cap and guardrail refusals are reported as such.
+#      Optional probes: --probe-guardrails (a prompt attack must be blocked),
+#      --probe-rate-limit (a burst must be refused with 429 and Retry-After) and
+#      --probe-batch (a two-request batch must complete)
 #   8. --fix: grow the EBS volume behind each full filesystem (growpart +
 #      resize2fs/xfs_growfs) on either node, and restart couchbase-server if the
 #      admin API is still down, then re-check
@@ -92,6 +95,16 @@
 #   --skip-inference       do not send inference requests
 #   --probe-guardrails     also send each chat model with jailbreak detection a mild
 #                          prompt-attack probe and expect it to be blocked (HTTP 422)
+#   --probe-rate-limit     also send each model with a rate limit one burst of parallel
+#                          requests, larger than the limit allows, and expect some to be
+#                          refused with 429 deployment_rate_limit_exceeded and Retry-After.
+#                          Uses up the deployment's limit for a few seconds
+#   --burst-max N          largest burst --probe-rate-limit may send (default: 150 requests);
+#                          a deployment that needs more is skipped
+#   --probe-batch          also submit a two-request batch to each model with batch enabled
+#                          (POST /v1/files, POST /v1/batches) and wait for its results
+#   --batch-timeout SECS   how long --probe-batch waits for a batch (default: 300); a batch
+#                          still running then is cancelled
 #   --size GB              new size for every volume --fix grows (default: double its size)
 #   --threshold PCT        filesystem use (space or inodes) that counts as full (default: 85)
 #   --snapshot             snapshot each volume before resizing it
@@ -127,6 +140,10 @@ SAVE_KEY_FILE=""
 MODELS_FILTER=""
 SKIP_INFERENCE=false
 PROBE_GUARDRAILS=false
+PROBE_RATE_LIMIT=false
+BURST_MAX=150
+PROBE_BATCH=false
+BATCH_TIMEOUT=300
 NEW_SIZE=""
 THRESHOLD=85
 SNAPSHOT=false
@@ -166,6 +183,10 @@ while [[ $# -gt 0 ]]; do
 	--models) MODELS_FILTER="$2"; shift ;;
 	--skip-inference) SKIP_INFERENCE=true ;;
 	--probe-guardrails) PROBE_GUARDRAILS=true ;;
+	--probe-rate-limit) PROBE_RATE_LIMIT=true ;;
+	--burst-max) BURST_MAX="$2"; shift ;;
+	--probe-batch) PROBE_BATCH=true ;;
+	--batch-timeout) BATCH_TIMEOUT="$2"; shift ;;
 	--size) NEW_SIZE="$2"; shift ;;
 	--threshold) THRESHOLD="$2"; shift ;;
 	--snapshot) SNAPSHOT=true ;;
@@ -184,6 +205,8 @@ die() { echo "error: $*" >&2; exit 1; }
 [[ -z "$API_KEY_FILE" ]] || ! $CREATE_KEY || die "use either --api-key-file or --create-api-key"
 ! $INFRA && $SKIP_INFERENCE && die "--inference-only and --skip-inference leave nothing to run"
 ! $INFRA && [[ "$MODE" == fix ]] && die "--inference-only has nothing to fix; use --check"
+[[ "$BURST_MAX" =~ ^[0-9]+$ && "$BURST_MAX" -ge 2 ]] || die "--burst-max must be a number of requests, 2 or more"
+[[ "$BATCH_TIMEOUT" =~ ^[0-9]+$ && "$BATCH_TIMEOUT" -ge 10 ]] || die "--batch-timeout must be a number of seconds, 10 or more"
 SM_REGION="${SM_REGION:-$REGION}"
 [[ "$MODE" == dry-run ]] && VERBOSE=true
 
@@ -406,6 +429,14 @@ def blank: ((. // "") | tostring | gsub("^\\s+|\\s+$"; "") == "");
 def lower: ((. // "") | tostring | ascii_downcase | gsub("^\\s+|\\s+$"; ""));
 def bedrock: ((.serverKind // "") == "bedrock");
 def safety_on: ((.guardrailConfig.isEnabled == true) or (.jailbreakConfig.isEnabled == true));
+# instant: an RFC 3339 timestamp as seconds since the epoch (fractions and offsets
+# included), or null when it is not one.
+def instant: (try (tostring |
+	capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<f>\\.[0-9]+)?(?<z>[Zz]|[+-][0-9]{2}:[0-9]{2})$") |
+	(((.d + "Z") | fromdateiso8601) + (if .f then ("0" + .f | tonumber) else 0 end) -
+		(if (.z | ascii_downcase) == "z" then 0
+			else ((.z[1:3] | tonumber) * 3600 + (.z[4:6] | tonumber) * 60) * (if .z[0:1] == "-" then -1 else 1 end) end)))
+	catch null) // null;
 def plural($n; $w): "\($n) \($w)\(if $n == 1 then "" else "s" end)";
 def capcheck: [
 	(if ((.limit // 0) | (type != "number" or . < 0.000001 or . > 1e12))
@@ -508,7 +539,8 @@ def capcheck: [
 		$c.regionSpendCap as $r | ($r | capcheck) as $e |
 		if $e != "" then ["WARN", "config: regionSpendCap is ignored by the gateway: \($e)",
 			"fix the region spend cap; until then the region has no cap"]
-		elif (($r.cycleEnd // "") != "") and (($r.cycleStart // "") != "") and ($r.cycleEnd <= $r.cycleStart)
+		elif (($r.cycleStart | instant) as $from | ($r.cycleEnd | instant) as $to |
+				$from != null and $to != null and $to <= $from)
 			then ["WARN", "config: regionSpendCap is ignored by the gateway: cycleEnd must be after cycleStart",
 				"fix the billing cycle dates of the region spend cap"]
 		else empty end
@@ -1100,6 +1132,10 @@ check_guardrails() {
 		elif aws_denied; then
 			warn "bedrock guardrail $id version $ver: could not be checked with your credentials"
 			hint "needs bedrock:GetGuardrail in $region and AWS CLI v2: $(aws_reason)"
+		elif ! grep -q 'ResourceNotFoundException' <<<"$AWS_OUT"; then
+			# Throttling, a timeout or any other error says nothing about the guardrail.
+			warn "bedrock guardrail $id version $ver: could not be checked in $region: $(aws_reason)"
+			hint "the lookup failed, so the guardrail may still exist: re-run, or check with: aws bedrock get-guardrail --region $region --guardrail-identifier $id --guardrail-version $ver"
 		elif [[ "$role" == role ]]; then
 			warn "bedrock guardrail $id version $ver: not found in $region with your credentials; the model assumes bedrockConfig.roleArn, so it may live in that role's account"
 			hint "check the guardrail in the account of bedrockConfig.roleArn: $(aws_reason)"
@@ -1114,15 +1150,17 @@ check_guardrails() {
 # check_batch_storage: the S3 staging bucket and the Bedrock batch service role of every
 # model with bedrockConfig.batch enabled.
 check_batch_storage() {
-	local rows bucket arn name status
+	local rows bucket arn name status account mine seen=" "
 	rows=$(jq -r '[.modelConfig.models[]? | select(.bedrockConfig.batch.enabled == true) | .bedrockConfig.batch |
 		[(.s3Bucket // "" | if . == "" then "-" else . end),
 			(.serviceRoleArn // "" | if . == "" then "-" else . end)]] | unique | .[] | @tsv' "$CONFIG")
 	[[ -n "$rows" ]] || return 0
 	while IFS=$'\t' read -r bucket arn; do
-		if [[ "$bucket" != - ]]; then
-			bucket="${bucket#s3://}"
-			bucket="${bucket%%/*}"
+		bucket="${bucket#s3://}"
+		bucket="${bucket%%/*}"
+		# Several models may share one bucket: check it once.
+		if [[ "$bucket" != - && "$seen" != *" $bucket "* ]]; then
+			seen+="$bucket "
 			aws_try s3api head-bucket --bucket "$bucket"
 			status=$?
 			if ! allowed check; then
@@ -1138,13 +1176,31 @@ check_batch_storage() {
 			fi
 		fi
 		if [[ "$arn" != - ]]; then
+			# iam get-role finds a role by name in the caller's account only, so a role in
+			# another account cannot be checked, and a found role must have the configured ARN.
 			name="${arn##*/}"
+			account=""
+			[[ "$arn" =~ ^arn:[a-z0-9-]+:iam::([0-9]{12}):role/.+$ ]] && account="${BASH_REMATCH[1]}"
+			mine=""
+			[[ "${CALLER:-}" =~ ^arn:[a-z0-9-]+:[a-z]+::([0-9]{12}): ]] && mine="${BASH_REMATCH[1]}"
+			if allowed check && [[ -z "$account" ]]; then
+				warn "bedrock batch: serviceRoleArn '$arn' is not an IAM role ARN"
+				hint "expected arn:aws:iam::<account id>:role/<name>; fix bedrockConfig.batch.serviceRoleArn"
+				continue
+			elif allowed check && [[ -n "$mine" && "$account" != "$mine" ]]; then
+				warn "bedrock batch: service role $name is in account $account, not the account of your credentials ($mine); it was not checked"
+				hint "check it with credentials for account $account: aws iam get-role --role-name $name"
+				continue
+			fi
 			aws_try iam get-role --role-name "$name" --query Role.Arn --output text
 			status=$?
 			if ! allowed check; then
 				:
-			elif [[ "$status" == 0 ]]; then
+			elif [[ "$status" == 0 && "$AWS_OUT" == "$arn" ]]; then
 				pass "bedrock batch: service role $name exists"
+			elif [[ "$status" == 0 ]]; then
+				fail "bedrock batch: a role named $name exists, but its ARN is $AWS_OUT, not the configured $arn"
+				hint "the path or account differs: set bedrockConfig.batch.serviceRoleArn to the role's real ARN"
 			elif grep -q NoSuchEntity <<<"$AWS_OUT"; then
 				fail "bedrock batch: service role $name does not exist"
 				hint "create the Bedrock batch service role (trusted by bedrock.amazonaws.com, with access to the staging bucket), or fix bedrockConfig.batch.serviceRoleArn"
@@ -1245,6 +1301,16 @@ public_cp_url() {
 	fi
 }
 
+# resp_init: the files for the last response's body ($RESP_FILE) and headers ($RESP_HDR).
+# Both live in a directory only this user can read, created by mktemp -d, so neither path
+# can be prepared by someone else on a shared machine.
+RESP_DIR="" RESP_FILE="" RESP_HDR=""
+resp_init() {
+	[[ -z "$RESP_DIR" ]] || return 0
+	RESP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/aigw-doctor.XXXXXX") || die "cannot create a temporary directory"
+	RESP_FILE="$RESP_DIR/response" RESP_HDR="$RESP_DIR/headers"
+}
+
 # step_cp_endpoint: log in to the control plane and read the gateway endpoint that the
 # org's language models in this region are served from. One gateway serves a tenant's
 # region, so every model there carries the same network.endpoint (https://<fqdn>, port 443).
@@ -1289,7 +1355,7 @@ step_cp_endpoint() {
 			"$DIM" "$CP_URL" "$org" "'Authorization: Bearer <session jwt>'" "$RST"
 	} | show check
 	allowed check || return 0
-	RESP_FILE="${RESP_FILE:-$(mktemp)}"
+	resp_init
 	code=$(curl -sk --max-time 30 -K <(basic_config "$CP_USER:$CP_PASSWORD") -o "$RESP_FILE" \
 		-w '%{http_code}' -X POST "$CP_URL/sessions")
 	jwt=$(jq -r '.jwt // empty' "$RESP_FILE" 2>/dev/null)
@@ -1347,14 +1413,14 @@ step_cp_endpoint() {
 
 # ---------- 7. inference: model probes and cache hits ----------
 
-API_KEY="" KEY_ID="" ADMIN_SECRET="" RESP_FILE="" INFERENCE_RAN=false
+API_KEY="" KEY_ID="" ADMIN_SECRET="" INFERENCE_RAN=false
 
 # call PATH CACHE_TYPE BODY [HEADER]: POST to the gateway with the API key. The response
-# body goes to $RESP_FILE and its headers to $RESP_FILE.hdr; "<http code> <X-Cache>
+# body goes to $RESP_FILE and its headers to $RESP_HDR; "<http code> <X-Cache>
 # <seconds>" goes to stdout. A request refused by the deployment's rate limit (429
 # deployment_rate_limit_exceeded) is sent again after its Retry-After, up to three times.
 call() {
-	local hdr="$RESP_FILE.hdr" out cache code="" secs="" try wait extra=()
+	local hdr="$RESP_HDR" out cache code="" secs="" try wait extra=()
 	[[ -n "${4:-}" ]] && extra=(-H "$4")
 	printf '   %s[check] $ curl -sk -X POST %s -H %s -H %s%s -d %s%s\n' "$DIM" "$AIGW_URL$1" \
 		"'Authorization: Bearer <redacted>'" "'X-cb-cache: $2'" "${4:+ -H '$4'}" "$(shellquote "$3")" "$RST" | show check
@@ -1398,7 +1464,7 @@ resp_code() { jq -r '.error.code // .error.type // .code // empty' "$RESP_FILE" 
 resp_param() { jq -r '.error.param // empty' "$RESP_FILE" 2>/dev/null | head -n1; }
 # resp_header NAME: a header of the last response (name in lower case).
 resp_header() {
-	awk -F': *' -v n="$1" 'tolower($1) == n {gsub("\r", "", $2); v = $2} END {print v}' "$RESP_FILE.hdr" 2>/dev/null
+	awk -F': *' -v n="$1" 'tolower($1) == n {gsub("\r", "", $2); v = $2} END {print v}' "$RESP_HDR" 2>/dev/null
 }
 
 # k2_refusal MODEL WHAT HTTP_CODE: report a response that a Keystone 2 control refused: a
@@ -1417,6 +1483,11 @@ k2_refusal() {
 		param=$(resp_param)
 		fail "inference: $model $what refused: the ${param:+$param }spend cap is reached (HTTP 429 spend_cap_exceeded)"
 		hint "the model answers again in the next billing cycle; to serve it now raise the cap (spendCap.limit on the deployment, or regionSpendCap) or set its behavior to warn"
+		;;
+	429:batch_rejected)
+		param=$(resp_param)
+		fail "inference: $model $what refused at submission (HTTP 429 batch_rejected${param:+, $param}): $(resp_error)"
+		hint "a batch reserves its estimated cost when it is submitted: with param spend_cap the model or region spend cap has no room for it"
 		;;
 	429:*)
 		warn "inference: $model $what rate limited (HTTP 429${ec:+ $ec}): $(resp_error)"
@@ -1582,6 +1653,217 @@ cache_test() {
 	fi
 }
 
+# ---------- 7b. optional probes: rate-limit burst, batch ----------
+
+# MODEL_OK: did the model's plain probe answer? The optional probes only run then.
+MODEL_OK=false
+
+# gw METHOD PATH [CURL ARGS...]: one gateway API call with the API key. The response body
+# goes to $RESP_FILE, its headers to $RESP_HDR, and the HTTP code to stdout.
+gw() {
+	local method="$1" path="$2"
+	shift 2
+	printf '   %s[check] $ curl -sk -X %s %s -H %s%s%s\n' "$DIM" "$method" "$AIGW_URL$path" \
+		"'Authorization: Bearer <redacted>'" "${1:+ $(shellquote "$@")}" "$RST" | show check
+	allowed check || return 0
+	curl -sk --max-time 120 -K <(bearer_config "$API_KEY") -o "$RESP_FILE" -D "$RESP_HDR" \
+		-w '%{http_code}' -X "$method" "$@" "$AIGW_URL$path"
+}
+
+# burst_config N PATH BODY_FILE DIR: a curl config with N copies of one request, for
+# curl --parallel. Each request has its own Authorization header (options do not carry
+# across "next"), body file and header file; the key is only ever written to the pipe.
+burst_config() {
+	local n="$1" path="$2" body="$3" dir="$4" i
+	for i in $(seq 1 "$n"); do
+		((i > 1)) && echo next
+		printf 'url = "%s"\n' "$(curl_escape "$AIGW_URL$path")"
+		bearer_config "$API_KEY"
+		printf 'header = "Content-Type: application/json"\nheader = "X-cb-cache: none"\n'
+		printf 'data = "@%s"\noutput = "%s/%s.body"\ndump-header = "%s/%s.hdr"\n' \
+			"$(curl_escape "$body")" "$(curl_escape "$dir")" "$i" "$(curl_escape "$dir")" "$i"
+		printf 'insecure\nsilent\nmax-time = 120\n'
+	done
+}
+
+# probe_burst MODEL KIND RPM: send more requests at once than the deployment's rate limit
+# allows and expect some to be refused with 429 deployment_rate_limit_exceeded and a
+# Retry-After header. The gateway's bucket holds a burst of RPM/6 requests (at least 1) and
+# refills at RPM/60 a second, so the burst is that plus two seconds of refill, plus 5.
+probe_burst() {
+	local model="$1" kind="$2" rpm="$3" burst n path body dir codes ok limited ra other
+	burst=$((rpm / 6))
+	((burst < 1)) && burst=1
+	n=$((burst + rpm / 30 + 5))
+	if ((n > BURST_MAX)); then
+		skip "inference: $model rate-limit burst not sent: $rpm requests/min needs a burst of $n requests, over --burst-max $BURST_MAX"
+		return 0
+	fi
+	if ! curl --help all 2>/dev/null | grep -q -- '--parallel-max'; then
+		skip "inference: $model rate-limit burst not sent: this curl has no --parallel (needs curl 7.66 or later)"
+		return 0
+	fi
+	if [[ "$kind" == *embedding* ]]; then
+		path=/v1/embeddings
+		body=$(jq -nc --arg m "$model" '{model: $m, input: "aigw-doctor burst probe"}')
+	else
+		path=/v1/chat/completions
+		body=$(jq -nc --arg m "$model" '{model: $m, max_tokens: 1, temperature: 0, messages: [{role: "user", content: "Reply with only the word OK."}]}')
+	fi
+	printf '   %s[check] $ curl -sk --parallel --parallel-max %s -X POST %s -H %s -d %s   (%s requests at once)%s\n' \
+		"$DIM" "$n" "$AIGW_URL$path" "'Authorization: Bearer <redacted>'" "$(shellquote "$body")" "$n" "$RST" | show check
+	allowed check || return 0
+	dir=$(mktemp -d "${TMPDIR:-/tmp}/aigw-doctor-burst.XXXXXX") || return 0
+	printf '%s' "$body" >"$dir/request.json"
+	curl --parallel --parallel-max "$n" -K <(burst_config "$n" "$path" "$dir/request.json" "$dir") >/dev/null 2>&1
+	# The last status line of each header file is the response's HTTP code.
+	codes=$(awk 'FNR == 1 && NR > 1 {print c; c = ""} /^HTTP\// {c = $2} END {if (NR > 0) print c}' "$dir"/*.hdr 2>/dev/null)
+	ok=$(grep -c '^200$' <<<"$codes")
+	limited=$(grep -l 'deployment_rate_limit_exceeded' "$dir"/*.body 2>/dev/null | grep -c .)
+	ra=$(grep -ih '^retry-after:' "$dir"/*.hdr 2>/dev/null | head -n1 | tr -d '\r' | awk '{print $2}')
+	other=$(grep -v -e '^200$' -e '^429$' <<<"$codes" | grep . | sort | uniq -c | awk '{printf "%s%s x HTTP %s", sep, $1, $2; sep = ", "}')
+	info "burst of $n: $ok answered, $limited refused by the rate limit${other:+, $other}"
+	rm -rf "$dir"
+	if ((limited > 0)) && [[ "$ra" =~ ^[0-9]+$ ]]; then
+		pass "inference: $model rate limit enforced: of $n requests at once, $ok answered and $limited got 429 deployment_rate_limit_exceeded (Retry-After ${ra}s; limit $rpm requests/min)"
+	elif ((limited > 0)); then
+		warn "inference: $model rate limit refused $limited of $n requests, but without a Retry-After header"
+		hint "clients cannot tell how long to wait: check the gateway build, and that the load balancer passes the Retry-After header through"
+	elif ((ok == n)); then
+		warn "inference: $model answered all $n requests sent at once: the rate limit of $rpm requests/min was not enforced"
+		hint "check that features.deploymentRateLimit is not false on the deployed gateway, that the gateway build has Keystone 2 rate limits, and that the deployed config matches this file"
+		hint "the gateway log reports a limit it ignored as 'Invalid rate limit config' (step 3)"
+	else
+		warn "inference: $model rate-limit burst was inconclusive: $ok of $n answered, none refused by the rate limit${other:+ ($other)}"
+		hint "another control answered first (see the model's other results), or the requests failed before reaching the limiter; --verbose shows the counts"
+	fi
+}
+
+# BATCH_ID / BATCH_FILES: the probe batch and files still on the gateway; cleaned up when
+# the probe ends, and on exit.
+BATCH_ID="" BATCH_FILES=""
+
+# batch_cleanup: cancel a probe batch that is still running and delete the probe's files.
+batch_cleanup() {
+	local id="$BATCH_ID" files="$BATCH_FILES" f
+	BATCH_ID="" BATCH_FILES=""
+	[[ -n "$id$files" ]] || return 0
+	if [[ -n "$id" ]]; then
+		info "cancelling probe batch $id"
+		curl -sk --max-time 30 -K <(bearer_config "$API_KEY") -o /dev/null -X POST "$AIGW_URL/v1/batches/$id/cancel"
+	fi
+	for f in $files; do
+		info "deleting probe file $f"
+		curl -sk --max-time 30 -K <(bearer_config "$API_KEY") -o /dev/null -X DELETE "$AIGW_URL/v1/files/$f"
+	done
+}
+
+# probe_batch MODEL KIND REF: upload a two-request batch file for the model, create the
+# batch, wait for it and check that both requests were answered. A batch this small runs
+# request by request (for Bedrock: on the runtime, at the standard rate), so it finishes in
+# seconds; it proves the Files and Batches API, the batch storage and the API key's batch role.
+probe_batch() {
+	local model="$1" kind="$2" ref="$3" url file body i code fid bid status="" route out_id err_id n_ok first start elapsed
+	local refhdr=()
+	[[ -n "$ref" && "$ref" != - ]] && refhdr=(-H "X-cb-model-ref: $ref")
+	if [[ "$kind" == *embedding* ]]; then url=/v1/embeddings; else url=/v1/chat/completions; fi
+	file=$(mktemp "${TMPDIR:-/tmp}/aigw-doctor-batch.XXXXXX") || return 0
+	for i in 1 2; do
+		if [[ "$kind" == *embedding* ]]; then
+			body=$(jq -nc --arg m "$model" --arg i "$i" '{model: $m, input: ("aigw-doctor batch probe " + $i)}')
+		else
+			body=$(jq -nc --arg m "$model" --arg i "$i" '{model: $m, max_tokens: 16, temperature: 0,
+				messages: [{role: "user", content: ("Reply with only the number " + $i + ".")}]}')
+		fi
+		jq -nc --arg id "doctor-$i" --arg u "$url" --argjson b "$body" '{custom_id: $id, method: "POST", url: $u, body: $b}'
+	done >"$file"
+
+	code=$(gw POST /v1/files ${refhdr[@]+"${refhdr[@]}"} -F purpose=batch \
+		-F "file=@$file;filename=aigw-doctor-probe.jsonl;type=application/jsonl")
+	rm -f "$file"
+	if ! allowed check; then
+		gw POST /v1/batches -H 'Content-Type: application/json' \
+			--data "{\"input_file_id\":\"<file id>\",\"endpoint\":\"$url\",\"completion_window\":\"24h\"}" >/dev/null
+		gw GET "/v1/batches/<batch id>" >/dev/null
+		gw GET "/v1/files/<output file id>/content" >/dev/null
+		return 0
+	fi
+	fid=$(jq -r '.id // empty' "$RESP_FILE" 2>/dev/null)
+	if [[ "$code" != 2* || -z "$fid" ]]; then
+		if [[ "$code" == 401 || "$code" == 403 ]]; then
+			warn "inference: $model batch: the API key may not upload batch files (HTTP $code: $(resp_error))"
+			hint "the key needs the BatchUser role: keys get it when they are created after batch is enabled on the model; use --create-api-key for a fresh key"
+		elif ! k2_refusal "$model" "batch upload" "$code"; then
+			fail "inference: $model batch: POST /v1/files returned HTTP $code: $(resp_error)"
+			hint "batchConfig.isEnabled must be true for the model; for Bedrock batch the gateway's role must be able to write to bedrockConfig.batch.s3Bucket (see step 6b)"
+		fi
+		return 0
+	fi
+	BATCH_FILES="$fid"
+
+	body=$(jq -nc --arg f "$fid" --arg u "$url" '{input_file_id: $f, endpoint: $u, completion_window: "24h", metadata: {source: "aigw-doctor"}}')
+	code=$(gw POST /v1/batches -H 'Content-Type: application/json' --data "$body")
+	bid=$(jq -r '.id // empty' "$RESP_FILE" 2>/dev/null)
+	if [[ "$code" != 2* || -z "$bid" ]]; then
+		if ! k2_refusal "$model" batch "$code"; then
+			fail "inference: $model batch: POST /v1/batches returned HTTP $code: $(resp_error)"
+			hint "see the gateway log for this request; a model with an invalid safety config is refused at submission (step 1)"
+		fi
+		batch_cleanup
+		return 0
+	fi
+	BATCH_ID="$bid"
+	route=$(jq -r '[.route // empty, (.billing_rate // empty | "\(.) rate")] | join(", ")' "$RESP_FILE" 2>/dev/null)
+
+	start=$(date +%s)
+	while :; do
+		status=$(jq -r '.status // empty' "$RESP_FILE" 2>/dev/null)
+		case "$status" in completed | failed | expired | cancelled) break ;; esac
+		elapsed=$(($(date +%s) - start))
+		((elapsed >= BATCH_TIMEOUT)) && break
+		sleep 5
+		code=$(gw GET "/v1/batches/$bid")
+		[[ "$code" == 200 ]] || { status="HTTP $code"; break; }
+	done
+	elapsed=$(($(date +%s) - start))
+	if [[ "$status" != completed ]]; then
+		if [[ "$status" == failed || "$status" == expired || "$status" == cancelled ]]; then
+			BATCH_ID=""
+			fail "inference: $model batch $status after ${elapsed}s: $(jq -r '[.errors.data[]?.message] | join("; ")' "$RESP_FILE" 2>/dev/null | cut -c1-200)"
+			hint "see the gateway log for batch $bid; for a Bedrock batch check the service role and the S3 bucket (step 6b)"
+		elif [[ "$status" == HTTP* ]]; then
+			fail "inference: $model batch: reading batch $bid returned $status: $(resp_error)"
+			hint "see the gateway log for batch $bid"
+		else
+			warn "inference: $model batch still ${status:-unknown} after ${elapsed}s (--batch-timeout $BATCH_TIMEOUT); the probe batch is cancelled"
+			hint "batch workers may be busy or stopped: check the gateway log for batch $bid, or allow more time with --batch-timeout"
+		fi
+		batch_cleanup
+		return 0
+	fi
+	BATCH_ID=""
+	out_id=$(jq -r '.output_file_id // empty' "$RESP_FILE")
+	err_id=$(jq -r '.error_file_id // empty' "$RESP_FILE")
+	BATCH_FILES="$fid $out_id $err_id"
+	n_ok=0
+	if [[ -n "$out_id" ]]; then
+		code=$(gw GET "/v1/files/$out_id/content")
+		n_ok=$(jq -s '[.[] | select(.response.status_code == 200)] | length' "$RESP_FILE" 2>/dev/null)
+	fi
+	if [[ "${n_ok:-0}" == 2 ]]; then
+		pass "inference: $model batch completed in ${elapsed}s: 2 of 2 requests answered${route:+ ($route)}"
+	else
+		first=""
+		if [[ -n "$err_id" ]]; then
+			code=$(gw GET "/v1/files/$err_id/content")
+			first=$(jq -rs '.[0] | (.response.body.error // .error // {}) | "\(.code // "") \(.message // "")"' "$RESP_FILE" 2>/dev/null | cut -c1-200)
+		fi
+		fail "inference: $model batch completed in ${elapsed}s, but only ${n_ok:-0} of 2 requests were answered${first:+: $first}"
+		hint "the error file of batch $bid has one line per failed request; a guardrail_blocked line means the guardrail refused the probe text"
+	fi
+	batch_cleanup
+}
+
 # probe_jailbreak MODEL: a mild prompt-attack request; jailbreak detection should refuse it
 # with HTTP 422 (jailbreak_violation_error). Only sent with --probe-guardrails.
 probe_jailbreak() {
@@ -1628,6 +1910,7 @@ probe_chat() {
 			return 0
 		fi
 		INFERENCE_RAN=true
+		MODEL_OK=true
 		if [[ "$guard" == G ]]; then
 			pass "inference: $model chat OK (${secs}s, passed its Bedrock guardrail check)"
 		else
@@ -1710,6 +1993,7 @@ probe_embedding() {
 		return 0
 	fi
 	INFERENCE_RAN=true
+	MODEL_OK=true
 	n=$(jq '.data[0].embedding | length' "$RESP_FILE" 2>/dev/null)
 	if [[ "$dims" != - && -n "$n" && "$n" != "$dims" ]]; then
 		warn "inference: $model embeddings returned $n dimensions, config says $dims"
@@ -1721,14 +2005,15 @@ probe_embedding() {
 
 step_inference() {
 	step "7. Inference: model probes and cache hits"
-	local models model kind std sem threshold dims rpm jb guard rc
+	local models model kind std sem threshold dims rpm jb guard ref batch rc limits_on
 	# Without a control plane login, try the instance directly (often blocked by its security group).
 	[[ -z "$AIGW_URL" && -z "$CP_USER" && -n "$AIGW_PUBLIC" ]] && AIGW_URL="https://$AIGW_PUBLIC:8081"
 	allowed check || AIGW_URL="${AIGW_URL:-https://<ai-gateway public dns>:8081}"
 
-	# "modelName kind standard semantic threshold dims rpm jailbreak guard" for each model
-	# (optionally --models). rpm is the deployment's rate limit; jailbreak is J with jailbreak
-	# detection on; guard is G when a Bedrock guardrail checks the model's requests.
+	# "modelName kind standard semantic threshold dims rpm jailbreak guard ref batch" for
+	# each model (optionally --models). rpm is the deployment's rate limit; jailbreak is J
+	# with jailbreak detection on; guard is G when a Bedrock guardrail checks the model's
+	# requests; ref is the model's id; batch is B when the model serves batches.
 	models=$(jq -r --arg f ",$MODELS_FILTER," '.modelConfig.models[]? | . as $m |
 		select($f == ",," or ($f | contains("," + ($m.modelName // "") + ",")) or
 			($f | contains("," + ($m.id // "") + ","))) |
@@ -1743,7 +2028,10 @@ step_inference() {
 			(if $m.jailbreakConfig.isEnabled? == true then "J" else "-" end),
 			(if ($m.serverKind // "") == "bedrock" and (($m.bedrockConfig.guardrail.id? // "") != "") and
 				($m.guardrailConfig.isEnabled? == true or $m.jailbreakConfig.isEnabled? == true)
-				then "G" else "-" end)] | @tsv' "$CONFIG")
+				then "G" else "-" end),
+			(($m.id // "") | if . == "" then "-" else . end),
+			(if $m.batchConfig.isEnabled? == true then "B" else "-" end)] | @tsv' "$CONFIG")
+	limits_on=$(jq -r 'if .features.deploymentRateLimit == false then "false" else "true" end' "$CONFIG")
 
 	if $SKIP_INFERENCE; then
 		skip "inference: --skip-inference"
@@ -1760,7 +2048,7 @@ step_inference() {
 	fi
 
 	RUN_ID="$(date +%Y%m%d%H%M%S)-$$"
-	RESP_FILE=$(mktemp)
+	resp_init
 	API_KEY="${AIGW_API_KEY:-}"
 	[[ -n "$API_KEY_FILE" ]] && API_KEY=$(tr -d '[:space:]' <"$API_KEY_FILE")
 	if $CREATE_KEY; then
@@ -1772,9 +2060,10 @@ step_inference() {
 
 	gateway_info || return 0
 	info "gateway $AIGW_URL; each model gets one probe, then one MISS and one HIT per cache type"
-	while IFS=$'\t' read -r model kind std sem threshold dims rpm jb guard; do
+	while IFS=$'\t' read -r model kind std sem threshold dims rpm jb guard ref batch; do
 		[[ -n "$model" ]] || continue
 		rc=0
+		MODEL_OK=false
 		K2_RPM="${rpm:-}"
 		[[ "$K2_RPM" =~ ^[0-9]+$ ]] || K2_RPM=""
 		case "$kind" in
@@ -1784,6 +2073,21 @@ step_inference() {
 		*) skip "inference: $model ($kind) is not probed" ;;
 		esac
 		[[ "$rc" == 2 ]] && break
+		# The optional probes need a model that answers (in a dry run they are only shown).
+		if $MODEL_OK || ! allowed check; then
+			case "$kind" in *sparse*) continue ;; *embedding* | *text-generation*) ;; *) continue ;; esac
+			if $PROBE_BATCH && [[ "$batch" == B ]]; then
+				probe_batch "$model" "$kind" "$ref"
+			fi
+			# Last, because the burst uses up the deployment's limit for a few seconds.
+			if $PROBE_RATE_LIMIT && [[ -n "$K2_RPM" ]] && ((K2_RPM >= 1 && K2_RPM <= 100000)); then
+				if [[ "$limits_on" == true ]]; then
+					probe_burst "$model" "$kind" "$K2_RPM"
+				else
+					skip "inference: $model rate-limit burst not sent: features.deploymentRateLimit is false in the config"
+				fi
+			fi
+		fi
 	done <<<"$models"
 
 	delete_api_key
@@ -1985,8 +2289,9 @@ stop_logger() {
 
 cleanup() {
 	local rc=$?
+	batch_cleanup
 	delete_api_key
-	[[ -z "$RESP_FILE" ]] || rm -f "$RESP_FILE" "$RESP_FILE.hdr"
+	[[ -z "$RESP_DIR" ]] || rm -rf "$RESP_DIR"
 	[[ -z "$RUN_LOG" ]] || printf '%s# finished: %s, exit %s%s\n' "$MARK" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 		"$rc" "$( ((rc > 128)) && echo ' (interrupted)')"
 	stop_logger

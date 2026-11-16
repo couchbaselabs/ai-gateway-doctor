@@ -57,6 +57,8 @@ const FLAGS = {
   createApiKey: '--create-api-key',
   skipInference: '--skip-inference',
   probeGuardrails: '--probe-guardrails',
+  probeRateLimit: '--probe-rate-limit',
+  probeBatch: '--probe-batch',
 };
 
 // .env keys and the form field each fills. "<SANDBOX>_<KEY>" sets one sandbox

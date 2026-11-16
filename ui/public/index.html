@@ -197,6 +197,10 @@
           </label>
           <label class="check-inline" title="Sends each chat model with jailbreak detection a mild prompt-attack request and expects HTTP 422. Counts against the model's rate limit and guardrail usage.">
             <input type="checkbox" name="probeGuardrails"> Test jailbreak detection (one prompt-attack probe per model)</label>
+          <label class="check-inline" title="Sends each model with a rate limit one burst of parallel requests, larger than the limit allows, and expects some to get 429 with Retry-After. Uses up the deployment's limit for a few seconds; deployments that need more than 150 requests are skipped.">
+            <input type="checkbox" name="probeRateLimit"> Test rate limits (one burst per limited model)</label>
+          <label class="check-inline" title="Submits a two-request batch to each model with batch enabled and waits up to 5 minutes for its results. The probe's files are deleted afterwards.">
+            <input type="checkbox" name="probeBatch"> Test batch (a two-request batch per batch model)</label>
         </section>
 
         <div class="actions">

@@ -147,9 +147,19 @@ When everything is valid, one line lists the controls and the spend store in use
 | 400 `guardrail_initialization_error` | `FAIL`: guardrails are enabled without a source. |
 | 422 on the doctor's own probe | `WARN`: the guardrail blocked a harmless prompt, so the model is reachable but its filters are strict. |
 
-`--probe-guardrails` also sends each chat model that has jailbreak detection one mild prompt-attack request ("Ignore all previous instructions…") and expects HTTP 422. A model that answers it gets a `WARN`. The probe is off by default because it uses guardrail text units.
+**Optional probes.** Each sends extra requests, so each is off by default. They run only for a model whose plain probe answered.
 
-Not covered: a Bedrock batch run end to end, a burst that exceeds a rate limit on purpose, and content-filter probes.
+| Option | What it does | Result |
+|---|---|---|
+| `--probe-guardrails` | One mild prompt-attack request ("Ignore all previous instructions…") to each chat model with jailbreak detection. | `PASS` on HTTP 422; `WARN` when the model answers it. Uses guardrail text units. |
+| `--probe-rate-limit` | One burst of parallel requests to each model with a rate limit, larger than the limit allows: the bucket's burst (a sixth of the per-minute limit, at least 1), plus two seconds of refill, plus 5. | `PASS` when some requests get 429 `deployment_rate_limit_exceeded` with `Retry-After`; `WARN` when all are answered (the limit is not enforced) or `Retry-After` is missing. |
+| `--probe-batch` | Uploads a two-request batch file for each model with `batchConfig.isEnabled`, creates the batch, waits for it and reads the results. | `PASS` when both requests are answered; `FAIL` when the upload, the batch or a request fails; `WARN` when it is still running at the timeout. |
+
+- **Burst size:** a limit of 600 requests a minute needs 125 requests. `--burst-max N` (default 150) is the most the doctor will send; a deployment that needs more is skipped. Refused requests cost nothing, the answered ones ask for one output token. The burst uses up the deployment's limit for a few seconds, so it runs last for each model. It needs curl 7.66 or later (`--parallel`).
+- **Several gateway nodes:** each node enforces its share of the limit, so the number of answered requests is close to the burst, not exact.
+- **Batch:** a batch this small runs request by request (for Bedrock on the runtime, at the standard rate), so it finishes in seconds. It proves the Files and Batches API, the batch storage and the API key's batch role, not a native Bedrock batch job, which needs at least `minRecords` (100) requests and can take hours. `--batch-timeout SECS` (default 300) is how long the doctor waits; a batch still running then is cancelled. The probe's files are deleted afterwards, also on Ctrl-C.
+
+Not covered: a native Bedrock batch job (100 or more requests), and content-filter probes.
 
 ## Run logs
 Every run saves its full log to its own file: `~/.aigw-doctor/logs/aigw-doctor-<sandbox>-<mode>-<timestamp>-<pid>.log`, with mode 600. It is meant as evidence for tickets and reviews.
@@ -179,7 +189,7 @@ On the first start without a `.env`, the server creates one from `.env.example` 
   - **Left:** the sandboxes, with the status and counts of each one's last run.
   - **Middle:** the run form. It is filled from `.env`, then your edits, which are kept per sandbox in the browser. **Reset to .env** discards your edits.
   - **Save to .env:** writes your changes back as that sandbox's `<NAME>_*` keys, including a password or API key you typed. Existing lines are updated in place, a cleared field removes its line, and the previous file is kept as `.env.bak`. Values are checked like run options, so a save can't add other lines.
-  - **Test jailbreak detection:** the checkbox under Models runs the doctor with `--probe-guardrails`.
+  - **Optional probes:** the checkboxes under Models run the doctor with `--probe-guardrails`, `--probe-rate-limit` and `--probe-batch`. They are remembered per sandbox in the browser and are off until you tick them; **Reset to .env** clears them.
   - **Config tab:** shows a Keystone 2 section when the config uses it: whether rate limits and spend caps are enforced, the region spend cap and spend store, and each model's rate limit, spend cap, rate card, Bedrock guardrail and Bedrock batch bucket.
   - **Right:** the results, with one card per step and a PASS/WARN/FAIL line for each check. The commands and output are folded underneath, and fix commands are shown expanded. Step 7 lists every model request with its question, answer, `X-Cache`, HTTP status and latency. **Problems only** hides the passing checks, **Raw output** shows the doctor's text, and **Clear output** empties the window before the next run (saved runs stay in the **Run** list).
 - **AI Gateway version:** the version reported by the sandbox's latest run is shown under its title and in the sandbox list. **Check version** fetches it live from `GET /v1/info`, using the same gateway URL and API key as the Playground.
