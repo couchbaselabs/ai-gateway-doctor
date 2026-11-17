@@ -237,7 +237,8 @@ function renderConfig(c) {
       kv('DB credential (Secrets Manager name)', c.store.dbCredKey),
       kv('Admin credential (Secrets Manager name)', c.store.adminKey),
       kv('Service', c.serviceName),
-      kv('Rate limit', c.rateLimit)));
+      kv('Rate limit', c.rateLimit),
+      kv('Custom metric labels (metricsCustomLabels)', c.metricsCustomLabels === 'none' ? 'none (off)' : c.metricsCustomLabels)));
 
   // Keystone 2: shown only when the config uses a rate limit, spend cap or Bedrock control.
   const k2 = c.keystone2 || {};
@@ -410,7 +411,7 @@ playForm.elements.model.addEventListener('change', updatePlayCache);
 function playEntry(r) {
   const ok = r.status >= 200 && r.status < 300;
   const tokens = tokensText(r.usage);
-  const prompt = r.request.messages ? r.request.messages[r.request.messages.length - 1].content : r.request.input;
+  const prompt = r.prompt ?? (r.request.messages ? r.request.messages[r.request.messages.length - 1].content : r.request.input);
   return el('div', { class: `exchange ${ok ? '' : 'bad'}` },
     el('div', { class: 'ex-head' },
       el('span', { class: 'ex-model' }, r.model),
@@ -423,12 +424,17 @@ function playEntry(r) {
       tokens && el('span', { class: 'ex-tokens' }, tokens),
       el('span', { class: 'ex-time' }, `${(r.ms / 1000).toFixed(2)}s · ${new Date(r.at).toLocaleTimeString()}`)),
     el('div', { class: 'ex-body' },
-      el('div', { class: 'ex-q' }, el('span', { class: 'ex-label' }, 'Q'), el('span', {}, prompt)),
-      el('div', { class: 'ex-a' }, el('span', { class: 'ex-label' }, 'A'), el('span', {}, ok ? r.content : r.error))),
+      el('div', { class: 'ex-q' }, el('span', { class: 'ex-label' }, 'Q'), el('span', { class: 'pre-line' }, prompt)),
+      el('div', { class: 'ex-a' }, el('span', { class: 'ex-label' }, 'A'),
+        el('span', { class: 'pre-line' }, ok ? r.content : [r.error, r.content].filter(Boolean).join('\n')))),
+    r.steps && el('div', { class: 'debug-headers' }, r.steps.map((st) =>
+      el('span', { class: 'chip' }, el('span', { class: 'muted' }, `${st.name}: `), st.status ? `HTTP ${st.status}` : 'failed'))),
     debugHeaders(r.responseHeaders),
     curlBlock(r),
     headerTable('Request headers', r.requestHeaders, `POST ${r.endpoint}`),
     headerTable('Response headers', r.responseHeaders, `HTTP ${r.status}`),
+    r.requestLines && el('details', {}, el('summary', { class: 'small' }, 'Batch file (requests.jsonl)'),
+      el('pre', { class: 'raw-json' }, r.requestLines)),
     el('details', {}, el('summary', { class: 'small' }, `Raw response · ${r.keySource} · ${r.endpoint}`),
       el('pre', { class: 'raw-json' }, (() => {
         try {
@@ -442,6 +448,7 @@ function playEntry(r) {
 // curlCommand: the request as a shareable curl command. The API key is left as
 // $AIGW_API_KEY; -i shows the response headers (X-Cache); -k only when TLS was not verified.
 function curlCommand(r) {
+  if (r.curl) return r.curl; // a batch is several calls; the server writes them out
   const q = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
   // -N prints a streamed answer as it arrives.
   const lines = [`curl -sS -i${r.request?.stream ? ' -N' : ''}${r.insecure ? ' -k' : ''} -X POST ${q(r.endpoint)}`];
@@ -487,6 +494,7 @@ function debugHeaders(headers) {
 
 // isEmbeddingRequest: embeddings are never streamed.
 function isEmbeddingRequest(body) {
+  if (['moderations', 'batch'].includes(body.requestType)) return true; // not streamed either
   if (body.custom) return body.requestType === 'embeddings';
   const m = configData?.models.find((x) => x.modelName === body.model);
   return Boolean(m && /embedding/.test(m.kind));
@@ -540,7 +548,7 @@ async function sendPlayStream(body) {
 async function sendPlay(body) {
   $('play-send').disabled = true;
   $('play-again').disabled = true;
-  $('play-msg').textContent = 'sending…';
+  $('play-msg').textContent = body.requestType === 'batch' ? 'running the batch: upload, create, wait (up to 3 minutes)…' : 'sending…';
   try {
     if (body.stream && !isEmbeddingRequest(body)) {
       await sendPlayStream(body);
@@ -578,6 +586,13 @@ function updatePlayTarget() {
   updateCustomModel();
   for (const x of playForm.querySelectorAll('.custom-only')) x.hidden = !custom;
   for (const x of playForm.querySelectorAll('.sandbox-only')) x.hidden = custom;
+  // A sandbox knows each model's kind, so chat or embeddings follows the model; a custom
+  // endpoint has no config, so the choice is made here.
+  const type = playForm.elements.requestType;
+  for (const opt of type.options) {
+    opt.disabled = custom ? opt.value === 'auto' : opt.value === 'chat' || opt.value === 'embeddings';
+  }
+  if (type.selectedOptions[0]?.disabled) type.value = custom ? 'chat' : 'auto';
   // "(off in config)" describes the sandbox's config; a custom endpoint shows what Detect
   // cache found for the model, or plain names.
   if (custom) showDetectedCache();
@@ -656,7 +671,11 @@ function updateCustomModel() {
 }
 
 function guessRequestType() {
-  playForm.elements.requestType.value = /embed/i.test(customModelName()) ? 'embeddings' : 'chat';
+  // Only between chat and embeddings, and only for a custom endpoint: a chosen moderations
+  // or batch request stays, and a sandbox takes the kind from its config.
+  const type = playForm.elements.requestType;
+  if (playTarget() !== 'custom' || ['moderations', 'batch'].includes(type.value)) return;
+  type.value = /embed/i.test(customModelName()) ? 'embeddings' : 'chat';
 }
 
 playForm.elements.customModelPick.addEventListener('change', () => {
@@ -718,9 +737,18 @@ $('custom-connect').addEventListener('click', async () => {
 playForm.addEventListener('submit', (e) => {
   e.preventDefault();
   const f = playForm.elements;
+  // The endpoint choice and the extra X-cb-* headers, for both targets.
+  const extras = {
+    requestType: f.requestType.value, modelRef: f.modelRef.value.trim(), extraHeaders: f.extraHeaders.value,
+    metricLabels: f.metricLabels.value,
+    suppress: {
+      requestGuardrails: f.suppressRequestGuardrails.checked, requestJailbreak: f.suppressRequestJailbreak.checked,
+      responseGuardrails: f.suppressResponseGuardrails.checked,
+    },
+  };
   if (playTarget() === 'custom') {
     sendPlay({
-      custom: true, ...customBody(), model: customModelName(), requestType: f.requestType.value,
+      custom: true, ...customBody(), model: customModelName(), ...extras,
       cacheType: f.cacheType.value, prompt: f.prompt.value, system: f.system.value,
       maxTokens: f.maxTokens.value, temperature: f.temperature.value, debug: f.debug.checked, stream: f.stream.checked,
     });
@@ -732,6 +760,7 @@ playForm.addEventListener('submit', (e) => {
     keySource: run.keySource, apiKey: form.elements.apiKey.value, apiKeyFile: form.elements.apiKeyFile.value.trim(),
     model: f.model.value, cacheType: f.cacheType.value, prompt: f.prompt.value, system: f.system.value,
     maxTokens: f.maxTokens.value, temperature: f.temperature.value, debug: f.debug.checked, stream: f.stream.checked,
+    ...extras,
   });
 });
 playForm.elements.prompt.addEventListener('keydown', (e) => {

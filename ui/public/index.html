@@ -262,9 +262,12 @@
                 <option value="__other">Other (type a name)…</option>
               </select>
               <input name="customModel" placeholder="model name" hidden>
-              <select name="requestType" class="custom-only" hidden title="The endpoint to call">
+              <select name="requestType" title="The endpoint to call">
+                <option value="auto">Chat or embeddings (by model)</option>
                 <option value="chat">Chat completions</option>
                 <option value="embeddings">Embeddings</option>
+                <option value="moderations">Moderations (/v1/moderations)</option>
+                <option value="batch">Batch (/v1/files + /v1/batches)</option>
               </select>
             </label>
             <label>Cache
@@ -290,11 +293,35 @@
             <summary>System prompt</summary>
             <textarea name="system" rows="2" placeholder="Optional"></textarea>
           </details>
+          <details id="play-headers">
+            <summary>Request headers (guardrails, deployment, more)</summary>
+            <label class="check-inline"><input type="checkbox" name="suppressRequestGuardrails">
+              Skip the prompt's guardrail check: <code>X-cb-suppress-request-guardrails: true</code></label>
+            <label class="check-inline"><input type="checkbox" name="suppressRequestJailbreak">
+              Skip the prompt's jailbreak check: <code>X-cb-suppress-request-jailbreak: true</code></label>
+            <label class="check-inline"><input type="checkbox" name="suppressResponseGuardrails">
+              Skip the answer's guardrail check: <code>X-cb-suppress-response-guardrails: true</code></label>
+            <label>Deployment id: <code>X-cb-model-ref</code>
+              <input name="modelRef" placeholder="empty: the model's own id for moderations and batch uploads">
+            </label>
+            <label>Custom metric labels: <code>X-cb-metric-label-&lt;name&gt;</code>
+              <input name="metricLabels" placeholder="workflowId=invoice-triage, appId=billing-portal, teamId=finance">
+            </label>
+            <p class="hint" id="metric-labels-hint">One <code>name=value</code> per label, separated by commas. The gateway adds
+              them to its Prometheus metrics for chat and embeddings requests, for the names on its allowlist
+              (<code>metricsCustomLabels</code>; by default workflowId, appId, teamId, tenantId, sessionId) and ignores other names.</p>
+            <label>Additional headers, one per line (only <code>X-cb-*</code>)
+              <textarea name="extraHeaders" rows="2" placeholder="X-cb-guardrail-response: inline"></textarea>
+            </label>
+            <p class="hint">The suppress headers apply to chat and embeddings; batch lines carry no headers, so a batch is
+              always checked. <code>X-cb-guardrail-response</code> (<code>error</code> or <code>inline</code>) chooses how a
+              batch reports a blocked input.</p>
+          </details>
           <label class="check-inline"><input type="checkbox" name="stream">
             Stream: send <code>"stream": true</code> and show the answer as it arrives (chat only)</label>
           <label class="check-inline"><input type="checkbox" name="debug">
             Debug: send <code>X-cb-debug: true</code> (the gateway adds its <code>X-cb-*</code> debug headers to the response)</label>
-          <textarea name="prompt" rows="4" placeholder="Ask something… (Cmd/Ctrl+Enter sends)"></textarea>
+          <textarea name="prompt" rows="4" placeholder="Ask something… (Cmd/Ctrl+Enter sends). Batch: one request per line, up to 20."></textarea>
           <div class="actions">
             <button type="submit" id="play-send" class="cta"><span>Send</span><span class="cta-arrow" aria-hidden="true">›</span></button>
             <button type="button" id="play-again" disabled title="Send the last request again, e.g. to see a cache HIT">Send again</button>

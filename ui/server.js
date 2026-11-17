@@ -535,6 +535,9 @@ function configSummary(file) {
     modifiedAt: fs.statSync(file).mtimeMs,
     serviceName: c.serviceName || '',
     rateLimit: c.rateLimit ?? null,
+    // The label names clients may send as X-cb-metric-label-<name>; empty when the config
+    // leaves the gateway's default list in place.
+    metricsCustomLabels: typeof c.metricsCustomLabels === 'string' ? c.metricsCustomLabels : '',
     // Keystone 2: gateway-wide switches and the region spend cap.
     keystone2: {
       rateLimitsOn: c.features?.deploymentRateLimit !== false,
@@ -844,18 +847,64 @@ async function detectCache(body) {
   return { model, ...result, checkedAt: Date.now() };
 }
 
+// The gateway's request headers that switch a safety check off for one request (only the
+// exact value "true" counts). Batch lines carry no headers, so they do not apply to a batch.
+const SUPPRESS_HEADERS = {
+  requestGuardrails: 'X-cb-suppress-request-guardrails',
+  requestJailbreak: 'X-cb-suppress-request-jailbreak',
+  responseGuardrails: 'X-cb-suppress-response-guardrails',
+};
+const MODEL_REF = /^[\w.:/@+-]{1,200}$/;
+
+// playgroundHeaders: the extra request headers the playground form asks for. Only the
+// gateway's own X-cb-* headers can be added, so the form cannot replace Authorization, Host
+// or the content type.
+function playgroundHeaders(body, defaultRef = '') {
+  const headers = {};
+  for (const [field, name] of Object.entries(SUPPRESS_HEADERS)) {
+    if (body.suppress?.[field] === true) headers[name] = 'true';
+  }
+  const ref = String(body.modelRef || '').trim() || defaultRef;
+  if (ref) {
+    if (!MODEL_REF.test(ref)) throw new Error(`invalid deployment id for X-cb-model-ref: ${ref}`);
+    headers['X-cb-model-ref'] = ref;
+  }
+  // Custom metric labels: "name=value" pairs, each sent as X-cb-metric-label-<name>. The
+  // gateway adds them to its Prometheus metrics for the names on its allowlist
+  // (metricsCustomLabels) and ignores the rest.
+  const labels = String(body.metricLabels || '').split(/[\r\n,]+/).map((l) => l.trim()).filter(Boolean);
+  if (labels.length > 20) throw new Error('at most 20 metric labels');
+  for (const label of labels) {
+    const m = label.match(/^([a-zA-Z_][a-zA-Z0-9_]{0,59})\s*[=:]\s*([\x20-\x7e]{1,128})$/);
+    if (!m || m[1].startsWith('__')) throw new Error(`metric label "${label.slice(0, 60)}" must look like "workflowId=invoice-triage" (a Prometheus label name, then a value of up to 128 characters)`);
+    headers[`X-cb-metric-label-${m[1]}`] = m[2].trim();
+  }
+  const lines = String(body.extraHeaders || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length > 20) throw new Error('at most 20 additional headers');
+  for (const line of lines) {
+    const m = line.match(/^(x-cb-[a-z0-9-]{1,60})\s*:\s*([\x20-\x7e]{0,500})$/i);
+    if (!m) throw new Error(`additional header "${line.slice(0, 60)}" must look like "X-cb-<name>: value"`);
+    headers[m[1]] = m[2].trim();
+  }
+  return headers;
+}
+
 // preparePlayground: the target, key and request for a playground call (sandbox or custom).
+// requestType: "chat" or "embeddings" (in a sandbox the model's kind decides between those
+// two), "moderations" (POST /v1/moderations) or "batch" (see playgroundBatch).
 async function preparePlayground(body) {
   const cacheType = ['none', 'standard', 'semantic'].includes(body.cacheType) ? body.cacheType : 'none';
+  const type = ['moderations', 'batch'].includes(body.requestType) ? body.requestType : '';
   const prompt = String(body.prompt || '');
   if (!prompt.trim()) throw new Error('type a prompt');
-  let gw; let key; let source; let modelName; let embedding; let kind; let verifyTls = false;
+  let gw; let key; let source; let modelName; let embedding; let kind; let verifyTls = false; let modelId = '';
   if (body.custom === true) {
     ({ gw, key, verifyTls } = customTarget(body));
     source = 'your API key';
     modelName = String(body.model || '').trim();
-    if (!/^[\w.:/@+-]{1,200}$/.test(modelName)) throw new Error('pick or type a model name');
-    embedding = body.requestType === 'embeddings';
+    if (!MODEL_REF.test(modelName)) throw new Error('pick or type a model name');
+    // A custom batch has no config to tell the model's kind: an "embed" name means embeddings.
+    embedding = body.requestType === 'embeddings' || (type === 'batch' && /embed/i.test(modelName));
     kind = embedding ? 'embeddings' : 'chat';
   } else {
     const ctx = sandboxContext(body);
@@ -864,6 +913,7 @@ async function preparePlayground(body) {
     if (!model) throw new Error(`model ${body.model} is not in the config`);
     embedding = /embedding/.test(model.kind || '');
     modelName = model.modelName;
+    modelId = model.id || '';
     kind = model.kind;
     gw = gatewayUrl(ctx, body);
     ({ key, source } = await playgroundKey(ctx, body, gw));
@@ -871,8 +921,14 @@ async function preparePlayground(body) {
 
   let path_ = '/v1/embeddings';
   let payload = { model: modelName, input: prompt };
-  const stream = body.stream === true && !embedding; // embeddings are not streamed
-  if (!embedding) {
+  const stream = body.stream === true && !embedding && !type; // only chat is streamed
+  if (type === 'moderations') {
+    // A Bedrock deployment is named by X-cb-model-ref (its id); "model" names a guardrail
+    // model on gateways that moderate with one, and is ignored for a Bedrock deployment.
+    path_ = '/v1/moderations';
+    payload = body.custom === true ? { model: modelName, input: prompt } : { input: prompt };
+    kind = 'moderations';
+  } else if (!embedding) {
     path_ = '/v1/chat/completions';
     const maxTokens = Math.min(Math.max(parseInt(body.maxTokens, 10) || 256, 1), 8192);
     const temperature = Math.min(Math.max(Number(body.temperature) || 0, 0), 2);
@@ -884,7 +940,18 @@ async function preparePlayground(body) {
   }
   const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-cb-cache': cacheType };
   if (body.debug === true) headers['X-cb-debug'] = 'true'; // the gateway then adds its X-cb-* debug headers
-  return { gw, path_, url: `${gw}${path_}`, key, source, modelName, embedding, kind, verifyTls, cacheType, payload, headers, stream };
+  // A sandbox moderation names the model's deployment unless the form names another.
+  Object.assign(headers, playgroundHeaders(body, type === 'moderations' ? modelId : ''));
+  return { gw, path_, url: `${gw}${path_}`, key, source, modelName, modelId, embedding, kind, type, verifyTls, cacheType, payload, headers, stream };
+}
+
+// moderationSummary: "flagged" or "not flagged" per input, with the categories that fired.
+function moderationSummary(json) {
+  if (!Array.isArray(json?.results)) return '';
+  return json.results.map((r) => {
+    const fired = Object.entries(r.categories || {}).filter(([, on]) => on === true).map(([name]) => name);
+    return r.flagged ? `flagged${fired.length ? `: ${fired.join(', ')}` : ''}` : 'not flagged';
+  }).join('\n');
 }
 
 // playgroundResult: what the page shows for one call; the API key is not echoed back.
@@ -897,6 +964,7 @@ function playgroundResult(p, res, text, extra = {}) {
     json = JSON.parse(text);
   } catch { /* not JSON (or a stream) */ }
   const content = extra.content !== undefined ? extra.content
+    : p.type === 'moderations' ? moderationSummary(json)
     : p.embedding
       ? json?.data?.[0]?.embedding ? `${json.data[0].embedding.length}-dimension vector: [${json.data[0].embedding.slice(0, 6).map((x) => x.toFixed(4)).join(', ')}, …]` : ''
       : json?.choices?.[0]?.message?.content ?? '';
@@ -908,10 +976,152 @@ function playgroundResult(p, res, text, extra = {}) {
     error: extra.error || (res.status >= 300 ? json?.error?.message || json?.message || text.slice(0, 500) : ''),
     raw: text.length > 20000 ? `${text.slice(0, 20000)}…` : text,
     stream: extra.stream || null,
+    ...(extra.batch || {}),
   };
 }
 
+// ---------- playground batch ----------
+
+const BATCH_MAX_LINES = 20; // small enough to run request by request, not as a native Bedrock job
+const BATCH_WAIT_MS = 180000;
+const BATCH_END = ['completed', 'failed', 'expired', 'cancelled'];
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
+
+// jsonLines: a JSONL file's objects; lines that are not JSON are skipped.
+function jsonLines(text) {
+  return String(text || '').split('\n').filter((l) => l.trim()).flatMap((l) => {
+    try {
+      return [JSON.parse(l)];
+    } catch {
+      return [];
+    }
+  });
+}
+
+// playgroundBatch: one prompt per line becomes a batch through the OpenAI Files and Batches
+// API: upload (POST /v1/files), create (POST /v1/batches), wait (GET /v1/batches/{id}),
+// read the output and error files, then delete the files. A batch that has not finished
+// after three minutes is cancelled. The result shows every step and each line's answer.
+async function playgroundBatch(body) {
+  const p = await preparePlayground(body);
+  const prompts = String(body.prompt).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (prompts.length > BATCH_MAX_LINES) {
+    throw new Error(`${prompts.length} lines: the playground sends at most ${BATCH_MAX_LINES} requests per batch, so it runs right away and not as a native Bedrock batch job`);
+  }
+  const started = Date.now();
+  const lineUrl = p.embedding ? '/v1/embeddings' : '/v1/chat/completions';
+  const base = p.embedding ? { model: p.modelName } : { ...p.payload, messages: undefined };
+  const system = p.embedding ? [] : p.payload.messages.slice(0, -1);
+  const jsonl = prompts.map((text, i) => JSON.stringify({
+    custom_id: `line-${i + 1}`, method: 'POST', url: lineUrl,
+    body: p.embedding ? { ...base, input: text } : { ...base, messages: [...system, { role: 'user', content: text }] },
+  })).join('\n');
+
+  // Headers: the key and the X-cb-* extras (X-cb-model-ref names the deployment for the
+  // upload; X-cb-guardrail-response applies to the create call). Not the cache header.
+  const extras = playgroundHeaders(body, p.modelId);
+  const auth = { Authorization: `Bearer ${p.key}`, ...extras };
+  const call = (method, path_, opts = {}) => request(method, `${p.gw}${path_}`, { verifyTls: p.verifyTls, timeout: 60000, ...opts, headers: { ...auth, ...(opts.headers || {}) } });
+  const steps = [];
+  const step = (name, res) => {
+    steps.push({ name, status: res.status, ms: res.ms });
+    return res;
+  };
+  const parse = (res) => {
+    try {
+      return JSON.parse(res.text);
+    } catch {
+      return null;
+    }
+  };
+  const created = [];
+  const cleanup = async (batchId) => {
+    if (batchId) step('cancel', await call('POST', `/v1/batches/${encodeURIComponent(batchId)}/cancel`).catch((e) => ({ status: 0, ms: 0, text: e.message })));
+    for (const id of created.splice(0)) {
+      step(`delete ${id}`, await call('DELETE', `/v1/files/${encodeURIComponent(id)}`).catch((e) => ({ status: 0, ms: 0, text: e.message })));
+    }
+  };
+  const createPayload = (fileId) => ({ input_file_id: fileId, endpoint: lineUrl, completion_window: '24h', metadata: { source: 'aigw-doctor-playground' } });
+  const curl = [
+    `curl -sS${p.verifyTls ? '' : ' -k'} -X POST ${shq(`${p.gw}/v1/files`)} -H "Authorization: Bearer $AIGW_API_KEY"${Object.entries(extras).map(([k, v]) => ` -H ${shq(`${k}: ${v}`)}`).join('')} -F purpose=batch -F file=@requests.jsonl`,
+    `curl -sS${p.verifyTls ? '' : ' -k'} -X POST ${shq(`${p.gw}/v1/batches`)} -H "Authorization: Bearer $AIGW_API_KEY" -H 'Content-Type: application/json'${Object.entries(extras).map(([k, v]) => ` -H ${shq(`${k}: ${v}`)}`).join('')} -d ${shq(JSON.stringify(createPayload('<file id>')))}`,
+    `curl -sS${p.verifyTls ? '' : ' -k'} ${shq(`${p.gw}/v1/batches/<batch id>`)} -H "Authorization: Bearer $AIGW_API_KEY"`,
+    `curl -sS${p.verifyTls ? '' : ' -k'} ${shq(`${p.gw}/v1/files/<output file id>/content`)} -H "Authorization: Bearer $AIGW_API_KEY"`,
+  ].join('\n');
+  const view = { ...p, url: `${p.gw}/v1/batches`, kind: 'batch', cacheType: 'none', payload: createPayload('<file id>'), headers: { ...auth, 'Content-Type': 'application/json' } };
+  const result = (res, text, extra) => playgroundResult(view, { ...res, ms: Date.now() - started }, text, {
+    ...extra, batch: { prompt: prompts.join('\n'), curl, steps, requestLines: jsonl, ...(extra.batch || {}) },
+  });
+
+  // 1. upload
+  const boundary = `----aigw-doctor-${Date.now().toString(16)}`;
+  const form = Buffer.from([
+    `--${boundary}`, 'Content-Disposition: form-data; name="purpose"', '', 'batch',
+    `--${boundary}`, 'Content-Disposition: form-data; name="file"; filename="playground.jsonl"', 'Content-Type: application/jsonl', '', jsonl,
+    `--${boundary}--`, '',
+  ].join('\r\n'));
+  const up = step('upload', await call('POST', '/v1/files', { body: form, headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': String(form.length) } }));
+  const fileId = parse(up)?.id;
+  if (up.status >= 300 || !fileId) return result(up, up.text, { content: '', error: `upload (POST /v1/files) failed: ${parse(up)?.error?.message || up.text.slice(0, 300) || `HTTP ${up.status}`}` });
+  created.push(fileId);
+
+  // 2. create
+  const make = step('create', await call('POST', '/v1/batches', { body: JSON.stringify(createPayload(fileId)), headers: { 'Content-Type': 'application/json' } }));
+  let batch = parse(make);
+  if (make.status >= 300 || !batch?.id) {
+    await cleanup();
+    return result(make, make.text, { content: '', error: `create (POST /v1/batches) failed: ${batch?.error?.message || make.text.slice(0, 300) || `HTTP ${make.status}`}` });
+  }
+
+  // 3. wait
+  let last = make;
+  while (!BATCH_END.includes(batch.status) && Date.now() - started < BATCH_WAIT_MS) {
+    await sleep(3000);
+    last = await call('GET', `/v1/batches/${encodeURIComponent(batch.id)}`, { timeout: 30000 });
+    const next = parse(last);
+    if (last.status !== 200 || !next) break;
+    batch = next;
+  }
+  steps.push({ name: `wait: ${batch.status}`, status: last.status, ms: Date.now() - started });
+  for (const id of [batch.output_file_id, batch.error_file_id]) if (id) created.push(id);
+  if (!BATCH_END.includes(batch.status)) {
+    await cleanup(batch.id);
+    return result(last, JSON.stringify({ batch }), {
+      content: '', error: `the batch was still ${batch.status} after ${Math.round((Date.now() - started) / 1000)}s and was cancelled (batch ${batch.id})`,
+    });
+  }
+
+  // 4. results
+  const read = async (id, name) => (id ? jsonLines(step(name, await call('GET', `/v1/files/${encodeURIComponent(id)}/content`)).text) : []);
+  const output = await read(batch.output_file_id, 'output file');
+  const errors = await read(batch.error_file_id, 'error file');
+  await cleanup();
+  const answer = (line) => {
+    const b = line.response?.body || {};
+    if (b.error || line.error) return `error: ${(b.error || line.error).code || ''} ${(b.error || line.error).message || ''}`.trim();
+    if (b.choices) return `${b.choices[0]?.message?.content ?? ''}${b.choices[0]?.finish_reason && b.choices[0].finish_reason !== 'stop' ? ` [${b.choices[0].finish_reason}]` : ''}`;
+    if (b.data) return `${b.data[0]?.embedding?.length ?? '?'}-dimension vector`;
+    return JSON.stringify(b).slice(0, 200);
+  };
+  const byId = new Map([...output, ...errors].map((l) => [l.custom_id, l]));
+  const content = prompts.map((_, i) => {
+    const line = byId.get(`line-${i + 1}`);
+    return `line-${i + 1} · ${line ? `HTTP ${line.response?.status_code ?? '?'} · ${answer(line)}` : 'no result'}`;
+  }).join('\n');
+  const facts = [batch.route, batch.billing_rate && `${batch.billing_rate} rate`, batch.guardrail_mode && `guardrail ${batch.guardrail_mode}`,
+    batch.guardrail_blocked && `${batch.guardrail_blocked} blocked`, batch.guardrail_masked && `${batch.guardrail_masked} masked`].filter(Boolean).join(' · ');
+  const ok = batch.status === 'completed';
+  return result({ ...make, status: ok ? 200 : 502 }, JSON.stringify({ batch, output, errors }), {
+    content: `${batch.status}${facts ? ` · ${facts}` : ''}\n${content}`,
+    usage: batch.usage || null,
+    error: ok ? '' : `the batch ${batch.status}: ${(batch.errors?.data || []).map((e) => e.message).join('; ') || 'see the raw response'}`,
+    batch: { batchStatus: batch.status },
+  });
+}
+
 async function playground(body) {
+  if (body.requestType === 'batch') return playgroundBatch(body);
   const p = await preparePlayground(body);
   const res = await request('POST', p.url, { headers: p.headers, body: JSON.stringify(p.payload), verifyTls: p.verifyTls });
   return playgroundResult(p, res, res.text);
