@@ -983,7 +983,7 @@ function playgroundResult(p, res, text, extra = {}) {
 // ---------- playground batch ----------
 
 const BATCH_MAX_LINES = 20; // small enough to run request by request, not as a native Bedrock job
-const BATCH_WAIT_MS = 180000;
+const BATCH_WAIT_MS = Number(process.env.PLAYGROUND_BATCH_WAIT_MS) || 180000;
 const BATCH_END = ['completed', 'failed', 'expired', 'cancelled'];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
@@ -997,6 +997,41 @@ function jsonLines(text) {
       return [];
     }
   });
+}
+
+// activeBatches: the batches and files that playground batch calls still own on a gateway,
+// each with the call function that carries its key. A job leaves the registry when the
+// gateway has confirmed that nothing of it is left; drainBatches cleans up the rest when
+// the server stops, before the playground's temporary keys are revoked.
+const activeBatches = new Set();
+const CANCEL_DONE = [200, 202, 404, 409]; // 404: gone, 409: already finished
+const DELETE_DONE = [200, 202, 204, 404];
+
+// batchCleanup: cancel the job's batch and delete its files, twice if needed. An id is
+// forgotten only when the gateway confirms it. Returns what is still there ('' for nothing).
+async function batchCleanup(job, step = () => {}) {
+  const failed = (e) => ({ status: 0, ms: 0, text: e.message });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (job.batchId) {
+      const res = await job.call('POST', `/v1/batches/${encodeURIComponent(job.batchId)}/cancel`, { timeout: 15000 }).catch(failed);
+      step('cancel', res);
+      if (CANCEL_DONE.includes(res.status)) job.batchId = '';
+    }
+    for (const id of [...job.files]) {
+      const res = await job.call('DELETE', `/v1/files/${encodeURIComponent(id)}`, { timeout: 15000 }).catch(failed);
+      step(`delete ${id}`, res);
+      if (DELETE_DONE.includes(res.status)) job.files.delete(id);
+    }
+    if (!job.batchId && !job.files.size) break;
+    if (attempt === 0) await sleep(1000);
+  }
+  if (!job.batchId && !job.files.size) activeBatches.delete(job);
+  return [job.batchId && `batch ${job.batchId} may still be running`,
+    job.files.size && `file(s) ${[...job.files].join(', ')} remain`].filter(Boolean).join('; ');
+}
+
+async function drainBatches() {
+  await Promise.allSettled([...activeBatches].map((job) => batchCleanup(job)));
 }
 
 // playgroundBatch: one prompt per line becomes a batch through the OpenAI Files and Batches
@@ -1035,13 +1070,11 @@ async function playgroundBatch(body) {
       return null;
     }
   };
-  const created = [];
-  const cleanup = async (batchId) => {
-    if (batchId) step('cancel', await call('POST', `/v1/batches/${encodeURIComponent(batchId)}/cancel`).catch((e) => ({ status: 0, ms: 0, text: e.message })));
-    for (const id of created.splice(0)) {
-      step(`delete ${id}`, await call('DELETE', `/v1/files/${encodeURIComponent(id)}`).catch((e) => ({ status: 0, ms: 0, text: e.message })));
-    }
-  };
+  // What this call owns on the gateway. Registered so that stopping the server cleans it up.
+  const job = { batchId: '', files: new Set(), call };
+  activeBatches.add(job);
+  const cleanup = () => batchCleanup(job, step);
+  const leftText = (left) => (left ? ` Cleanup is incomplete: ${left}.` : '');
   const createPayload = (fileId) => ({ input_file_id: fileId, endpoint: lineUrl, completion_window: '24h', metadata: { source: 'aigw-doctor-playground' } });
   const curl = [
     `curl -sS${p.verifyTls ? '' : ' -k'} -X POST ${shq(`${p.gw}/v1/files`)} -H "Authorization: Bearer $AIGW_API_KEY"${Object.entries(extras).map(([k, v]) => ` -H ${shq(`${k}: ${v}`)}`).join('')} -F purpose=batch -F file=@requests.jsonl`,
@@ -1054,70 +1087,104 @@ async function playgroundBatch(body) {
     ...extra, batch: { prompt: prompts.join('\n'), curl, steps, requestLines: jsonl, ...(extra.batch || {}) },
   });
 
-  // 1. upload
-  const boundary = `----aigw-doctor-${Date.now().toString(16)}`;
-  const form = Buffer.from([
-    `--${boundary}`, 'Content-Disposition: form-data; name="purpose"', '', 'batch',
-    `--${boundary}`, 'Content-Disposition: form-data; name="file"; filename="playground.jsonl"', 'Content-Type: application/jsonl', '', jsonl,
-    `--${boundary}--`, '',
-  ].join('\r\n'));
-  const up = step('upload', await call('POST', '/v1/files', { body: form, headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': String(form.length) } }));
-  const fileId = parse(up)?.id;
-  if (up.status >= 300 || !fileId) return result(up, up.text, { content: '', error: `upload (POST /v1/files) failed: ${parse(up)?.error?.message || up.text.slice(0, 300) || `HTTP ${up.status}`}` });
-  created.push(fileId);
+  try {
+    // 1. upload
+    const boundary = `----aigw-doctor-${Date.now().toString(16)}`;
+    const form = Buffer.from([
+      `--${boundary}`, 'Content-Disposition: form-data; name="purpose"', '', 'batch',
+      `--${boundary}`, 'Content-Disposition: form-data; name="file"; filename="playground.jsonl"', 'Content-Type: application/jsonl', '', jsonl,
+      `--${boundary}--`, '',
+    ].join('\r\n'));
+    const up = step('upload', await call('POST', '/v1/files', { body: form, headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': String(form.length) } }));
+    const fileId = parse(up)?.id;
+    if (up.status >= 300 || !fileId) return result(up, up.text, { content: '', error: `upload (POST /v1/files) failed: ${parse(up)?.error?.message || up.text.slice(0, 300) || `HTTP ${up.status}`}` });
+    job.files.add(fileId);
 
-  // 2. create
-  const make = step('create', await call('POST', '/v1/batches', { body: JSON.stringify(createPayload(fileId)), headers: { 'Content-Type': 'application/json' } }));
-  let batch = parse(make);
-  if (make.status >= 300 || !batch?.id) {
-    await cleanup();
-    return result(make, make.text, { content: '', error: `create (POST /v1/batches) failed: ${batch?.error?.message || make.text.slice(0, 300) || `HTTP ${make.status}`}` });
-  }
+    // 2. create
+    const make = step('create', await call('POST', '/v1/batches', { body: JSON.stringify(createPayload(fileId)), headers: { 'Content-Type': 'application/json' } }));
+    let batch = parse(make);
+    if (make.status >= 300 || !batch?.id) {
+      const left = await cleanup();
+      return result(make, make.text, { content: '', error: `create (POST /v1/batches) failed: ${batch?.error?.message || make.text.slice(0, 300) || `HTTP ${make.status}`}.${leftText(left)}` });
+    }
+    job.batchId = batch.id;
 
-  // 3. wait
-  let last = make;
-  while (!BATCH_END.includes(batch.status) && Date.now() - started < BATCH_WAIT_MS) {
-    await sleep(3000);
-    last = await call('GET', `/v1/batches/${encodeURIComponent(batch.id)}`, { timeout: 30000 });
-    const next = parse(last);
-    if (last.status !== 200 || !next) break;
-    batch = next;
-  }
-  steps.push({ name: `wait: ${batch.status}`, status: last.status, ms: Date.now() - started });
-  for (const id of [batch.output_file_id, batch.error_file_id]) if (id) created.push(id);
-  if (!BATCH_END.includes(batch.status)) {
-    await cleanup(batch.id);
-    return result(last, JSON.stringify({ batch }), {
-      content: '', error: `the batch was still ${batch.status} after ${Math.round((Date.now() - started) / 1000)}s and was cancelled (batch ${batch.id})`,
+    // 3. wait
+    let last = make;
+    while (!BATCH_END.includes(batch.status) && Date.now() - started < BATCH_WAIT_MS) {
+      await sleep(Math.min(3000, Math.max(BATCH_WAIT_MS - (Date.now() - started), 0)));
+      last = await call('GET', `/v1/batches/${encodeURIComponent(batch.id)}`, { timeout: 30000 });
+      const next = parse(last);
+      if (last.status !== 200 || !next) break;
+      batch = next;
+    }
+    steps.push({ name: `wait: ${batch.status}`, status: last.status, ms: Date.now() - started });
+    for (const id of [batch.output_file_id, batch.error_file_id]) if (id) job.files.add(id);
+    if (!BATCH_END.includes(batch.status)) {
+      const left = await cleanup(); // cancels first, so the message says what happened
+      const after = Math.round((Date.now() - started) / 1000);
+      return result(last, JSON.stringify({ batch }), {
+        content: '',
+        error: job.batchId
+          ? `the batch was still ${batch.status} after ${after}s and could not be cancelled.${leftText(left)}`
+          : `the batch was still ${batch.status} after ${after}s and was cancelled (batch ${batch.id}).${leftText(left)}`,
+      });
+    }
+    job.batchId = ''; // finished: nothing to cancel
+
+    // 4. results. A result file is read twice at most; one that cannot be read is kept on
+    // the gateway (not deleted), so its results can still be fetched.
+    const unread = [];
+    const read = async (id, name) => {
+      if (!id) return [];
+      let why = '';
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const res = await call('GET', `/v1/files/${encodeURIComponent(id)}/content`).catch((e) => ({ status: 0, ms: 0, text: e.message }));
+        step(name, res);
+        if (res.status === 200) return jsonLines(res.text);
+        why = res.status ? `HTTP ${res.status}` : res.text;
+        if (attempt === 0) await sleep(1000);
+      }
+      job.files.delete(id);
+      unread.push(`the ${name} ${id} (${why})`);
+      return [];
+    };
+    const output = await read(batch.output_file_id, 'output file');
+    const errors = await read(batch.error_file_id, 'error file');
+    const left = await cleanup();
+    const answer = (line) => {
+      const b = line.response?.body || {};
+      if (b.error || line.error) return `error: ${(b.error || line.error).code || ''} ${(b.error || line.error).message || ''}`.trim();
+      if (b.choices) return `${b.choices[0]?.message?.content ?? ''}${b.choices[0]?.finish_reason && b.choices[0].finish_reason !== 'stop' ? ` [${b.choices[0].finish_reason}]` : ''}`;
+      if (b.data) return `${b.data[0]?.embedding?.length ?? '?'}-dimension vector`;
+      return JSON.stringify(b).slice(0, 200);
+    };
+    const byId = new Map([...output, ...errors].map((l) => [l.custom_id, l]));
+    const content = prompts.map((_, i) => {
+      const line = byId.get(`line-${i + 1}`);
+      return `line-${i + 1} · ${line ? `HTTP ${line.response?.status_code ?? '?'} · ${answer(line)}` : 'no result'}`;
+    }).join('\n');
+    const facts = [batch.route, batch.billing_rate && `${batch.billing_rate} rate`, batch.guardrail_mode && `guardrail ${batch.guardrail_mode}`,
+      batch.guardrail_blocked && `${batch.guardrail_blocked} blocked`, batch.guardrail_masked && `${batch.guardrail_masked} masked`].filter(Boolean).join(' · ');
+    const ok = batch.status === 'completed' && !unread.length;
+    const error = unread.length
+      ? `the batch ${batch.status}, but ${unread.join(' and ')} could not be read. It was not deleted: fetch it again with GET /v1/files/<id>/content and the same API key.${leftText(left)}`
+      : batch.status !== 'completed'
+        ? `the batch ${batch.status}: ${(batch.errors?.data || []).map((e) => e.message).join('; ') || 'see the raw response'}.${leftText(left)}`
+        : '';
+    return result({ ...make, status: ok ? 200 : 502 }, JSON.stringify({ batch, output, errors }), {
+      content: `${batch.status}${facts ? ` · ${facts}` : ''}\n${content}${ok && left ? `\n${leftText(left).trim()}` : ''}`,
+      usage: batch.usage || null,
+      error,
+      batch: { batchStatus: batch.status },
     });
+  } catch (err) {
+    // A network error or timeout part-way: still cancel the batch and delete the files.
+    const left = await cleanup();
+    throw new Error(`batch: ${err.message}.${leftText(left)}`);
+  } finally {
+    if (!job.batchId && !job.files.size) activeBatches.delete(job);
   }
-
-  // 4. results
-  const read = async (id, name) => (id ? jsonLines(step(name, await call('GET', `/v1/files/${encodeURIComponent(id)}/content`)).text) : []);
-  const output = await read(batch.output_file_id, 'output file');
-  const errors = await read(batch.error_file_id, 'error file');
-  await cleanup();
-  const answer = (line) => {
-    const b = line.response?.body || {};
-    if (b.error || line.error) return `error: ${(b.error || line.error).code || ''} ${(b.error || line.error).message || ''}`.trim();
-    if (b.choices) return `${b.choices[0]?.message?.content ?? ''}${b.choices[0]?.finish_reason && b.choices[0].finish_reason !== 'stop' ? ` [${b.choices[0].finish_reason}]` : ''}`;
-    if (b.data) return `${b.data[0]?.embedding?.length ?? '?'}-dimension vector`;
-    return JSON.stringify(b).slice(0, 200);
-  };
-  const byId = new Map([...output, ...errors].map((l) => [l.custom_id, l]));
-  const content = prompts.map((_, i) => {
-    const line = byId.get(`line-${i + 1}`);
-    return `line-${i + 1} · ${line ? `HTTP ${line.response?.status_code ?? '?'} · ${answer(line)}` : 'no result'}`;
-  }).join('\n');
-  const facts = [batch.route, batch.billing_rate && `${batch.billing_rate} rate`, batch.guardrail_mode && `guardrail ${batch.guardrail_mode}`,
-    batch.guardrail_blocked && `${batch.guardrail_blocked} blocked`, batch.guardrail_masked && `${batch.guardrail_masked} masked`].filter(Boolean).join(' · ');
-  const ok = batch.status === 'completed';
-  return result({ ...make, status: ok ? 200 : 502 }, JSON.stringify({ batch, output, errors }), {
-    content: `${batch.status}${facts ? ` · ${facts}` : ''}\n${content}`,
-    usage: batch.usage || null,
-    error: ok ? '' : `the batch ${batch.status}: ${(batch.errors?.data || []).map((e) => e.message).join('; ') || 'see the raw response'}`,
-    batch: { batchStatus: batch.status },
-  });
 }
 
 async function playground(body) {
@@ -1757,10 +1824,12 @@ if (!process.env.ENV_FILE && !fs.existsSync(ENV_FILE) && fs.existsSync(ENV_EXAMP
 
 fs.mkdirSync(HISTORY_DIR, { recursive: true, mode: 0o700 });
 loadHistory();
-// Delete the playground's temporary API keys on the way out.
+// On the way out: cancel and delete what playground batches still own on a gateway, while
+// their keys still work, then delete the playground's temporary API keys.
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, async () => {
     for (const t of terminals.values()) closeTerminal(t);
+    await drainBatches();
     await deletePlayKeys();
     process.exit(0);
   });
