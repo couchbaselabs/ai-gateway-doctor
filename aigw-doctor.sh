@@ -1730,7 +1730,7 @@ probe_burst() {
 	# a Retry-After on some other response (the provider's, or the gateway-wide limiter's)
 	# does not count.
 	limited=0 good=0 ra=""
-	for f in $(grep -l 'deployment_rate_limit_exceeded' "$dir"/*.body 2>/dev/null); do
+	while IFS= read -r f; do
 		[[ "$(jq -r '.error.code // .error.type // empty' "$f" 2>/dev/null)" == deployment_rate_limit_exceeded ]] || continue
 		limited=$((limited + 1))
 		hdr=$(awk '{sub(/\r$/, "")} /^HTTP\// {c = $2; r = ""} tolower($1) == "retry-after:" {r = $2} END {print c, r}' "${f%.body}.hdr" 2>/dev/null)
@@ -1738,7 +1738,7 @@ probe_burst() {
 			good=$((good + 1))
 			ra="${BASH_REMATCH[1]}"
 		fi
-	done
+	done < <(grep -l 'deployment_rate_limit_exceeded' "$dir"/*.body 2>/dev/null) # one path per line: the directory may contain spaces
 	other=$(grep -v -e '^200$' -e '^429$' <<<"$codes" | grep . | sort | uniq -c | awk '{printf "%s%s x HTTP %s", sep, $1, $2; sep = ", "}')
 	info "burst of $n: $ok answered, $limited refused by the rate limit${other:+, $other}"
 	rm -rf "$dir"
