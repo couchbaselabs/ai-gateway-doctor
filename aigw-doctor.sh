@@ -1691,7 +1691,7 @@ burst_config() {
 # Retry-After header. The gateway's bucket holds a burst of RPM/6 requests (at least 1) and
 # refills at RPM/60 a second, so the burst is that plus two seconds of refill, plus 5.
 probe_burst() {
-	local model="$1" kind="$2" rpm="$3" burst n path body dir codes ok limited ra other
+	local model="$1" kind="$2" rpm="$3" burst n path body dir codes ok limited good ra other f hdr
 	burst=$((rpm / 6))
 	((burst < 1)) && burst=1
 	n=$((burst + rpm / 30 + 5))
@@ -1719,16 +1719,28 @@ probe_burst() {
 	# The last status line of each header file is the response's HTTP code.
 	codes=$(awk 'FNR == 1 && NR > 1 {print c; c = ""} /^HTTP\// {c = $2} END {if (NR > 0) print c}' "$dir"/*.hdr 2>/dev/null)
 	ok=$(grep -c '^200$' <<<"$codes")
-	limited=$(grep -l 'deployment_rate_limit_exceeded' "$dir"/*.body 2>/dev/null | grep -c .)
-	ra=$(grep -ih '^retry-after:' "$dir"/*.hdr 2>/dev/null | head -n1 | tr -d '\r' | awk '{print $2}')
+	# A rate-limit refusal is a response whose own error code is deployment_rate_limit_exceeded.
+	# It is a good one when that same response is HTTP 429 and carries a numeric Retry-After;
+	# a Retry-After on some other response (the provider's, or the gateway-wide limiter's)
+	# does not count.
+	limited=0 good=0 ra=""
+	for f in $(grep -l 'deployment_rate_limit_exceeded' "$dir"/*.body 2>/dev/null); do
+		[[ "$(jq -r '.error.code // .error.type // empty' "$f" 2>/dev/null)" == deployment_rate_limit_exceeded ]] || continue
+		limited=$((limited + 1))
+		hdr=$(awk '/^HTTP\// {c = $2; r = ""} tolower($1) == "retry-after:" {r = $2} END {gsub("\r", "", r); print c, r}' "${f%.body}.hdr" 2>/dev/null)
+		if [[ "$hdr" =~ ^429\ ([0-9]+)$ ]]; then
+			good=$((good + 1))
+			ra="${BASH_REMATCH[1]}"
+		fi
+	done
 	other=$(grep -v -e '^200$' -e '^429$' <<<"$codes" | grep . | sort | uniq -c | awk '{printf "%s%s x HTTP %s", sep, $1, $2; sep = ", "}')
 	info "burst of $n: $ok answered, $limited refused by the rate limit${other:+, $other}"
 	rm -rf "$dir"
-	if ((limited > 0)) && [[ "$ra" =~ ^[0-9]+$ ]]; then
+	if ((limited > 0 && good == limited)); then
 		pass "inference: $model rate limit enforced: of $n requests at once, $ok answered and $limited got 429 deployment_rate_limit_exceeded (Retry-After ${ra}s; limit $rpm requests/min)"
 	elif ((limited > 0)); then
-		warn "inference: $model rate limit refused $limited of $n requests, but without a Retry-After header"
-		hint "clients cannot tell how long to wait: check the gateway build, and that the load balancer passes the Retry-After header through"
+		warn "inference: $model rate limit refused $limited of $n requests, but $((limited - good)) of those were not HTTP 429 with a numeric Retry-After header"
+		hint "clients cannot tell how long to wait: check the gateway build, and that the load balancer passes the status and the Retry-After header through"
 	elif ((ok == n)); then
 		warn "inference: $model answered all $n requests sent at once: the rate limit of $rpm requests/min was not enforced"
 		hint "check that features.deploymentRateLimit is not false on the deployed gateway, that the gateway build has Keystone 2 rate limits, and that the deployed config matches this file"
@@ -1739,23 +1751,44 @@ probe_burst() {
 	fi
 }
 
-# BATCH_ID / BATCH_FILES: the probe batch and files still on the gateway; cleaned up when
-# the probe ends, and on exit.
-BATCH_ID="" BATCH_FILES=""
+# BATCH_IDS / BATCH_FILES: probe batches that may still run, and probe files, left on the
+# gateway. batch_cleanup removes them and keeps whatever it could not remove, so it can be
+# tried again; batch_leftovers reports what is still there at the end.
+BATCH_IDS="" BATCH_FILES=""
 
-# batch_cleanup: cancel a probe batch that is still running and delete the probe's files.
+# batch_cleanup: cancel the tracked batches and delete the tracked files. An id stays
+# tracked unless the gateway confirmed it (or says it is already gone or finished).
 batch_cleanup() {
-	local id="$BATCH_ID" files="$BATCH_FILES" f
-	BATCH_ID="" BATCH_FILES=""
-	[[ -n "$id$files" ]] || return 0
-	if [[ -n "$id" ]]; then
-		info "cancelling probe batch $id"
-		curl -sk --max-time 30 -K <(bearer_config "$API_KEY") -o /dev/null -X POST "$AIGW_URL/v1/batches/$id/cancel"
-	fi
-	for f in $files; do
-		info "deleting probe file $f"
-		curl -sk --max-time 30 -K <(bearer_config "$API_KEY") -o /dev/null -X DELETE "$AIGW_URL/v1/files/$f"
+	local ids="$BATCH_IDS" files="$BATCH_FILES" id f code
+	BATCH_IDS="" BATCH_FILES=""
+	for id in $ids; do
+		code=$(curl -sk --max-time 30 -K <(bearer_config "$API_KEY") -o /dev/null -w '%{http_code}' \
+			-X POST "$AIGW_URL/v1/batches/$id/cancel")
+		case "$code" in
+		200 | 202 | 404 | 409) info "probe batch $id cancelled (HTTP $code)" ;; # 409: already finished
+		*) BATCH_IDS+="$id "; info "probe batch $id could not be cancelled (HTTP $code)" ;;
+		esac
 	done
+	for f in $files; do
+		code=$(curl -sk --max-time 30 -K <(bearer_config "$API_KEY") -o /dev/null -w '%{http_code}' \
+			-X DELETE "$AIGW_URL/v1/files/$f")
+		case "$code" in
+		200 | 202 | 204 | 404) info "probe file $f deleted (HTTP $code)" ;;
+		*) BATCH_FILES+="$f "; info "probe file $f could not be deleted (HTTP $code)" ;;
+		esac
+	done
+}
+
+# batch_leftovers: one more cleanup attempt, then name what is still on the gateway. Runs
+# before the temporary API key is revoked: only the key that created them can remove them.
+batch_leftovers() {
+	[[ -n "$BATCH_IDS$BATCH_FILES" ]] || return 0
+	batch_cleanup
+	[[ -n "$BATCH_IDS$BATCH_FILES" ]] || return 0
+	warn "batch probe: could not clean up on the gateway:${BATCH_IDS:+ batch(es) ${BATCH_IDS% } may still be running;}${BATCH_FILES:+ file(s) ${BATCH_FILES% } remain}"
+	hint "they belong to the API key this run used. With that key: curl -sk -X POST $AIGW_URL/v1/batches/<batch id>/cancel and curl -sk -X DELETE $AIGW_URL/v1/files/<file id>, each with -H 'Authorization: Bearer <key>'"
+	hint "a temporary key (--create-api-key) is revoked when the run ends: re-run with --save-api-key FILE or --api-key-file FILE to keep a key that can clean up; a two-request batch ends on its own, and the gateway's storage rules expire the files"
+	BATCH_IDS="" BATCH_FILES=""
 }
 
 # probe_batch MODEL KIND REF: upload a two-request batch file for the model, create the
@@ -1799,7 +1832,7 @@ probe_batch() {
 		fi
 		return 0
 	fi
-	BATCH_FILES="$fid"
+	BATCH_FILES+="$fid "
 
 	body=$(jq -nc --arg f "$fid" --arg u "$url" '{input_file_id: $f, endpoint: $u, completion_window: "24h", metadata: {source: "aigw-doctor"}}')
 	code=$(gw POST /v1/batches -H 'Content-Type: application/json' --data "$body")
@@ -1812,7 +1845,7 @@ probe_batch() {
 		batch_cleanup
 		return 0
 	fi
-	BATCH_ID="$bid"
+	BATCH_IDS+="$bid "
 	route=$(jq -r '[.route // empty, (.billing_rate // empty | "\(.) rate")] | join(", ")' "$RESP_FILE" 2>/dev/null)
 
 	start=$(date +%s)
@@ -1826,25 +1859,36 @@ probe_batch() {
 		[[ "$code" == 200 ]] || { status="HTTP $code"; break; }
 	done
 	elapsed=$(($(date +%s) - start))
+	# A batch that reached an end state needs no cancel, and its result files (which a failed
+	# or expired batch can have too) are the probe's to delete.
+	case "$status" in
+	completed | failed | expired | cancelled)
+		BATCH_IDS="${BATCH_IDS/$bid /}"
+		out_id=$(jq -r '.output_file_id // empty' "$RESP_FILE" 2>/dev/null)
+		err_id=$(jq -r '.error_file_id // empty' "$RESP_FILE" 2>/dev/null)
+		BATCH_FILES+="${out_id:+$out_id }${err_id:+$err_id }"
+		;;
+	esac
 	if [[ "$status" != completed ]]; then
 		if [[ "$status" == failed || "$status" == expired || "$status" == cancelled ]]; then
-			BATCH_ID=""
 			fail "inference: $model batch $status after ${elapsed}s: $(jq -r '[.errors.data[]?.message] | join("; ")' "$RESP_FILE" 2>/dev/null | cut -c1-200)"
 			hint "see the gateway log for batch $bid; for a Bedrock batch check the service role and the S3 bucket (step 6b)"
 		elif [[ "$status" == HTTP* ]]; then
 			fail "inference: $model batch: reading batch $bid returned $status: $(resp_error)"
 			hint "see the gateway log for batch $bid"
 		else
-			warn "inference: $model batch still ${status:-unknown} after ${elapsed}s (--batch-timeout $BATCH_TIMEOUT); the probe batch is cancelled"
+			# Cancel first, so the message says what really happened to the batch.
+			batch_cleanup
+			if [[ " $BATCH_IDS" == *" $bid "* ]]; then
+				warn "inference: $model batch still ${status:-unknown} after ${elapsed}s (--batch-timeout $BATCH_TIMEOUT), and it could not be cancelled"
+			else
+				warn "inference: $model batch still ${status:-unknown} after ${elapsed}s (--batch-timeout $BATCH_TIMEOUT); the probe batch is cancelled"
+			fi
 			hint "batch workers may be busy or stopped: check the gateway log for batch $bid, or allow more time with --batch-timeout"
 		fi
 		batch_cleanup
 		return 0
 	fi
-	BATCH_ID=""
-	out_id=$(jq -r '.output_file_id // empty' "$RESP_FILE")
-	err_id=$(jq -r '.error_file_id // empty' "$RESP_FILE")
-	BATCH_FILES="$fid $out_id $err_id"
 	n_ok=0
 	if [[ -n "$out_id" ]]; then
 		code=$(gw GET "/v1/files/$out_id/content")
@@ -2090,6 +2134,7 @@ step_inference() {
 		fi
 	done <<<"$models"
 
+	batch_leftovers
 	delete_api_key
 }
 
@@ -2289,7 +2334,7 @@ stop_logger() {
 
 cleanup() {
 	local rc=$?
-	batch_cleanup
+	batch_leftovers
 	delete_api_key
 	[[ -z "$RESP_DIR" ]] || rm -rf "$RESP_DIR"
 	[[ -z "$RUN_LOG" ]] || printf '%s# finished: %s, exit %s%s\n' "$MARK" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

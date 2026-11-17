@@ -927,12 +927,21 @@ async function lookupLinks(name) {
 const PROBES = ['probeGuardrails', 'probeRateLimit', 'probeBatch'];
 const PROBES_KEY = 'aigw-doctor-probes-v1';
 
-function probeChoices() {
+// storedMap: a JSON object from localStorage as a map without a prototype, so a sandbox
+// named "constructor" or "toString" is looked up like any other key.
+function storedMap(key) {
+  const map = Object.create(null);
   try {
-    return JSON.parse(localStorage.getItem(PROBES_KEY) || '{}');
-  } catch {
-    return {};
-  }
+    const parsed = JSON.parse(localStorage.getItem(key) || '{}');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) Object.assign(map, parsed);
+  } catch { /* unreadable: start empty */ }
+  return map;
+}
+
+function probeChoices() {
+  const all = storedMap(PROBES_KEY);
+  for (const name of Object.keys(all)) if (!Array.isArray(all[name])) delete all[name];
+  return all;
 }
 
 function saveProbes() {
@@ -944,7 +953,7 @@ function saveProbes() {
 }
 
 function edits() {
-  return JSON.parse(localStorage.getItem(EDITS_KEY) || '{}');
+  return storedMap(EDITS_KEY);
 }
 
 function radio(name) {
