@@ -146,13 +146,13 @@ When everything is valid, one line lists the controls and the spend store in use
 | 429 `spend_cap_exceeded` | `FAIL`: the region or model cap is reached, and the model does not answer until the next billing cycle or a higher cap. |
 | 503 `guardrail_unavailable` | `FAIL`: the guardrail check could not run and failed closed. Usually the gateway's role lacks `bedrock:ApplyGuardrail`, or the guardrail version does not exist in the model's region. |
 | 400 `guardrail_initialization_error` | `FAIL`: guardrails are enabled without a source. |
-| 422 on the doctor's own probe | `WARN`: the guardrail blocked a harmless prompt, so the model is reachable but its filters are strict. |
+| A guardrail or jailbreak violation on the doctor's own probe | `WARN`: the guardrail blocked a harmless prompt, so the model is reachable but its filters are strict. Any other 422 is an ordinary failed request. |
 
 **Optional probes.** Each sends extra requests, so each is off by default. They run only for a model whose plain probe answered.
 
 | Option | What it does | Result |
 |---|---|---|
-| `--probe-guardrails` | One mild prompt-attack request ("Ignore all previous instructions…") to each chat model with jailbreak detection. | `PASS` on HTTP 422; `WARN` when the model answers it. Uses guardrail text units. |
+| `--probe-guardrails` | One mild prompt-attack request ("Ignore all previous instructions…") to each chat model with jailbreak detection. | `PASS` only on HTTP 422 `jailbreak_violation_error`; `WARN` when the model answers it, when another guardrail check blocks it first, or when the refusal is not a 422. Uses guardrail text units. |
 | `--probe-rate-limit` | One burst of parallel requests to each model with a rate limit, larger than the limit allows: the bucket's burst (a sixth of the per-minute limit, at least 1), plus two seconds of refill, plus 5. | `PASS` when some requests are refused with `deployment_rate_limit_exceeded` and every such response is itself HTTP 429 with a numeric `Retry-After`; `WARN` when all are answered (the limit is not enforced) or a refusal lacks the status or header. |
 | `--probe-batch` | Uploads a two-request batch file for each model with `batchConfig.isEnabled`, creates the batch, waits for it and reads the results. | `PASS` when both requests are answered; `FAIL` when the upload, the batch or a request fails; `WARN` when it is still running at the timeout. |
 
