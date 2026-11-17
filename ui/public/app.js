@@ -315,8 +315,7 @@ $('version-btn').addEventListener('click', async () => {
   $('gw-version').textContent = 'checking…';
   const resp = await fetch('/api/info', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sandbox: run.sandbox, config: run.config, region: run.region, aigwUrl: run.aigwUrl,
-      keySource: run.keySource, apiKey: form.elements.apiKey.value, apiKeyFile: form.elements.apiKeyFile.value.trim() }),
+    body: JSON.stringify({ sandbox: run.sandbox, config: run.config, region: run.region, aigwUrl: run.aigwUrl, ...keyChoice(run) }),
   });
   const data = await resp.json();
   if (!resp.ok) {
@@ -757,7 +756,10 @@ $('cp-key-create').addEventListener('click', async () => {
     localStorage.setItem(KEY_FORM_KEY, JSON.stringify({ cpUrl: body.cpUrl, region: body.region, cpUser: body.cpUser }));
     const resp = await fetch('/api/cp/apikey', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...body, name: f.keyName.value.trim(), expiryDuration: Number(f.keyExpiry.value), allowedIPs: f.keyAllowedIps.value }),
+      body: JSON.stringify({
+        ...body, name: f.keyName.value.trim(), expiryDuration: Number(f.keyExpiry.value), allowedIPs: f.keyAllowedIps.value,
+        save: f.keySave.checked,
+      }),
     });
     const data = await resp.json();
     if (!resp.ok) {
@@ -776,7 +778,8 @@ $('cp-key-create').addEventListener('click', async () => {
     } else if (!data.endpoint) {
       note = ` No model with an endpoint in ${data.region}: enter the Gateway URL yourself.`;
     }
-    msg.textContent = `Created ${data.name} (${data.keyId})${data.expiry ? `, expires ${new Date(data.expiry).toLocaleString()}` : ''}. It is in the API key field.${note}`;
+    msg.textContent = `Created ${data.name} (${data.keyId})${data.expiry ? `, expires ${new Date(data.expiry).toLocaleString()}` : ''}. It is in the API key field${data.saved ? ` and saved as ${data.saved} in ${data.savedIn}` : ''}.${note}`;
+    if (data.saved) await loadSavedKeys(data.saved);
   } catch (err) {
     msg.className = 'error-text small';
     msg.textContent = err.message;
@@ -804,12 +807,66 @@ $('cp-key-delete').addEventListener('click', async () => {
   if (playForm.elements.customKey.value === createdKey.apiKey) playForm.elements.customKey.value = '';
   createdKey = null;
   $('cp-key-delete').hidden = true;
+  await loadSavedKeys(''); // its saved copy is removed with it
 });
+
+// keyChoice: the run form's API key choice, as the server needs it to get a key for a
+// sandbox: the typed key or key file, or what a Capella key needs (control plane and sign-in).
+function keyChoice(run) {
+  return {
+    keySource: run.keySource, apiKey: form.elements.apiKey.value, apiKeyFile: form.elements.apiKeyFile.value.trim(),
+    cpUrl: run.cpUrl, orgId: run.orgId, tenantId: run.tenantId, cpUser: form.elements.cpUser.value.trim(),
+    cpPassword: form.elements.cpPassword.value, cpJwt: form.elements.cpJwt.value,
+  };
+}
 
 function customBody() {
   const f = playForm.elements;
-  return { aigwUrl: f.customUrl.value.trim(), apiKey: f.customKey.value, verifyTls: f.verifyTls.checked };
+  return { aigwUrl: f.customUrl.value.trim(), apiKey: f.customKey.value, savedKey: f.savedKey.value, verifyTls: f.verifyTls.checked };
 }
+
+// ---- saved keys (custom endpoint): keys created earlier, kept in ~/.aigw-doctor/keys ----
+let savedKeyList = [];
+
+async function loadSavedKeys(pick) {
+  const select = playForm.elements.savedKey;
+  const before = pick ?? select.value;
+  try {
+    const data = await (await fetch('/api/keys')).json();
+    savedKeyList = data.keys || [];
+  } catch {
+    savedKeyList = [];
+  }
+  select.replaceChildren(el('option', { value: '' }, 'none: use the API key field'),
+    ...savedKeyList.map((k) => el('option', { value: k.name },
+      `${k.name} · ${k.region || '?'} · ${k.expired ? 'expired' : k.expiresAt ? `until ${new Date(k.expiresAt * 1000).toLocaleString()}` : 'no expiry known'}`)));
+  select.value = savedKeyList.some((k) => k.name === before) ? before : '';
+  showSavedKey();
+}
+
+function showSavedKey() {
+  const f = playForm.elements;
+  const k = savedKeyList.find((x) => x.name === f.savedKey.value);
+  $('saved-key-forget').hidden = !k;
+  f.customKey.placeholder = k ? `using the saved key ${k.name}` : '';
+  $('saved-key-note').textContent = !k ? '' : k.expired ? 'This key has expired: create a new one.'
+    : f.customKey.value ? 'The API key field is filled and wins: clear it to use the saved key.' : '';
+  // The saved key remembers the gateway it was made for.
+  if (k?.endpoint && !f.customUrl.value.trim()) {
+    f.customUrl.value = k.endpoint;
+    localStorage.setItem(CUSTOM_URL_KEY, k.endpoint);
+  }
+}
+
+playForm.elements.savedKey.addEventListener('change', showSavedKey);
+playForm.elements.customKey.addEventListener('input', showSavedKey);
+$('saved-key-forget').addEventListener('click', async () => {
+  const name = playForm.elements.savedKey.value;
+  if (!name || !window.confirm(`Remove the saved key "${name}" from this machine?\n\nThe key stays valid in Capella until it expires or is deleted there.`)) return;
+  await fetch('/api/keys/forget', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+  await loadSavedKeys('');
+});
+loadSavedKeys();
 
 $('custom-connect').addEventListener('click', async () => {
   const info = $('custom-info');
@@ -868,8 +925,7 @@ playForm.addEventListener('submit', (e) => {
   }
   const run = formBody();
   sendPlay({
-    sandbox: run.sandbox, config: run.config, region: run.region, aigwUrl: run.aigwUrl,
-    keySource: run.keySource, apiKey: form.elements.apiKey.value, apiKeyFile: form.elements.apiKeyFile.value.trim(),
+    sandbox: run.sandbox, config: run.config, region: run.region, aigwUrl: run.aigwUrl, ...keyChoice(run),
     model: f.model.value, cacheType: f.cacheType.value, prompt: f.prompt.value, system: f.system.value,
     maxTokens: f.maxTokens.value, temperature: f.temperature.value, debug: f.debug.checked, stream: f.stream.checked,
     ...extras,
@@ -1214,6 +1270,7 @@ $('save-env-btn').addEventListener('click', async () => {
 function updateVisibility() {
   const key = radio('keySource');
   $('models-fields').hidden = radio('scope') === 'infra';
+  form.querySelector('.key-capella').hidden = key !== 'capella';
   form.querySelector('.key-file').hidden = key !== 'file';
   form.querySelector('.key-paste').hidden = key !== 'paste';
 }
@@ -1229,6 +1286,8 @@ function formBody() {
     inferenceOnly: scope === 'inference',
     skipInference: scope === 'infra',
     createApiKey: models && key === 'create',
+    capellaApiKey: models && key === 'capella',
+    cpJwt: models && key === 'capella' ? form.elements.cpJwt.value : '',
     apiKeyFile: models && key === 'file' ? v('apiKeyFile') : '',
     apiKey: models && key === 'paste' ? form.elements.apiKey.value : '',
     cpUser: models ? v('cpUser') : '',

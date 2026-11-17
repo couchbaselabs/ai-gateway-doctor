@@ -623,3 +623,5 @@ table.headers tr.notable td:first-child { color: var(--cb-red); }
 #cp-key { margin-top: 8px; }
 #cp-key[open] > summary { margin-bottom: 8px; }
 #cp-key > label, #cp-key > .custom-row { margin-bottom: 8px; }
+.saved-key { flex-direction: row; align-items: center; gap: 8px; }
+.saved-key select { min-width: 260px; }

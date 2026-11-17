@@ -70,14 +70,25 @@ Checks why the semantic cache stopped working, typically because the cache Couch
 
 Output is one `PASS`/`WARN`/`FAIL` line per check, followed by a result count. Each `FAIL` or `WARN` is followed by `HINT` lines on how to fix it, such as the command to run, the setting to change or the likely cause. The UI shows them under the check. `--verbose` adds the step headers, every command and remote script, and the listings (ASGs, instances, `df`, nodes). The fix commands are always shown.
 
-The API key for step 7 can come from three places:
+The API key for step 7 can come from four places:
 - `--api-key-file FILE`
 - the `AIGW_API_KEY` environment variable
-- `--create-api-key`
+- `--create-api-key`: a temporary key made with the gateway's admin secret (needs AWS access)
+- `--capella-api-key`: a model API key made through the Capella control plane (needs only your Capella sign-in)
 
 With `--create-api-key`, the script reads the gateway admin credential from Secrets Manager (the `adminConfig.adminKey` secret). It uses that to create a temporary key through `POST /v1/apikeys`. The key expires after an hour and is deleted with `DELETE /v1/apikeys/<keyId>` when the run ends, including on Ctrl-C. To keep it instead, add `--save-api-key FILE`, which writes it with mode 600.
 
+With `--capella-api-key`, the script asks the Capella control plane for a key (`POST /v2/organizations/<org id>/languageModelApiKeys`) that can use every model in `--region`. Use it where you cannot read the gateway's admin secret, such as production: together with `--inference-only` it needs no AWS credentials and no AWS CLI.
+- **Sign-in:** `--cp-user EMAIL` with the password from `CP_PASSWORD` or a prompt, or a session JWT in `CP_JWT` when you sign in with SSO.
+- **Organization:** from `--cp-url https://api.<env>.<domain>/v2/organizations/<org id>`, or `--org-id`.
+- **Saved and reused:** the key is saved in `~/.aigw-doctor/keys` (`--keys-dir`, or `AIGW_DOCTOR_KEYS_DIR`) as `<name>.key` (the key) and `<name>.json` (id, expiry, organization, region), readable only by you. The next run for the same organization and region reuses it until five minutes before it expires, then creates a new one. `--key-expiry SECS` sets the lifetime of a new key (default a day).
+- **Not deleted:** unlike a temporary key, a Capella key stays valid until it expires. Delete it in the Capella console (or with the UI's **Delete this key**) and remove its two files to drop it earlier.
+
 ```bash
+# Production: models and cache hits only, no AWS, a Capella key that is saved and reused
+./aigw-doctor.sh -c config.json --region us-east-2 --check --inference-only --capella-api-key \
+  --cp-url https://api.cloud.couchbase.com/v2/organizations/<org id> --cp-user you@example.com
+
 # Show what would run
 ./aigw-doctor.sh -c config.json --region us-east-2 --tenant-id <org-id> --create-api-key
 
@@ -190,6 +201,7 @@ On the first start without a `.env`, the server creates one from `.env.example` 
   - **Left:** the sandboxes, with the status and counts of each one's last run.
   - **Middle:** the run form. It is filled from `.env`, then your edits, which are kept per sandbox in the browser. **Reset to .env** discards your edits.
   - **Save to .env:** writes your changes back as that sandbox's `<NAME>_*` keys, including a password or API key you typed. Existing lines are updated in place, a cleared field removes its line, and the previous file is kept as `.env.bak`. Values are checked like run options, so a save can't add other lines.
+  - **API key: Capella key:** creates a model API key through the Capella control plane with the form's Control plane URL and Capella login, or a session JWT for SSO. It needs no gateway admin secret and no AWS access, so it works for production too. The key is saved in `~/.aigw-doctor/keys` and reused for the organization and region until it expires. Runs, **Check version** and the Playground all use it.
   - **Optional probes:** the checkboxes under Models run the doctor with `--probe-guardrails`, `--probe-rate-limit` and `--probe-batch`. They are remembered per sandbox in the browser and are off until you tick them; **Reset to .env** clears them.
   - **Config tab:** shows a Keystone 2 section when the config uses it: whether rate limits and spend caps are enforced, the region spend cap and spend store, and each model's rate limit, spend cap, rate card, Bedrock guardrail and Bedrock batch bucket.
   - **Right:** the results, with one card per step and a PASS/WARN/FAIL line for each check. The commands and output are folded underneath, and fix commands are shown expanded. Step 7 lists every model request with its question, answer, `X-Cache`, HTTP status and latency. **Problems only** hides the passing checks, **Raw output** shows the doctor's text, and **Clear output** empties the window before the next run (saved runs stay in the **Run** list).
@@ -235,7 +247,8 @@ On the first start without a `.env`, the server creates one from `.env.example` 
       - **Sign-in:** your Capella email and password, or a session JWT when you sign in with SSO.
       - **Result:** the key has access to every model in the region and is put into the API key field. When the organization has a model in that region, its gateway endpoint fills an empty Gateway URL.
       - **Delete this key** removes the key you just created (`DELETE …/languageModelApiKeys/<key id>`).
-      - **Not saved:** the key, the password and the JWT stay in the page. The URL, region and email are remembered in the browser.
+      - **Saved keys:** with **Save the key on this machine** ticked (the default), the key is written to `~/.aigw-doctor/keys`, readable only by you. The **Saved key** list above then offers it again: pick one and leave the API key field empty. The server reads the key from the file, so it does not pass through the page. **Forget** removes the files from this machine; the key stays valid in Capella.
+      - **Not saved:** the password and the JWT stay in the page. The URL, region and email are remembered in the browser.
     - **TLS:** certificates are verified. Untick **Verify TLS certificate** for a self-signed gateway.
     - **Key:** the API key stays in the page and is never saved. The URL is remembered.
   - **Request type:** next to the model. A sandbox picks chat or embeddings from the model's kind; a custom endpoint lets you choose. Both can also send:

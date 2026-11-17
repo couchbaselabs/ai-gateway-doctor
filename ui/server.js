@@ -56,6 +56,7 @@ const FLAGS = {
   inferenceOnly: '--inference-only',
   createApiKey: '--create-api-key',
   skipInference: '--skip-inference',
+  capellaApiKey: '--capella-api-key',
   probeGuardrails: '--probe-guardrails',
   probeRateLimit: '--probe-rate-limit',
   probeBatch: '--probe-batch',
@@ -297,7 +298,7 @@ const SAVE_RULES = {
   ...Object.fromEntries(Object.entries(OPTIONS).map(([field, [, pattern]]) => [field, pattern])),
   config: /^[^\s"'#]+$/,
   apiKeyFile: /^[^\s"'#]+$/,
-  keySource: /^(create|file|paste)$/,
+  keySource: /^(create|capella|file|paste)$/,
   scope: /^(all|inference|infra)$/,
   mode: /^(check|dry-run)$/,
 };
@@ -732,6 +733,23 @@ async function playgroundKey(ctx, body, gw) {
     if (!k) throw new Error('paste an API key, or set AIGW_API_KEY in .env');
     return { key: k, source: body.apiKey ? 'pasted key' : '.env key' };
   }
+  if (body.keySource === 'capella') {
+    // A model API key from the Capella control plane: no admin secret and no AWS needed. A
+    // saved key for the organization and region is reused; otherwise one is created and saved.
+    const cpUrl = ctx.pick('cpUrl');
+    if (!cpUrl) throw new Error('a Capella key needs the Control plane URL (with /v2/organizations/<org id>) in the form');
+    const orgId = (cpUrl.match(/\/organizations\/([0-9a-fA-F-]+)/) || [])[1] || ctx.pick('orgId') || ctx.tenantId;
+    const found = orgId && findSavedKey(orgId, ctx.region);
+    if (found) return { key: readSavedKey(found.name), source: `saved Capella key ${found.name}` };
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-');
+    const made = await cpCreateKey({
+      cpUrl, orgId, jwt: body.cpJwt, cpUser: ctx.pick('cpUser'),
+      cpPassword: (typeof body.cpPassword === 'string' && body.cpPassword) || envValue(ctx.env, ctx.sandbox, 'CP_PASSWORD'),
+      region: ctx.region, name: `aigw-doctor-${stamp}`, description: 'created by aigw-doctor', expiryDuration: 86400,
+      verifyTls: false, // sandbox control planes use private certificates, as the doctor script assumes
+    });
+    return { key: made.apiKey, source: `Capella key ${made.name}` };
+  }
   if (body.keySource === 'file') {
     const file = existingFile(body.apiKeyFile || ctx.values.apiKeyFile || '', 'API key file');
     return { key: fs.readFileSync(file, 'utf8').trim(), source: 'key file' };
@@ -773,9 +791,75 @@ const CUSTOM_URL = /^https?:\/\/[\w.-]+(:\d+)?(\/[\w.~/-]*)?$/;
 function customTarget(body) {
   const gw = String(body.aigwUrl || '').trim().replace(/\/+$/, '');
   if (!CUSTOM_URL.test(gw)) throw new Error('enter the gateway URL, e.g. https://<gateway endpoint>');
-  const key = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
-  if (!key) throw new Error('enter an API key for that gateway');
+  // A typed key wins; else the saved key picked in the page, read here so it never leaves the server.
+  const key = (typeof body.apiKey === 'string' && body.apiKey.trim()) || (body.savedKey ? readSavedKey(body.savedKey) : '');
+  if (!key) throw new Error('enter an API key for that gateway, pick a saved key, or create one');
   return { gw, key, verifyTls: body.verifyTls !== false };
+}
+
+// ---------- saved model API keys ----------
+
+// Capella keys are kept in ~/.aigw-doctor/keys (AIGW_DOCTOR_KEYS_DIR), readable only by you:
+// <name>.key holds the key, <name>.json its id, expiry, organization, region and gateway
+// endpoint. The doctor script reads and writes the same files (--capella-api-key).
+const keysDir = () => expandHome(process.env.AIGW_DOCTOR_KEYS_DIR || '~/.aigw-doctor/keys');
+const SAVED_NAME = /^[\w.@-]{1,120}$/;
+
+function saveKey(meta, apiKey) {
+  const dir = keysDir();
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let name = String(meta.name || 'key').replace(/[^\w.@-]+/g, '-').slice(0, 100) || 'key';
+  if (fs.existsSync(path.join(dir, `${name}.json`))) name = `${name}-${String(meta.keyId || Date.now()).slice(0, 8)}`;
+  fs.writeFileSync(path.join(dir, `${name}.key`), `${apiKey}\n`, { mode: 0o600 });
+  fs.writeFileSync(path.join(dir, `${name}.json`), `${JSON.stringify({ ...meta, name }, null, 2)}\n`, { mode: 0o600 });
+  return name;
+}
+
+// savedKeys: what is known about each saved key; never the key itself.
+function savedKeys() {
+  const dir = keysDir();
+  if (!fs.existsSync(dir)) return [];
+  const now = Math.floor(Date.now() / 1000);
+  return fs.readdirSync(dir).filter((f) => f.endsWith('.json')).flatMap((f) => {
+    const name = f.slice(0, -5);
+    if (!SAVED_NAME.test(name) || !fs.existsSync(path.join(dir, `${name}.key`))) return [];
+    try {
+      const m = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+      return [{
+        name, keyId: m.keyId || '', region: m.region || '', orgId: m.orgId || '', cpUrl: m.cpUrl || '', endpoint: m.endpoint || '',
+        expiry: m.expiry || '', expiresAt: m.expiresAt || 0, expired: Boolean(m.expiresAt) && m.expiresAt <= now,
+      }];
+    } catch {
+      return [];
+    }
+  }).sort((a, b) => b.expiresAt - a.expiresAt);
+}
+
+function readSavedKey(name) {
+  if (!SAVED_NAME.test(String(name))) throw new Error('unknown saved key');
+  const file = path.join(keysDir(), `${name}.key`);
+  if (!fs.existsSync(file)) throw new Error(`saved key ${name} is not in ${keysDir()} any more`);
+  return fs.readFileSync(file, 'utf8').trim();
+}
+
+// forgetKey: remove a saved key's two files. The key itself stays valid in Capella.
+function forgetKey(name) {
+  if (!SAVED_NAME.test(String(name))) throw new Error('unknown saved key');
+  let removed = 0;
+  for (const ext of ['key', 'json']) {
+    const file = path.join(keysDir(), `${name}.${ext}`);
+    if (fs.existsSync(file)) {
+      fs.rmSync(file);
+      removed += 1;
+    }
+  }
+  return { name, removed };
+}
+
+// findSavedKey: a saved key for this organization and region with at least five minutes left.
+function findSavedKey(orgId, region) {
+  const soon = Math.floor(Date.now() / 1000) + 300;
+  return savedKeys().find((k) => k.orgId === orgId && k.region === region && k.expiresAt > soon) || null;
 }
 
 // ---------- model API keys through the Capella control plane ----------
@@ -846,9 +930,19 @@ async function cpCreateKey(body) {
     endpoint = models.find((m) => m.modelConfig?.cloudConfig?.region?.name === region && m.network?.endpoint)?.network.endpoint || '';
     if (endpoint && !/^https?:\/\//.test(endpoint)) endpoint = `https://${endpoint}`;
   } catch { /* the endpoint is a convenience only */ }
+  endpoint = endpoint.replace(/\/+$/, '');
+  // Saved by default, so the key can be picked again later without creating another.
+  let saved = '';
+  if (body.save !== false) {
+    const now = Math.floor(Date.now() / 1000);
+    saved = saveKey({
+      keyId: key.keyId || '', name: key.name || name, expiry: key.expiry || '', region: key.region || region, orgId: cp.orgId,
+      cpUrl: cp.base, endpoint, createdAt: now, expiresAt: now + (Number(key.expiryDuration) || expiryDuration),
+    }, key.apiKey);
+  }
   return {
     keyId: key.keyId || '', name: key.name || name, apiKey: key.apiKey, expiry: key.expiry || '', region: key.region || region,
-    allowedIPs: key.accessPolicy?.allowedIPs || allowedIPs, endpoint: endpoint.replace(/\/+$/, ''),
+    allowedIPs: key.accessPolicy?.allowedIPs || allowedIPs, endpoint, saved, savedIn: saved ? keysDir() : '',
     request: { url: `${cp.base}/v2/organizations/${cp.orgId}/languageModelApiKeys`, body: payload },
   };
 }
@@ -860,7 +954,9 @@ async function cpDeleteKey(body) {
   if (!/^[0-9a-fA-F-]{8,64}$/.test(keyId)) throw new Error('no key id to delete');
   const res = await request('DELETE', `${cp.base}/v2/organizations/${cp.orgId}/languageModelApiKeys/${keyId}`, { headers: cp.headers, timeout: 30000, verifyTls: cp.verifyTls });
   if (res.status >= 300 && res.status !== 404) throw new Error(`deleting the API key: HTTP ${res.status}: ${cpError(res)}`);
-  return { keyId, deleted: true, gone: res.status === 404 };
+  // Its saved copy is of no use any more.
+  const forgotten = savedKeys().filter((k) => k.keyId === keyId).map((k) => forgetKey(k.name).name);
+  return { keyId, deleted: true, gone: res.status === 404, forgotten };
 }
 
 // customConnect: what a client sees on that gateway: its version (GET /v1/info) and the
@@ -1618,6 +1714,9 @@ function startRun(body) {
   const cpPassword = (typeof body.cpPassword === 'string' && body.cpPassword) ||
     (body.cpUser ? envValue(fileEnv, sandbox, 'CP_PASSWORD') : '');
   if (cpPassword) env.CP_PASSWORD = cpPassword;
+  // A session JWT for the control plane (SSO logins), used in place of the password login.
+  delete env.CP_JWT;
+  if (typeof body.cpJwt === 'string' && /^(Bearer\s+)?[\w-]+\.[\w-]+\.[\w-]+$/.test(body.cpJwt.trim())) env.CP_JWT = body.cpJwt.trim();
 
   // detached: the doctor gets its own process group, so Cancel can interrupt it
   // like Ctrl-C and its exit trap still deletes a temporary API key.
@@ -1858,6 +1957,18 @@ const server = http.createServer(async (req, res) => {
       if (r.status !== 200) throw new Error(`/v1/info returned HTTP ${r.status}: ${info.error?.message || info.message || ''}`);
       const models = (info.models || []).map((m) => ({ name: m.model_name, status: m.status, reachable: m.server_reachable }));
       return send(res, 200, { gateway: gw, version: info.version || '', buildTime: info.build_time || '', commit: info.commit_hash || '', models });
+    } catch (err) {
+      return send(res, 400, { error: err.message });
+    }
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/keys') {
+    return send(res, 200, { dir: keysDir(), keys: savedKeys() });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/keys/forget') {
+    try {
+      return send(res, 200, forgetKey((await readJson(req)).name));
     } catch (err) {
       return send(res, 400, { error: err.message });
     }

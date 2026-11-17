@@ -183,8 +183,17 @@
           </details>
           <div class="segmented" role="radiogroup" aria-label="API key">
             <label><input type="radio" name="keySource" value="create" checked><span>Temporary key</span></label>
+            <label><input type="radio" name="keySource" value="capella"><span>Capella key</span></label>
             <label><input type="radio" name="keySource" value="file"><span>Key file</span></label>
             <label><input type="radio" name="keySource" value="paste"><span>Paste key</span></label>
+          </div>
+          <div class="key-capella" hidden>
+            <label>Session JWT (only when you sign in to Capella with SSO)
+              <input name="cpJwt" type="password" autocomplete="off" placeholder="empty: log in with the Capella login and password above">
+            </label>
+            <p class="hint">Creates a model API key through the Capella control plane, with the Control plane URL and Capella
+              login above. It needs no gateway admin secret and no AWS access, so it also works for production. The key
+              is saved in <code>~/.aigw-doctor/keys</code> and reused for this organization and region until it expires (a day).</p>
           </div>
           <label class="key-file" hidden>API key file
             <input name="apiKeyFile" placeholder="~/.aigw-key">
@@ -248,6 +257,14 @@
                 <input name="customKey" type="password" autocomplete="off">
               </label>
             </div>
+            <div class="custom-actions">
+              <label class="saved-key">Saved key
+                <select name="savedKey"><option value="">none: use the API key field</option></select>
+              </label>
+              <button type="button" class="small-btn" id="saved-key-forget" hidden
+                title="Removes the key's files from this machine. The key stays valid in Capella until it expires or is deleted there.">Forget</button>
+              <span id="saved-key-note" class="muted small"></span>
+            </div>
             <details id="cp-key">
               <summary>Create an API key (Capella control plane)</summary>
               <div class="custom-row">
@@ -286,14 +303,16 @@
               <label>Allowed IPs (addresses or CIDR ranges, comma-separated)
                 <input name="keyAllowedIps" value="0.0.0.0/0">
               </label>
+              <label class="check-inline"><input type="checkbox" name="keySave" checked>
+                Save the key on this machine (<code>~/.aigw-doctor/keys</code>, readable only by you), to pick it again later</label>
               <div class="custom-actions">
                 <button type="button" class="small-btn" id="cp-key-create"
                   title="POST /v2/organizations/<org id>/languageModelApiKeys">Create key</button>
                 <button type="button" class="small-btn" id="cp-key-delete" hidden>Delete this key</button>
                 <span id="cp-key-msg" class="muted small"></span>
               </div>
-              <p class="hint">The key gets access to every model in the region and is put into the API key field above. It is
-                shown only once by Capella and is kept in this page only; the password and JWT are not saved either.
+              <p class="hint">The key gets access to every model in the region and is put into the API key field above. Capella
+                shows it only once: without saving, it lives in this page only. The password and JWT are never saved.
                 When the organization has a model in that region, its gateway endpoint fills an empty Gateway URL.</p>
             </details>
             <div class="custom-actions">
