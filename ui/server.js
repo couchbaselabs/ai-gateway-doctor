@@ -56,6 +56,9 @@ const FLAGS = {
   inferenceOnly: '--inference-only',
   createApiKey: '--create-api-key',
   skipInference: '--skip-inference',
+  probeGuardrails: '--probe-guardrails',
+  probeRateLimit: '--probe-rate-limit',
+  probeBatch: '--probe-batch',
 };
 
 // .env keys and the form field each fills. "<SANDBOX>_<KEY>" sets one sandbox
@@ -514,6 +517,10 @@ function endpointLabel(u) {
 
 const flag = (v) => v === true || v?.isEnabled === true;
 
+// spendCap: a spend cap as text, e.g. "5000 credits, stop" (the gateway's default behavior is warn).
+const spendCap = (cap) => (cap && typeof cap === 'object'
+  ? `${cap.limit ?? '?'} ${cap.unit || '?'}, ${cap.behavior || 'warn'}` : '');
+
 // configSummary: what the page shows about a gateway config. Fields are picked one by
 // one; certificates, model keys and other values are never sent. Secrets Manager entries
 // appear by name only.
@@ -528,6 +535,15 @@ function configSummary(file) {
     modifiedAt: fs.statSync(file).mtimeMs,
     serviceName: c.serviceName || '',
     rateLimit: c.rateLimit ?? null,
+    // Keystone 2: gateway-wide switches and the region spend cap.
+    keystone2: {
+      rateLimitsOn: c.features?.deploymentRateLimit !== false,
+      spendCapsOn: c.features?.spendCap !== false,
+      regionSpendCap: spendCap(c.regionSpendCap),
+      cycleStart: c.regionSpendCap?.cycleStart || '',
+      spendStore: c.usageReport?.spendStore || '',
+      spendKeyspace: defaults.spendKeyspace || '',
+    },
     store: {
       host: (store.couchbaseConnectString || '').replace(/^[a-z]+:\/\//, '').split(/[,/?]/)[0],
       cacheKeyspace: defaults.cacheKeyspace || '',
@@ -571,6 +587,16 @@ function configSummary(file) {
         jailbreak: flag(m.jailbreakConfig),
         hallucination: flag(m.hallucinate),
         batch: flag(m.batchConfig),
+        // Keystone 2 controls of the deployment.
+        requestsPerMinute: m.rateLimit?.requestsPerMinute ?? null,
+        spendCap: spendCap(m.spendCap),
+        rateCard: Array.isArray(m.rateCard) ? m.rateCard.length : 0,
+        bedrockGuardrail: m.bedrockConfig?.guardrail
+          ? [m.bedrockConfig.guardrail.id, m.bedrockConfig.guardrail.version && `v${m.bedrockConfig.guardrail.version}`].filter(Boolean).join(' ')
+          : '',
+        bedrockBatch: m.bedrockConfig?.batch?.enabled === true
+          ? { bucket: m.bedrockConfig.batch.s3Bucket || '', guardrailMode: m.bedrockConfig.batch.guardrailMode || '' }
+          : null,
       };
     }),
   };

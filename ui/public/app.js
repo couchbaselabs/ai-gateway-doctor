@@ -208,6 +208,10 @@ function kv(label, value) {
   return el('div', { class: 'kv' }, el('span', { class: 'k' }, label), el('span', { class: 'v' }, String(value)));
 }
 
+// usesKeystone2: does the model have any deployment-level Keystone 2 setting? A rate card
+// alone counts: with only a region spend cap it is what prices the model's requests.
+const usesKeystone2 = (m) => m.requestsPerMinute != null || Boolean(m.spendCap || m.rateCard || m.bedrockGuardrail || m.bedrockBatch);
+
 function renderConfig(c) {
   const chat = c.models.filter((m) => /text-generation/.test(m.kind)).length;
   const tested = c.models.filter((m) => cacheVerdict(m).tested.length).length;
@@ -235,6 +239,19 @@ function renderConfig(c) {
       kv('Service', c.serviceName),
       kv('Rate limit', c.rateLimit)));
 
+  // Keystone 2: shown only when the config uses a rate limit, spend cap or Bedrock control.
+  const k2 = c.keystone2 || {};
+  const k2Used = k2.regionSpendCap || c.models.some(usesKeystone2);
+  const controls = k2Used ? el('article', { class: 'step info' },
+    el('header', {}, el('h3', {}, 'Keystone 2 controls')),
+    el('div', { class: 'pills' }, onOff(k2.rateLimitsOn ? 'rate limits enforced' : 'rate limits not enforced', k2.rateLimitsOn),
+      onOff(k2.spendCapsOn ? 'spend caps enforced' : 'spend caps not enforced', k2.spendCapsOn)),
+    el('div', { class: 'kv-grid' },
+      kv('Region spend cap', k2.regionSpendCap),
+      kv('Billing cycle start', k2.cycleStart),
+      kv('Spend store', k2.spendStore || (k2.spendKeyspace ? 'auto (Couchbase)' : 'auto (per node)')),
+      kv('Spend keyspace', k2.spendKeyspace))) : null;
+
   const cards = c.models.map((m) => {
     const v = cacheVerdict(m);
     const cc = m.cache;
@@ -260,12 +277,18 @@ function renderConfig(c) {
           el('div', { class: 'pills' }, m.guardrail && onOff('guardrail', true), m.jailbreak && onOff('jailbreak', true),
             m.hallucination && onOff('hallucination', true), m.batch && onOff('batch', true)),
           kv('qps', m.qps), kv('queue', m.queueLength), kv('timeout', duration(m.requestTimeout)),
-          kv('embedding dims', /embedding/.test(m.kind) ? m.embeddingDimensions : null))));
+          kv('embedding dims', /embedding/.test(m.kind) ? m.embeddingDimensions : null)),
+        usesKeystone2(m) && section('Keystone 2',
+          kv('rate limit', m.requestsPerMinute != null ? `${m.requestsPerMinute} requests/min` : null),
+          kv('spend cap', m.spendCap),
+          kv('rate card', m.rateCard ? `${m.rateCard} charge${m.rateCard === 1 ? '' : 's'}` : null),
+          kv('Bedrock guardrail', m.bedrockGuardrail),
+          kv('Bedrock batch', m.bedrockBatch && ([m.bedrockBatch.bucket, m.bedrockBatch.guardrailMode && `guardrail ${m.bedrockBatch.guardrailMode}`].filter(Boolean).join(' · ') || 'enabled')))));
   });
   const models = el('article', { class: 'step info' },
     el('header', {}, el('h3', {}, `Models (${c.models.length})`)),
     el('div', { class: 'model-cards' }, cards));
-  return [head, rawBox, store, models];
+  return [head, rawBox, store, controls, models].filter(Boolean);
 }
 
 // ---------- Couchbase console (middle pane) ----------
@@ -899,8 +922,38 @@ async function lookupLinks(name) {
 
 // ---------- form (middle) ----------
 
+// The optional probes (they send extra, billable requests) are chosen per sandbox and kept
+// in the browser only; a sandbox without a saved choice has them all off.
+const PROBES = ['probeGuardrails', 'probeRateLimit', 'probeBatch'];
+const PROBES_KEY = 'aigw-doctor-probes-v1';
+
+// storedMap: a JSON object from localStorage as a map without a prototype, so a sandbox
+// named "constructor" or "toString" is looked up like any other key.
+function storedMap(key) {
+  const map = Object.create(null);
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) || '{}');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) Object.assign(map, parsed);
+  } catch { /* unreadable: start empty */ }
+  return map;
+}
+
+function probeChoices() {
+  const all = storedMap(PROBES_KEY);
+  for (const name of Object.keys(all)) if (!Array.isArray(all[name])) delete all[name];
+  return all;
+}
+
+function saveProbes() {
+  const all = probeChoices();
+  const mine = PROBES.filter((p) => form.elements[p].checked);
+  if (mine.length) all[selected] = mine;
+  else delete all[selected];
+  localStorage.setItem(PROBES_KEY, JSON.stringify(all));
+}
+
 function edits() {
-  return JSON.parse(localStorage.getItem(EDITS_KEY) || '{}');
+  return storedMap(EDITS_KEY);
 }
 
 function radio(name) {
@@ -923,6 +976,8 @@ function fillForm() {
   const values = { ...baseline(), ...(edits()[selected] || {}) };
   for (const f of TEXT_FIELDS) form.elements[f].value = values[f] || '';
   for (const r of Object.keys(RADIOS)) setRadio(r, values[r]);
+  const probes = probeChoices()[selected] || [];
+  for (const p of PROBES) form.elements[p].checked = probes.includes(p);
   for (const [field, key] of Object.entries(SECRET_FIELDS)) {
     form.elements[field].value = '';
     form.elements[field].placeholder = sb?.secrets[key] ? 'set in .env' : '';
@@ -945,6 +1000,7 @@ function saveEdits() {
   if (Object.keys(mine).length) all[selected] = mine;
   else delete all[selected];
   localStorage.setItem(EDITS_KEY, JSON.stringify(all));
+  saveProbes();
   updateEditButtons();
 }
 
@@ -954,7 +1010,7 @@ function updateEditButtons() {
   const sb = current();
   const changed = Boolean(edits()[selected]);
   const secret = Boolean(form.elements.cpPassword.value || form.elements.apiKey.value);
-  $('reset-btn').hidden = !sb || !changed;
+  $('reset-btn').hidden = !sb || !(changed || probeChoices()[selected]);
   $('delete-btn').hidden = !sb;
   $('save-env-btn').hidden = !sb || (!changed && !secret);
 }
@@ -1037,6 +1093,9 @@ function formBody() {
     cpUser: models ? v('cpUser') : '',
     cpPassword: models ? form.elements.cpPassword.value : '',
     models: models ? v('models') : '',
+    probeGuardrails: models && form.elements.probeGuardrails.checked,
+    probeRateLimit: models && form.elements.probeRateLimit.checked,
+    probeBatch: models && form.elements.probeBatch.checked,
   });
 }
 
@@ -1054,6 +1113,9 @@ $('reset-btn').addEventListener('click', () => {
   const all = edits();
   delete all[selected];
   localStorage.setItem(EDITS_KEY, JSON.stringify(all));
+  const probes = probeChoices();
+  delete probes[selected];
+  localStorage.setItem(PROBES_KEY, JSON.stringify(probes));
   fillForm();
 });
 
