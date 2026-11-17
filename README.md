@@ -123,6 +123,7 @@ Keystone 2 adds production controls to serverless (Bedrock) models. The doctor f
 | `rateLimit.requestsPerMinute` | outside 1–100000 (ignored: no limit) |
 | `spendCap`, `regionSpendCap` | limit outside 0.000001–1e12, unit not `credits` or `tokens`, behavior not `warn` or `stop`, a credits cap without a `rateCard`, `cycleEnd` not after `cycleStart` (ignored: no cap) |
 | `rateCard[]` | negative `value`, `per` of 0 or less, or a `charge` the gateway does not price |
+| `regionSpendCap` in credits | models without a `rateCard`, named in the warning: their requests cost nothing against the cap |
 | `guardrailConfig`, `jailbreakConfig` on a Bedrock model | enabled with neither a guardrail model nor `bedrockConfig.guardrail.id`; a guardrail without a version, with `DRAFT`, or set together with `guardrailIdentifier` (requests get 400 `guardrail_initialization_error`) |
 | `bedrockConfig.guardrail` | set while both switches are off (not applied) |
 | `bedrockConfig.batch` | enabled without `s3Bucket` or `serviceRoleArn`, `timeoutHours` outside 24–168, `guardrailMode` not `enforce` or `detect`; `detect` is flagged because nothing is blocked |
@@ -157,7 +158,7 @@ When everything is valid, one line lists the controls and the spend store in use
 
 - **Burst size:** a limit of 600 requests a minute needs 125 requests. `--burst-max N` (default 150) is the most the doctor will send; a deployment that needs more is skipped. Refused requests cost nothing, the answered ones ask for one output token. The burst uses up the deployment's limit for a few seconds, so it runs last for each model. It needs curl 7.66 or later (`--parallel`).
 - **Several gateway nodes:** each node enforces its share of the limit, so the number of answered requests is close to the burst, not exact.
-- **Batch:** a batch this small runs request by request (for Bedrock on the runtime, at the standard rate), so it finishes in seconds. It proves the Files and Batches API, the batch storage and the API key's batch role, not a native Bedrock batch job, which needs at least `minRecords` (100) requests and can take hours. `--batch-timeout SECS` (default 300) is how long the doctor waits; a batch still running then is cancelled. The probe's files are deleted afterwards, also on Ctrl-C and when the batch failed. If a cancel or delete does not succeed, the doctor tries once more at the end and then names the batch and files left on the gateway.
+- **Batch:** a batch this small runs request by request (for Bedrock on the runtime, at the standard rate), so it finishes in seconds. It proves the Files and Batches API, the batch storage and the API key's batch role, not a native Bedrock batch job, which needs at least `minRecords` (100) requests and can take hours. `--batch-timeout SECS` (default 300) is how long the doctor waits, including a status request that does not answer; a batch still running then is cancelled. The probe's files are deleted afterwards, also on Ctrl-C and when the batch failed. If a cancel or delete does not succeed, the doctor tries once more at the end and then names the batch and files left on the gateway.
 
 Not covered: a native Bedrock batch job (100 or more requests), and content-filter probes.
 

@@ -452,6 +452,7 @@ def capcheck: [
 ($c.modelServiceStoreConfig // {}) as $store |
 [$ms[] | select(.rateLimit != null)] as $limited |
 [$ms[] | select(.spendCap != null)] as $capped |
+[$ms[] | select(((.rateCard // []) | length) == 0) | lbl] as $unpriced |
 [$ms[] | select(bedrock and .bedrockConfig.guardrail != null and safety_on)] as $guarded |
 [$ms[] | select(.bedrockConfig.batch.enabled == true)] as $batch |
 ($c.usageReport.spendStore | lower) as $mode |
@@ -543,6 +544,9 @@ def capcheck: [
 				$from != null and $to != null and $to <= $from)
 			then ["WARN", "config: regionSpendCap is ignored by the gateway: cycleEnd must be after cycleStart",
 				"fix the billing cycle dates of the region spend cap"]
+		elif ($r.unit == "credits") and (($unpriced | length) > 0)
+			then ["WARN", "config: regionSpendCap is in credits, but \(plural($unpriced | length; "model")) \(if ($unpriced | length) == 1 then "has" else "have" end) no rateCard, so \(if ($unpriced | length) == 1 then "its" else "their" end) requests cost nothing against the cap: \($unpriced[0:8] | join(", "))\(if ($unpriced | length) > 8 then " and \(($unpriced | length) - 8) more" else "" end)",
+				"add a rateCard to each of those deployments; a cap in tokens (unit \"tokens\") needs none"]
 		else empty end
 		else empty end),
 	(if ($mode != "") and ($mode != "auto") and ($mode != "local") and ($mode != "couchbase") and ($mode != "controlplane")
@@ -1659,14 +1663,15 @@ cache_test() {
 MODEL_OK=false
 
 # gw METHOD PATH [CURL ARGS...]: one gateway API call with the API key. The response body
-# goes to $RESP_FILE, its headers to $RESP_HDR, and the HTTP code to stdout.
+# goes to $RESP_FILE, its headers to $RESP_HDR, and the HTTP code to stdout. GW_MAX_TIME
+# (seconds, default 120) bounds the request.
 gw() {
 	local method="$1" path="$2"
 	shift 2
 	printf '   %s[check] $ curl -sk -X %s %s -H %s%s%s\n' "$DIM" "$method" "$AIGW_URL$path" \
 		"'Authorization: Bearer <redacted>'" "${1:+ $(shellquote "$@")}" "$RST" | show check
 	allowed check || return 0
-	curl -sk --max-time 120 -K <(bearer_config "$API_KEY") -o "$RESP_FILE" -D "$RESP_HDR" \
+	curl -sk --max-time "${GW_MAX_TIME:-120}" -K <(bearer_config "$API_KEY") -o "$RESP_FILE" -D "$RESP_HDR" \
 		-w '%{http_code}' -X "$method" "$@" "$AIGW_URL$path"
 }
 
@@ -1717,7 +1722,8 @@ probe_burst() {
 	printf '%s' "$body" >"$dir/request.json"
 	curl --parallel --parallel-max "$n" -K <(burst_config "$n" "$path" "$dir/request.json" "$dir") >/dev/null 2>&1
 	# The last status line of each header file is the response's HTTP code.
-	codes=$(awk 'FNR == 1 && NR > 1 {print c; c = ""} /^HTTP\// {c = $2} END {if (NR > 0) print c}' "$dir"/*.hdr 2>/dev/null)
+	# Header lines end in a carriage return, and an HTTP/2 status line is just "HTTP/2 200".
+	codes=$(awk '{sub(/\r$/, "")} FNR == 1 && NR > 1 {print c; c = ""} /^HTTP\// {c = $2} END {if (NR > 0) print c}' "$dir"/*.hdr 2>/dev/null)
 	ok=$(grep -c '^200$' <<<"$codes")
 	# A rate-limit refusal is a response whose own error code is deployment_rate_limit_exceeded.
 	# It is a good one when that same response is HTTP 429 and carries a numeric Retry-After;
@@ -1727,7 +1733,7 @@ probe_burst() {
 	for f in $(grep -l 'deployment_rate_limit_exceeded' "$dir"/*.body 2>/dev/null); do
 		[[ "$(jq -r '.error.code // .error.type // empty' "$f" 2>/dev/null)" == deployment_rate_limit_exceeded ]] || continue
 		limited=$((limited + 1))
-		hdr=$(awk '/^HTTP\// {c = $2; r = ""} tolower($1) == "retry-after:" {r = $2} END {gsub("\r", "", r); print c, r}' "${f%.body}.hdr" 2>/dev/null)
+		hdr=$(awk '{sub(/\r$/, "")} /^HTTP\// {c = $2; r = ""} tolower($1) == "retry-after:" {r = $2} END {print c, r}' "${f%.body}.hdr" 2>/dev/null)
 		if [[ "$hdr" =~ ^429\ ([0-9]+)$ ]]; then
 			good=$((good + 1))
 			ra="${BASH_REMATCH[1]}"
@@ -1796,7 +1802,7 @@ batch_leftovers() {
 # request by request (for Bedrock: on the runtime, at the standard rate), so it finishes in
 # seconds; it proves the Files and Batches API, the batch storage and the API key's batch role.
 probe_batch() {
-	local model="$1" kind="$2" ref="$3" url file body i code fid bid status="" route out_id err_id n_ok first start elapsed
+	local model="$1" kind="$2" ref="$3" url file body i code fid bid status="" route out_id err_id n_ok first start elapsed left
 	local refhdr=()
 	[[ -n "$ref" && "$ref" != - ]] && refhdr=(-H "X-cb-model-ref: $ref")
 	if [[ "$kind" == *embedding* ]]; then url=/v1/embeddings; else url=/v1/chat/completions; fi
@@ -1852,11 +1858,19 @@ probe_batch() {
 	while :; do
 		status=$(jq -r '.status // empty' "$RESP_FILE" 2>/dev/null)
 		case "$status" in completed | failed | expired | cancelled) break ;; esac
-		elapsed=$(($(date +%s) - start))
-		((elapsed >= BATCH_TIMEOUT)) && break
-		sleep 5
-		code=$(gw GET "/v1/batches/$bid")
-		[[ "$code" == 200 ]] || { status="HTTP $code"; break; }
+		# Neither the wait nor the poll itself may run past the deadline.
+		left=$((BATCH_TIMEOUT - ($(date +%s) - start)))
+		((left <= 0)) && break
+		sleep $((left < 5 ? left : 5))
+		left=$((BATCH_TIMEOUT - ($(date +%s) - start)))
+		((left <= 0)) && break
+		code=$(GW_MAX_TIME=$((left < 120 ? left : 120)) gw GET "/v1/batches/$bid")
+		if [[ "$code" != 200 ]]; then
+			# A poll cut off by the deadline is a timeout, with the last status seen.
+			[[ "$code" == 000 ]] && (($(date +%s) - start >= BATCH_TIMEOUT)) && break
+			status="HTTP $code"
+			break
+		fi
 	done
 	elapsed=$(($(date +%s) - start))
 	# A batch that reached an end state needs no cancel, and its result files (which a failed
