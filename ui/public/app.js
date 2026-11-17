@@ -429,6 +429,7 @@ function playEntry(r) {
         el('span', { class: 'pre-line' }, ok ? r.content : [r.error, r.content].filter(Boolean).join('\n')))),
     r.steps && el('div', { class: 'debug-headers' }, r.steps.map((st) =>
       el('span', { class: 'chip' }, el('span', { class: 'muted' }, `${st.name}: `), st.status ? `HTTP ${st.status}` : 'failed'))),
+    unreadFiles(r),
     debugHeaders(r.responseHeaders),
     curlBlock(r),
     headerTable('Request headers', r.requestHeaders, `POST ${r.endpoint}`),
@@ -443,6 +444,31 @@ function playEntry(r) {
           return r.raw;
         }
       })())));
+}
+
+// unreadFiles: result files of a batch that could not be read. The server kept them on the
+// gateway with the key that made them; "Fetch again" reads one through the server, which
+// then deletes it.
+function unreadFiles(r) {
+  if (!r.unread?.length) return null;
+  return el('div', { class: 'unread-files' }, r.unread.map((file) => {
+    const out = el('pre', { class: 'raw-json' });
+    out.hidden = true;
+    const button = el('button', { type: 'button', class: 'small-btn' }, `Fetch the ${file.name} again`);
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      const resp = await fetch('/api/playground/file', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: file.id }),
+      });
+      const data = await resp.json();
+      out.hidden = false;
+      out.textContent = resp.ok ? data.text || '(empty)' : data.error;
+      // Read and deleted: nothing left to fetch. Otherwise it can be tried again.
+      if (resp.ok && data.deleted) button.textContent = `The ${file.name} was fetched and deleted from the gateway`;
+      else button.disabled = resp.status === 404;
+    });
+    return el('div', {}, button, el('span', { class: 'muted small mono' }, ` ${file.id}`), out);
+  }));
 }
 
 // curlCommand: the request as a shareable curl command. The API key is left as
@@ -693,6 +719,92 @@ playForm.elements.customModel.addEventListener('change', () => {
 playForm.elements.requestType.addEventListener('change', showDetectedCache);
 playForm.elements.customUrl.value = localStorage.getItem(CUSTOM_URL_KEY) || '';
 playForm.elements.customUrl.addEventListener('change', () => localStorage.setItem(CUSTOM_URL_KEY, playForm.elements.customUrl.value.trim()));
+
+// ---- Create an API key through the Capella control plane (custom endpoint) ----
+const KEY_FORM_KEY = 'aigw-doctor-cp-key-form'; // URL, region and email are remembered; never the password, JWT or key
+let createdKey = null; // the key made in this page, so it can be deleted again
+
+function cpKeyBody() {
+  const f = playForm.elements;
+  return {
+    cpUrl: f.keyCpUrl.value.trim(), region: f.keyRegion.value.trim(), cpUser: f.keyCpUser.value.trim(),
+    cpPassword: f.keyCpPassword.value, jwt: f.keyJwt.value, verifyTls: f.verifyTls.checked,
+  };
+}
+
+(() => {
+  const f = playForm.elements;
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(KEY_FORM_KEY) || '{}') || {};
+  } catch { /* start empty */ }
+  f.keyCpUrl.value = typeof saved.cpUrl === 'string' ? saved.cpUrl : '';
+  f.keyRegion.value = typeof saved.region === 'string' ? saved.region : '';
+  f.keyCpUser.value = typeof saved.cpUser === 'string' ? saved.cpUser : '';
+  const now = new Date();
+  const two = (n) => String(n).padStart(2, '0');
+  f.keyName.value = `aigw-doctor-${now.getFullYear()}${two(now.getMonth() + 1)}${two(now.getDate())}-${two(now.getHours())}${two(now.getMinutes())}`;
+})();
+
+$('cp-key-create').addEventListener('click', async () => {
+  const f = playForm.elements;
+  const msg = $('cp-key-msg');
+  msg.className = 'muted small';
+  msg.textContent = 'creating…';
+  $('cp-key-create').disabled = true;
+  try {
+    const body = cpKeyBody();
+    localStorage.setItem(KEY_FORM_KEY, JSON.stringify({ cpUrl: body.cpUrl, region: body.region, cpUser: body.cpUser }));
+    const resp = await fetch('/api/cp/apikey', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, name: f.keyName.value.trim(), expiryDuration: Number(f.keyExpiry.value), allowedIPs: f.keyAllowedIps.value }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      msg.className = 'error-text small';
+      msg.textContent = data.error;
+      return;
+    }
+    f.customKey.value = data.apiKey;
+    createdKey = { keyId: data.keyId, name: data.name, apiKey: data.apiKey };
+    $('cp-key-delete').hidden = !data.keyId;
+    let note = '';
+    if (data.endpoint && !f.customUrl.value.trim()) {
+      f.customUrl.value = data.endpoint;
+      localStorage.setItem(CUSTOM_URL_KEY, data.endpoint);
+      note = ` Gateway URL set to ${data.endpoint}.`;
+    } else if (!data.endpoint) {
+      note = ` No model with an endpoint in ${data.region}: enter the Gateway URL yourself.`;
+    }
+    msg.textContent = `Created ${data.name} (${data.keyId})${data.expiry ? `, expires ${new Date(data.expiry).toLocaleString()}` : ''}. It is in the API key field.${note}`;
+  } catch (err) {
+    msg.className = 'error-text small';
+    msg.textContent = err.message;
+  } finally {
+    $('cp-key-create').disabled = false;
+  }
+});
+
+$('cp-key-delete').addEventListener('click', async () => {
+  if (!createdKey) return;
+  const msg = $('cp-key-msg');
+  msg.className = 'muted small';
+  msg.textContent = 'deleting…';
+  const resp = await fetch('/api/cp/apikey/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...cpKeyBody(), keyId: createdKey.keyId }),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    msg.className = 'error-text small';
+    msg.textContent = data.error;
+    return;
+  }
+  msg.textContent = `Deleted ${createdKey.name} (${createdKey.keyId}).`;
+  // Clear the field only when it still holds the deleted key.
+  if (playForm.elements.customKey.value === createdKey.apiKey) playForm.elements.customKey.value = '';
+  createdKey = null;
+  $('cp-key-delete').hidden = true;
+});
 
 function customBody() {
   const f = playForm.elements;

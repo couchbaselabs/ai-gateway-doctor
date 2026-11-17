@@ -620,3 +620,6 @@ table.headers tr.notable td:first-child { color: var(--cb-red); }
 .pre-line { white-space: pre-line; }
 #play-headers { display: flex; flex-direction: column; gap: 6px; }
 #play-headers[open] > summary { margin-bottom: 6px; }
+#cp-key { margin-top: 8px; }
+#cp-key[open] > summary { margin-bottom: 8px; }
+#cp-key > label, #cp-key > .custom-row { margin-bottom: 8px; }

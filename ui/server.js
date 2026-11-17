@@ -778,6 +778,91 @@ function customTarget(body) {
   return { gw, key, verifyTls: body.verifyTls !== false };
 }
 
+// ---------- model API keys through the Capella control plane ----------
+
+// cpTarget: the control plane API, organization and session for a key request. The URL may
+// be the console API URL with /v2/organizations/<org id>. The session is the JWT given, or
+// a login (POST /sessions with the Capella email and password). Nothing is stored.
+async function cpTarget(body) {
+  const raw = String(body.cpUrl || '').trim().replace(/\/+$/, '');
+  if (!OPTIONS.cpUrl[1].test(raw)) throw new Error('enter the control plane URL, e.g. https://api.cloud.couchbase.com/v2/organizations/<org id>');
+  const [, base, org = ''] = raw.match(/^(https:\/\/[^/]+)(?:\/v\d+\/organizations\/([0-9a-fA-F-]+))?$/);
+  const orgId = String(body.orgId || '').trim() || org;
+  if (!OPTIONS.orgId[1].test(orgId)) throw new Error('the organization id is missing: add /v2/organizations/<org id> to the control plane URL');
+  const verifyTls = body.verifyTls !== false;
+  let jwt = typeof body.jwt === 'string' ? body.jwt.trim().replace(/^Bearer\s+/i, '') : '';
+  if (jwt && !/^[\w-]+\.[\w-]+\.[\w-]+$/.test(jwt)) throw new Error('that does not look like a JWT (three dot-separated parts)');
+  if (!jwt) {
+    const user = String(body.cpUser || '').trim();
+    const password = typeof body.cpPassword === 'string' ? body.cpPassword : '';
+    if (!OPTIONS.cpUser[1].test(user) || !password) throw new Error('enter your Capella login (email and password), or paste a session JWT');
+    const res = await request('POST', `${base}/sessions`, { headers: { Authorization: basic(`${user}:${password}`) }, timeout: 30000, verifyTls });
+    try {
+      jwt = JSON.parse(res.text).jwt || '';
+    } catch { /* reported below */ }
+    if (!jwt) throw new Error(`Capella login as ${user} failed (HTTP ${res.status}); the API needs a password login, not SSO: paste a session JWT instead`);
+  }
+  return { base, orgId, verifyTls, headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' } };
+}
+
+const cpError = (res) => {
+  try {
+    const j = JSON.parse(res.text);
+    return j.message || j.error?.message || j.hint || res.text.slice(0, 300);
+  } catch {
+    return res.text.slice(0, 300);
+  }
+};
+
+// cpCreateKey: POST /v2/organizations/<org>/languageModelApiKeys. The key gives access to
+// every model in the region. It also looks up the region's gateway endpoint (the
+// network.endpoint of the org's language models there), so the page can fill the URL.
+async function cpCreateKey(body) {
+  const cp = await cpTarget(body);
+  const region = String(body.region || '').trim();
+  if (!OPTIONS.region[1].test(region)) throw new Error('enter the region of the models, e.g. us-east-2');
+  const name = String(body.name || '').trim();
+  if (!/^[\w .@-]{1,100}$/.test(name)) throw new Error('enter a name for the key (letters, digits, spaces, . _ @ -)');
+  const expiryDuration = Number(body.expiryDuration);
+  if (!Number.isInteger(expiryDuration) || expiryDuration < 60 || expiryDuration > 366 * 86400) throw new Error('the expiry must be between a minute and a year, in seconds');
+  const allowedIPs = String(body.allowedIPs || '0.0.0.0/0').split(/[\s,]+/).filter(Boolean);
+  if (!allowedIPs.length || allowedIPs.length > 20 || !allowedIPs.every((ip) => /^[0-9a-fA-F:.]{2,45}(\/\d{1,3})?$/.test(ip))) {
+    throw new Error('allowed IPs must be IP addresses or CIDR ranges, e.g. 0.0.0.0/0');
+  }
+  const payload = { name, description: String(body.description || '').slice(0, 200), expiryDuration, region, accessPolicy: { allowedIPs } };
+  const res = await request('POST', `${cp.base}/v2/organizations/${cp.orgId}/languageModelApiKeys`, {
+    headers: cp.headers, body: JSON.stringify(payload), timeout: 60000, verifyTls: cp.verifyTls,
+  });
+  let key = {};
+  try {
+    key = JSON.parse(res.text);
+  } catch { /* reported below */ }
+  if (res.status >= 300 || !key.apiKey) throw new Error(`creating the API key: HTTP ${res.status}: ${cpError(res)}`);
+
+  let endpoint = '';
+  try {
+    const list = await request('GET', `${cp.base}/v2/organizations/${cp.orgId}/languagemodels?page=1&perPage=100`, { headers: cp.headers, timeout: 30000, verifyTls: cp.verifyTls });
+    const models = (JSON.parse(list.text).data || []).map((m) => m.data || m);
+    endpoint = models.find((m) => m.modelConfig?.cloudConfig?.region?.name === region && m.network?.endpoint)?.network.endpoint || '';
+    if (endpoint && !/^https?:\/\//.test(endpoint)) endpoint = `https://${endpoint}`;
+  } catch { /* the endpoint is a convenience only */ }
+  return {
+    keyId: key.keyId || '', name: key.name || name, apiKey: key.apiKey, expiry: key.expiry || '', region: key.region || region,
+    allowedIPs: key.accessPolicy?.allowedIPs || allowedIPs, endpoint: endpoint.replace(/\/+$/, ''),
+    request: { url: `${cp.base}/v2/organizations/${cp.orgId}/languageModelApiKeys`, body: payload },
+  };
+}
+
+// cpDeleteKey: DELETE /v2/organizations/<org>/languageModelApiKeys/<key id>.
+async function cpDeleteKey(body) {
+  const cp = await cpTarget(body);
+  const keyId = String(body.keyId || '').trim();
+  if (!/^[0-9a-fA-F-]{8,64}$/.test(keyId)) throw new Error('no key id to delete');
+  const res = await request('DELETE', `${cp.base}/v2/organizations/${cp.orgId}/languageModelApiKeys/${keyId}`, { headers: cp.headers, timeout: 30000, verifyTls: cp.verifyTls });
+  if (res.status >= 300 && res.status !== 404) throw new Error(`deleting the API key: HTTP ${res.status}: ${cpError(res)}`);
+  return { keyId, deleted: true, gone: res.status === 404 };
+}
+
 // customConnect: what a client sees on that gateway: its version (GET /v1/info) and the
 // models its key can use (GET /v1/models).
 async function customConnect(body) {
@@ -1030,8 +1115,42 @@ async function batchCleanup(job, step = () => {}) {
     job.files.size && `file(s) ${[...job.files].join(', ')} remain`].filter(Boolean).join('; ');
 }
 
+// stopping: set when the server is shutting down. No new batch starts, and a batch in
+// flight stops at its next checkpoint and cleans up after itself.
+let stopping = false;
+
+// keptFiles: result files a batch call could not read, kept on the gateway with the call
+// that carries their key, so POST /api/playground/file can fetch them again.
+const keptFiles = new Map(); // file id -> { call, name, temp }
+
+// drainBatches: on shutdown. Batch calls in flight are given time to finish the request
+// they are waiting on, register what it created and clean up (they stop at their next
+// checkpoint); then whatever is still registered is cleaned up here. Unread result files
+// made with a temporary key are deleted too, because nobody can read them once that key is
+// revoked; those made with the user's own key are left and named.
 async function drainBatches() {
+  stopping = true;
+  await Promise.race([Promise.allSettled([...activeBatches].map((job) => job.finished)), sleep(45000)]);
   await Promise.allSettled([...activeBatches].map((job) => batchCleanup(job)));
+  for (const [id, kept] of keptFiles) {
+    if (kept.temp) await kept.call('DELETE', `/v1/files/${encodeURIComponent(id)}`, { timeout: 15000 }).catch(() => {});
+    else console.log(`playground: unread ${kept.name} ${id} is still on the gateway; fetch it with GET /v1/files/${id}/content and the API key that made it`);
+  }
+  keptFiles.clear();
+}
+
+// fetchKeptFile: read a kept result file again with the key that created it. Once it has
+// been read it is deleted from the gateway.
+async function fetchKeptFile(body) {
+  const id = String(body.id || '');
+  const kept = keptFiles.get(id);
+  if (!kept) throw Object.assign(new Error('that file is not kept by this server any more (already fetched, or the server was restarted)'), { status: 404 });
+  const res = await kept.call('GET', `/v1/files/${encodeURIComponent(id)}/content`);
+  if (res.status !== 200) throw Object.assign(new Error(`GET /v1/files/${id}/content: HTTP ${res.status}; the file is still kept, try again`), { status: 502 });
+  const del = await kept.call('DELETE', `/v1/files/${encodeURIComponent(id)}`, { timeout: 15000 }).catch((e) => ({ status: 0, text: e.message }));
+  const deleted = DELETE_DONE.includes(del.status);
+  if (deleted) keptFiles.delete(id);
+  return { id, name: kept.name, deleted, text: res.text.length > 200000 ? `${res.text.slice(0, 200000)}…` : res.text };
 }
 
 // playgroundBatch: one prompt per line becomes a batch through the OpenAI Files and Batches
@@ -1039,6 +1158,7 @@ async function drainBatches() {
 // read the output and error files, then delete the files. A batch that has not finished
 // after three minutes is cancelled. The result shows every step and each line's answer.
 async function playgroundBatch(body) {
+  if (stopping) throw new Error('the server is stopping');
   const p = await preparePlayground(body);
   const prompts = String(body.prompt).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   if (prompts.length > BATCH_MAX_LINES) {
@@ -1072,7 +1192,15 @@ async function playgroundBatch(body) {
   };
   // What this call owns on the gateway. Registered so that stopping the server cleans it up.
   const job = { batchId: '', files: new Set(), call };
+  let release;
+  job.finished = new Promise((resolve) => { release = resolve; }); // settles when this call is over
   activeBatches.add(job);
+  const temp = p.source.startsWith('temporary key'); // revoked when the server stops
+  // live: a checkpoint after every step that created something. During shutdown the call
+  // stops here, with the new id already registered, and its catch block cleans up.
+  const live = () => {
+    if (stopping) throw new Error('the server is stopping, so the batch was abandoned');
+  };
   const cleanup = () => batchCleanup(job, step);
   const leftText = (left) => (left ? ` Cleanup is incomplete: ${left}.` : '');
   const createPayload = (fileId) => ({ input_file_id: fileId, endpoint: lineUrl, completion_window: '24h', metadata: { source: 'aigw-doctor-playground' } });
@@ -1099,6 +1227,7 @@ async function playgroundBatch(body) {
     const fileId = parse(up)?.id;
     if (up.status >= 300 || !fileId) return result(up, up.text, { content: '', error: `upload (POST /v1/files) failed: ${parse(up)?.error?.message || up.text.slice(0, 300) || `HTTP ${up.status}`}` });
     job.files.add(fileId);
+    live();
 
     // 2. create
     const make = step('create', await call('POST', '/v1/batches', { body: JSON.stringify(createPayload(fileId)), headers: { 'Content-Type': 'application/json' } }));
@@ -1108,11 +1237,13 @@ async function playgroundBatch(body) {
       return result(make, make.text, { content: '', error: `create (POST /v1/batches) failed: ${batch?.error?.message || make.text.slice(0, 300) || `HTTP ${make.status}`}.${leftText(left)}` });
     }
     job.batchId = batch.id;
+    live();
 
     // 3. wait
     let last = make;
     while (!BATCH_END.includes(batch.status) && Date.now() - started < BATCH_WAIT_MS) {
       await sleep(Math.min(3000, Math.max(BATCH_WAIT_MS - (Date.now() - started), 0)));
+      live();
       last = await call('GET', `/v1/batches/${encodeURIComponent(batch.id)}`, { timeout: 30000 });
       const next = parse(last);
       if (last.status !== 200 || !next) break;
@@ -1131,6 +1262,7 @@ async function playgroundBatch(body) {
       });
     }
     job.batchId = ''; // finished: nothing to cancel
+    live();
 
     // 4. results. A result file is read twice at most; one that cannot be read is kept on
     // the gateway (not deleted), so its results can still be fetched.
@@ -1145,8 +1277,10 @@ async function playgroundBatch(body) {
         why = res.status ? `HTTP ${res.status}` : res.text;
         if (attempt === 0) await sleep(1000);
       }
+      // Not deleted: kept with this call's key, so it can be fetched again from the page.
       job.files.delete(id);
-      unread.push(`the ${name} ${id} (${why})`);
+      keptFiles.set(id, { call, name, temp });
+      unread.push({ id, name, why });
       return [];
     };
     const output = await read(batch.output_file_id, 'output file');
@@ -1168,7 +1302,9 @@ async function playgroundBatch(body) {
       batch.guardrail_blocked && `${batch.guardrail_blocked} blocked`, batch.guardrail_masked && `${batch.guardrail_masked} masked`].filter(Boolean).join(' · ');
     const ok = batch.status === 'completed' && !unread.length;
     const error = unread.length
-      ? `the batch ${batch.status}, but ${unread.join(' and ')} could not be read. It was not deleted: fetch it again with GET /v1/files/<id>/content and the same API key.${leftText(left)}`
+      ? `the batch ${batch.status}, but ${unread.map((u) => `the ${u.name} ${u.id} (${u.why})`).join(' and ')} could not be read. It was kept on the gateway: use "Fetch again" below. ${temp
+        ? 'It was made with a temporary key, which only this server holds and which is revoked when the server stops, so the file is deleted then.'
+        : 'You can also fetch it yourself with GET /v1/files/<id>/content and the same API key.'}${leftText(left)}`
       : batch.status !== 'completed'
         ? `the batch ${batch.status}: ${(batch.errors?.data || []).map((e) => e.message).join('; ') || 'see the raw response'}.${leftText(left)}`
         : '';
@@ -1176,7 +1312,7 @@ async function playgroundBatch(body) {
       content: `${batch.status}${facts ? ` · ${facts}` : ''}\n${content}${ok && left ? `\n${leftText(left).trim()}` : ''}`,
       usage: batch.usage || null,
       error,
-      batch: { batchStatus: batch.status },
+      batch: { batchStatus: batch.status, unread: unread.map((u) => ({ id: u.id, name: u.name })) },
     });
   } catch (err) {
     // A network error or timeout part-way: still cancel the batch and delete the files.
@@ -1184,6 +1320,7 @@ async function playgroundBatch(body) {
     throw new Error(`batch: ${err.message}.${leftText(left)}`);
   } finally {
     if (!job.batchId && !job.files.size) activeBatches.delete(job);
+    release();
   }
 }
 
@@ -1726,6 +1863,16 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (req.method === 'POST' && (url.pathname === '/api/cp/apikey' || url.pathname === '/api/cp/apikey/delete')) {
+    try {
+      const body = await readJson(req);
+      return send(res, 200, url.pathname.endsWith('/delete') ? await cpDeleteKey(body) : await cpCreateKey(body));
+    } catch (err) {
+      return send(res, 400, { error: /certificate/i.test(err.message)
+        ? `${err.message} (untick "Verify TLS certificate" for a sandbox control plane)` : err.message });
+    }
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/custom/connect') {
     try {
       return send(res, 200, await customConnect(await readJson(req)));
@@ -1749,6 +1896,14 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
       if (res.headersSent) return res.end(`${JSON.stringify({ error: err.message })}\n`);
       return send(res, 400, { error: err.message });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/playground/file') {
+    try {
+      return send(res, 200, await fetchKeptFile(await readJson(req)));
+    } catch (err) {
+      return send(res, err.status || 400, { error: err.message });
     }
   }
 
@@ -1828,6 +1983,7 @@ loadHistory();
 // their keys still work, then delete the playground's temporary API keys.
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, async () => {
+    if (stopping) process.exit(1); // a second signal: do not wait for the cleanup
     for (const t of terminals.values()) closeTerminal(t);
     await drainBatches();
     await deletePlayKeys();

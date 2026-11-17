@@ -248,6 +248,54 @@
                 <input name="customKey" type="password" autocomplete="off">
               </label>
             </div>
+            <details id="cp-key">
+              <summary>Create an API key (Capella control plane)</summary>
+              <div class="custom-row">
+                <label>Control plane URL, with the organization
+                  <input name="keyCpUrl" placeholder="https://api.cloud.couchbase.com/v2/organizations/<org id>">
+                </label>
+                <label>Region of the models
+                  <input name="keyRegion" placeholder="us-east-2">
+                </label>
+              </div>
+              <div class="custom-row">
+                <label>Capella login (email)
+                  <input name="keyCpUser" autocomplete="off">
+                </label>
+                <label>Password
+                  <input name="keyCpPassword" type="password" autocomplete="off">
+                </label>
+              </div>
+              <label>or a session JWT (when you sign in with SSO)
+                <input name="keyJwt" type="password" autocomplete="off" placeholder="the JWT your browser session uses">
+              </label>
+              <div class="custom-row">
+                <label>Key name
+                  <input name="keyName">
+                </label>
+                <label>Expires after
+                  <select name="keyExpiry">
+                    <option value="3600">1 hour</option>
+                    <option value="86400" selected>1 day</option>
+                    <option value="864000">10 days</option>
+                    <option value="2592000">30 days</option>
+                    <option value="15552000">180 days</option>
+                  </select>
+                </label>
+              </div>
+              <label>Allowed IPs (addresses or CIDR ranges, comma-separated)
+                <input name="keyAllowedIps" value="0.0.0.0/0">
+              </label>
+              <div class="custom-actions">
+                <button type="button" class="small-btn" id="cp-key-create"
+                  title="POST /v2/organizations/<org id>/languageModelApiKeys">Create key</button>
+                <button type="button" class="small-btn" id="cp-key-delete" hidden>Delete this key</button>
+                <span id="cp-key-msg" class="muted small"></span>
+              </div>
+              <p class="hint">The key gets access to every model in the region and is put into the API key field above. It is
+                shown only once by Capella and is kept in this page only; the password and JWT are not saved either.
+                When the organization has a model in that region, its gateway endpoint fills an empty Gateway URL.</p>
+            </details>
             <div class="custom-actions">
               <label class="check-inline"><input type="checkbox" name="verifyTls" checked> Verify TLS certificate</label>
               <button type="button" class="small-btn" id="custom-connect" title="GET /v1/info and /v1/models with this key">Connect</button>
