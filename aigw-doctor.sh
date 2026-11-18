@@ -1621,8 +1621,8 @@ create_api_key() {
 	fi
 }
 
-# saved_capella_key ORG: use a saved Capella key for this organization and region that has
-# at least five minutes left. Keys live in KEYS_DIR as <name>.key (the key) and <name>.json
+# saved_capella_key ORG: use a saved Capella key for this control plane, organization and
+# region that has at least five minutes left. Keys live in KEYS_DIR as <name>.key (the key) and <name>.json
 # (id, expiry, organization, region), the same files the UI writes.
 CAPELLA_KEY_FILE=""
 saved_capella_key() {
@@ -1630,8 +1630,8 @@ saved_capella_key() {
 	now=$(date +%s)
 	for meta in "$KEYS_DIR"/*.json; do
 		[[ -f "$meta" && -f "${meta%.json}.key" ]] || continue
-		left=$(jq -r --arg o "$org" --arg r "$REGION" --argjson now "$now" \
-			'select(.orgId == $o and .region == $r and ((.expiresAt // 0) - $now) > 300) | (.expiresAt - $now)' "$meta" 2>/dev/null)
+		left=$(jq -r --arg o "$org" --arg r "$REGION" --arg u "${CP_URL%/}" --argjson now "$now" \
+			'select(.orgId == $o and .region == $r and ((.cpUrl // "") | sub("/+$"; "")) == $u and ((.expiresAt // 0) - $now) > 300) | (.expiresAt - $now)' "$meta" 2>/dev/null)
 		[[ "$left" =~ ^[0-9]+$ ]] || continue
 		name=$(basename "${meta%.json}")
 		API_KEY=$(tr -d '[:space:]' <"${meta%.json}.key")
