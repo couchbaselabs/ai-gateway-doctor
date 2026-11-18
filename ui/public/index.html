@@ -183,8 +183,17 @@
           </details>
           <div class="segmented" role="radiogroup" aria-label="API key">
             <label><input type="radio" name="keySource" value="create" checked><span>Temporary key</span></label>
+            <label><input type="radio" name="keySource" value="capella"><span>Capella key</span></label>
             <label><input type="radio" name="keySource" value="file"><span>Key file</span></label>
             <label><input type="radio" name="keySource" value="paste"><span>Paste key</span></label>
+          </div>
+          <div class="key-capella" hidden>
+            <label>Session JWT (only when you sign in to Capella with SSO)
+              <input name="cpJwt" type="password" autocomplete="off" placeholder="empty: log in with the Capella login and password above">
+            </label>
+            <p class="hint">Creates a model API key through the Capella control plane, with the Control plane URL and Capella
+              login above. It needs no gateway admin secret and no AWS access, so it also works for production. The key
+              is saved in <code>~/.aigw-doctor/keys</code> and reused for this organization and region until it expires (a day).</p>
           </div>
           <label class="key-file" hidden>API key file
             <input name="apiKeyFile" placeholder="~/.aigw-key">
@@ -249,6 +258,64 @@
               </label>
             </div>
             <div class="custom-actions">
+              <label class="saved-key">Saved key
+                <select name="savedKey"><option value="">none: use the API key field</option></select>
+              </label>
+              <button type="button" class="small-btn" id="saved-key-forget" hidden
+                title="Removes the key's files from this machine. The key stays valid in Capella until it expires or is deleted there.">Forget</button>
+              <span id="saved-key-note" class="muted small"></span>
+            </div>
+            <details id="cp-key">
+              <summary>Create an API key (Capella control plane)</summary>
+              <div class="custom-row">
+                <label>Control plane URL, with the organization
+                  <input name="keyCpUrl" placeholder="https://api.cloud.couchbase.com/v2/organizations/<org id>">
+                </label>
+                <label>Region of the models
+                  <input name="keyRegion" placeholder="us-east-2">
+                </label>
+              </div>
+              <div class="custom-row">
+                <label>Capella login (email)
+                  <input name="keyCpUser" autocomplete="off">
+                </label>
+                <label>Password
+                  <input name="keyCpPassword" type="password" autocomplete="off">
+                </label>
+              </div>
+              <label>or a session JWT (when you sign in with SSO)
+                <input name="keyJwt" type="password" autocomplete="off" placeholder="the JWT your browser session uses">
+              </label>
+              <div class="custom-row">
+                <label>Key name
+                  <input name="keyName">
+                </label>
+                <label>Expires after
+                  <select name="keyExpiry">
+                    <option value="3600">1 hour</option>
+                    <option value="86400" selected>1 day</option>
+                    <option value="864000">10 days</option>
+                    <option value="2592000">30 days</option>
+                    <option value="15552000">180 days</option>
+                  </select>
+                </label>
+              </div>
+              <label>Allowed IPs (addresses or CIDR ranges, comma-separated)
+                <input name="keyAllowedIps" value="0.0.0.0/0">
+              </label>
+              <label class="check-inline"><input type="checkbox" name="keySave" checked>
+                Save the key on this machine (<code>~/.aigw-doctor/keys</code>, readable only by you), to pick it again later</label>
+              <div class="custom-actions">
+                <button type="button" class="small-btn" id="cp-key-create"
+                  title="POST /v2/organizations/<org id>/languageModelApiKeys">Create key</button>
+                <button type="button" class="small-btn" id="cp-key-delete" hidden>Delete this key</button>
+                <span id="cp-key-msg" class="muted small"></span>
+              </div>
+              <p class="hint">The key gets access to every model in the region and is put into the API key field above. Capella
+                shows it only once: without saving, it lives in this page only. The password and JWT are never saved.
+                When the organization has a model in that region, its gateway endpoint fills an empty Gateway URL.</p>
+            </details>
+            <div class="custom-actions">
               <label class="check-inline"><input type="checkbox" name="verifyTls" checked> Verify TLS certificate</label>
               <button type="button" class="small-btn" id="custom-connect" title="GET /v1/info and /v1/models with this key">Connect</button>
               <span id="custom-info" class="muted small"></span>
@@ -262,9 +329,12 @@
                 <option value="__other">Other (type a name)…</option>
               </select>
               <input name="customModel" placeholder="model name" hidden>
-              <select name="requestType" class="custom-only" hidden title="The endpoint to call">
+              <select name="requestType" title="The endpoint to call">
+                <option value="auto">Chat or embeddings (by model)</option>
                 <option value="chat">Chat completions</option>
                 <option value="embeddings">Embeddings</option>
+                <option value="moderations">Moderations (/v1/moderations)</option>
+                <option value="batch">Batch (/v1/files + /v1/batches)</option>
               </select>
             </label>
             <label>Cache
@@ -290,11 +360,35 @@
             <summary>System prompt</summary>
             <textarea name="system" rows="2" placeholder="Optional"></textarea>
           </details>
+          <details id="play-headers">
+            <summary>Request headers (guardrails, deployment, more)</summary>
+            <label class="check-inline"><input type="checkbox" name="suppressRequestGuardrails">
+              Skip the prompt's guardrail check: <code>X-cb-suppress-request-guardrails: true</code></label>
+            <label class="check-inline"><input type="checkbox" name="suppressRequestJailbreak">
+              Skip the prompt's jailbreak check: <code>X-cb-suppress-request-jailbreak: true</code></label>
+            <label class="check-inline"><input type="checkbox" name="suppressResponseGuardrails">
+              Skip the answer's guardrail check: <code>X-cb-suppress-response-guardrails: true</code></label>
+            <label>Deployment id: <code>X-cb-model-ref</code>
+              <input name="modelRef" placeholder="empty: the model's own id for moderations and batch uploads">
+            </label>
+            <label>Custom metric labels: <code>X-cb-metric-label-&lt;name&gt;</code>
+              <input name="metricLabels" placeholder="workflowId=invoice-triage, appId=billing-portal, teamId=finance">
+            </label>
+            <p class="hint" id="metric-labels-hint">One <code>name=value</code> per label, separated by commas. The gateway adds
+              them to its Prometheus metrics for chat and embeddings requests, for the names on its allowlist
+              (<code>metricsCustomLabels</code>; by default workflowId, appId, teamId, tenantId, sessionId) and ignores other names.</p>
+            <label>Additional headers, one per line (only <code>X-cb-*</code>)
+              <textarea name="extraHeaders" rows="2" placeholder="X-cb-guardrail-response: inline"></textarea>
+            </label>
+            <p class="hint">The suppress headers apply to chat and embeddings; batch lines carry no headers, so a batch is
+              always checked. <code>X-cb-guardrail-response</code> (<code>error</code> or <code>inline</code>) chooses how a
+              batch reports a blocked input.</p>
+          </details>
           <label class="check-inline"><input type="checkbox" name="stream">
             Stream: send <code>"stream": true</code> and show the answer as it arrives (chat only)</label>
           <label class="check-inline"><input type="checkbox" name="debug">
             Debug: send <code>X-cb-debug: true</code> (the gateway adds its <code>X-cb-*</code> debug headers to the response)</label>
-          <textarea name="prompt" rows="4" placeholder="Ask something… (Cmd/Ctrl+Enter sends)"></textarea>
+          <textarea name="prompt" rows="4" placeholder="Ask something… (Cmd/Ctrl+Enter sends). Batch: one request per line, up to 20."></textarea>
           <div class="actions">
             <button type="submit" id="play-send" class="cta"><span>Send</span><span class="cta-arrow" aria-hidden="true">›</span></button>
             <button type="button" id="play-again" disabled title="Send the last request again, e.g. to see a cache HIT">Send again</button>

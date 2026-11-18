@@ -70,14 +70,25 @@ Checks why the semantic cache stopped working, typically because the cache Couch
 
 Output is one `PASS`/`WARN`/`FAIL` line per check, followed by a result count. Each `FAIL` or `WARN` is followed by `HINT` lines on how to fix it, such as the command to run, the setting to change or the likely cause. The UI shows them under the check. `--verbose` adds the step headers, every command and remote script, and the listings (ASGs, instances, `df`, nodes). The fix commands are always shown.
 
-The API key for step 7 can come from three places:
+The API key for step 7 can come from four places:
 - `--api-key-file FILE`
 - the `AIGW_API_KEY` environment variable
-- `--create-api-key`
+- `--create-api-key`: a temporary key made with the gateway's admin secret (needs AWS access)
+- `--capella-api-key`: a model API key made through the Capella control plane (needs only your Capella sign-in)
 
 With `--create-api-key`, the script reads the gateway admin credential from Secrets Manager (the `adminConfig.adminKey` secret). It uses that to create a temporary key through `POST /v1/apikeys`. The key expires after an hour and is deleted with `DELETE /v1/apikeys/<keyId>` when the run ends, including on Ctrl-C. To keep it instead, add `--save-api-key FILE`, which writes it with mode 600.
 
+With `--capella-api-key`, the script asks the Capella control plane for a key (`POST /v2/organizations/<org id>/languageModelApiKeys`) that can use every model in `--region`. Use it where you cannot read the gateway's admin secret, such as production: together with `--inference-only` it needs no AWS credentials and no AWS CLI.
+- **Sign-in:** `--cp-user EMAIL` with the password from `CP_PASSWORD` or a prompt, or a session JWT in `CP_JWT` when you sign in with SSO.
+- **Organization:** from `--cp-url https://api.<env>.<domain>/v2/organizations/<org id>`, or `--org-id`.
+- **Saved and reused:** the key is saved in `~/.aigw-doctor/keys` (`--keys-dir`, or `AIGW_DOCTOR_KEYS_DIR`) as `<name>.key` (the key) and `<name>.json` (id, expiry, organization, region), readable only by you. The next run for the same organization and region reuses it until five minutes before it expires, then creates a new one. `--key-expiry SECS` sets the lifetime of a new key (default a day).
+- **Not deleted:** unlike a temporary key, a Capella key stays valid until it expires. Delete it in the Capella console (or with the UI's **Delete this key**) and remove its two files to drop it earlier.
+
 ```bash
+# Production: models and cache hits only, no AWS, a Capella key that is saved and reused
+./aigw-doctor.sh -c config.json --region us-east-2 --check --inference-only --capella-api-key \
+  --cp-url https://api.cloud.couchbase.com/v2/organizations/<org id> --cp-user you@example.com
+
 # Show what would run
 ./aigw-doctor.sh -c config.json --region us-east-2 --tenant-id <org-id> --create-api-key
 
@@ -190,6 +201,7 @@ On the first start without a `.env`, the server creates one from `.env.example` 
   - **Left:** the sandboxes, with the status and counts of each one's last run.
   - **Middle:** the run form. It is filled from `.env`, then your edits, which are kept per sandbox in the browser. **Reset to .env** discards your edits.
   - **Save to .env:** writes your changes back as that sandbox's `<NAME>_*` keys, including a password or API key you typed. Existing lines are updated in place, a cleared field removes its line, and the previous file is kept as `.env.bak`. Values are checked like run options, so a save can't add other lines.
+  - **API key: Capella key:** creates a model API key through the Capella control plane with the form's Control plane URL and Capella login, or a session JWT for SSO. It needs no gateway admin secret and no AWS access, so it works for production too. The key is saved in `~/.aigw-doctor/keys` and reused for the organization and region until it expires. Runs, **Check version** and the Playground all use it.
   - **Optional probes:** the checkboxes under Models run the doctor with `--probe-guardrails`, `--probe-rate-limit` and `--probe-batch`. They are remembered per sandbox in the browser and are off until you tick them; **Reset to .env** clears them.
   - **Config tab:** shows a Keystone 2 section when the config uses it: whether rate limits and spend caps are enforced, the region spend cap and spend store, and each model's rate limit, spend cap, rate card, Bedrock guardrail and Bedrock batch bucket.
   - **Right:** the results, with one card per step and a PASS/WARN/FAIL line for each check. The commands and output are folded underneath, and fix commands are shown expanded. Step 7 lists every model request with its question, answer, `X-Cache`, HTTP status and latency. **Problems only** hides the passing checks, **Raw output** shows the doctor's text, and **Clear output** empties the window before the next run (saved runs stay in the **Run** list).
@@ -228,10 +240,25 @@ On the first start without a `.env`, the server creates one from `.env.example` 
   - **API key:** follows the form's choice. A temporary key is created once per sandbox, reused for up to an hour, and deleted when the server stops.
   - **Custom endpoint:** switch the target to **Custom endpoint** to check any environment (dev, stage or prod) the way a client does, with just the gateway URL and an API key. No sandbox, config or AWS is needed.
     - **Connect:** shows the gateway's version, build and commit from `GET /v1/info`, and lists every model the key can use from `GET /v1/models` in a dropdown, with their status. **Other (type a name)…** takes a model that isn't listed.
-    - **Request type:** pick **Chat completions** or **Embeddings**; it is guessed from the model name.
+    - **Request type:** pick **Chat completions** or **Embeddings** (guessed from the model name), **Moderations** or **Batch**.
     - **Detect cache:** a client can't read a model's cache settings, so this sends one tiny chat request per cache type (1 output token, `X-cb-debug: true`, a unique prompt). It reads `X-cb-cache-enabled` from each response, falling back to the presence of `X-Cache` on gateways without debug headers. The cache options then show which types are on, with the semantic threshold and embedding model. It runs only when clicked, and each check leaves a cache entry.
+    - **Create an API key:** makes a model API key through the Capella control plane (`POST /v2/organizations/<org id>/languageModelApiKeys`), so you need no existing key and no AWS access.
+      - **You give:** the control plane URL with the organization (for production `https://api.cloud.couchbase.com/v2/organizations/<org id>`), the region of the models, a key name, an expiry (1 hour to 180 days) and the allowed IPs (default `0.0.0.0/0`).
+      - **Sign-in:** your Capella email and password, or a session JWT when you sign in with SSO.
+      - **Result:** the key has access to every model in the region and is put into the API key field. When the organization has a model in that region, its gateway endpoint fills an empty Gateway URL.
+      - **Delete this key** removes the key you just created (`DELETE …/languageModelApiKeys/<key id>`).
+      - **Saved keys:** with **Save the key on this machine** ticked (the default), the key is written to `~/.aigw-doctor/keys`, readable only by you. The **Saved key** list above then offers it again: pick one and leave the API key field empty. The server reads the key from the file, so it does not pass through the page. **Forget** removes the files from this machine; the key stays valid in Capella.
+      - **Not saved:** the password and the JWT stay in the page. The URL, region and email are remembered in the browser.
     - **TLS:** certificates are verified. Untick **Verify TLS certificate** for a self-signed gateway.
     - **Key:** the API key stays in the page and is never saved. The URL is remembered.
+  - **Request type:** next to the model. A sandbox picks chat or embeddings from the model's kind; a custom endpoint lets you choose. Both can also send:
+    - **Moderations:** `POST /v1/moderations` with the prompt as `input`. The answer shows flagged or not flagged, with the categories that fired. For a sandbox model the request carries `X-cb-model-ref: <the model's id>`, which is how a Bedrock deployment's guardrail is named.
+    - **Batch:** each line of the prompt becomes one request (up to 20, so the batch runs right away and not as a native Bedrock batch job). The server uploads the file (`POST /v1/files`), creates the batch (`POST /v1/batches`), waits up to three minutes, reads the output and error files, and deletes the files. The entry shows every step, each line's answer or error, the route and billing rate, the batch file, and the curl commands for the same calls. A batch still running after three minutes is cancelled. Cleanup is checked: a cancel or delete the gateway does not confirm is tried again and then reported with the ids left behind, also after a network error part-way and when the UI server is stopped during a batch. A result file that cannot be read is kept on the gateway, not deleted; the entry names it and has a **Fetch again** button, which reads it through the server with the key that made it and then deletes it. When the server stops, a batch in flight finishes the request it is waiting on, then cancels and deletes what it created; kept files made with a temporary key are deleted, since nobody can read them once that key is revoked.
+  - **Request headers:** a section under the system prompt.
+    - Three checkboxes send `X-cb-suppress-request-guardrails`, `X-cb-suppress-request-jailbreak` and `X-cb-suppress-response-guardrails` with the value `true`, to see what a safety check changes. They apply to chat and embeddings; batch lines carry no headers.
+    - **Deployment id** sends `X-cb-model-ref`.
+    - **Custom metric labels** takes `name=value` pairs separated by commas, for example `workflowId=invoice-triage, appId=billing-portal`, and sends each as `X-cb-metric-label-<name>`. The gateway adds them to its Prometheus metrics for chat and embeddings requests, for the names on its allowlist (`metricsCustomLabels` in the gateway config; by default workflowId, appId, teamId, tenantId and sessionId), and ignores other names. The Config tab shows the allowlist when the config sets one.
+    - **Additional headers** takes one `X-cb-<name>: value` per line, for example `X-cb-guardrail-response: inline` on a batch or `X-cb-cache-threshold: 0.8`. Other header names are refused, so the form cannot replace `Authorization`.
   - **Shortcuts:** `?tab=playground` opens the tab directly, and Cmd/Ctrl+Enter sends.
 - **Terminals tab:** opens a shell on the sandbox's AI Gateway or Couchbase node inside the page, for checking disks and logs or restarting services by hand. Several sessions can be open at once, each with its own tab; up to 6 are allowed. They survive a page reload, and all of them close when the server stops.
   - **How it connects:** with `aws ssm start-session` and your AWS credentials, so no SSH keys are needed (it requires the Session Manager plugin). It uses SSH instead when `.env` sets `<NAME>_AIGW_SSH` / `<NAME>_CB_SSH` for that node, with `SSH_KEY` if set. The tab title shows which one is in use.

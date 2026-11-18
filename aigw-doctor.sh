@@ -91,6 +91,16 @@
 #                          credential (adminConfig.adminKey in Secrets Manager); it expires
 #                          in an hour and is deleted when the run ends
 #   --save-api-key FILE    with --create-api-key: write the key to FILE (mode 600) and keep it
+#   --capella-api-key      use a model API key made through the Capella control plane
+#                          (POST /v2/organizations/<org>/languageModelApiKeys); needs no AWS
+#                          access. A saved key for the same organization and region is reused
+#                          until it expires; otherwise one is created and saved. Sign in with
+#                          --cp-user (password from CP_PASSWORD or a prompt), or set CP_JWT to
+#                          a session JWT (for SSO logins). Needs --cp-url with the organization
+#   --keys-dir DIR         where Capella keys are saved, one <name>.key (the key) and
+#                          <name>.json (id, expiry, region) each, mode 600
+#                          (default: $AIGW_DOCTOR_KEYS_DIR or ~/.aigw-doctor/keys)
+#   --key-expiry SECS      lifetime of a key --capella-api-key creates (default: 86400, a day)
 #   --models LIST          comma-separated modelName or id values to test (default: all)
 #   --skip-inference       do not send inference requests
 #   --probe-guardrails     also send each chat model with jailbreak detection a mild
@@ -136,6 +146,9 @@ CP_URL=""
 ORG_ID=""
 API_KEY_FILE=""
 CREATE_KEY=false
+CAPELLA_KEY=false
+KEYS_DIR="${AIGW_DOCTOR_KEYS_DIR:-$HOME/.aigw-doctor/keys}"
+KEY_EXPIRY=86400
 SAVE_KEY_FILE=""
 MODELS_FILTER=""
 SKIP_INFERENCE=false
@@ -180,6 +193,9 @@ while [[ $# -gt 0 ]]; do
 	--api-key-file) API_KEY_FILE="$2"; shift ;;
 	--create-api-key) CREATE_KEY=true ;;
 	--save-api-key) SAVE_KEY_FILE="$2"; shift ;;
+	--capella-api-key) CAPELLA_KEY=true ;;
+	--keys-dir) KEYS_DIR="$2"; shift ;;
+	--key-expiry) KEY_EXPIRY="$2"; shift ;;
 	--models) MODELS_FILTER="$2"; shift ;;
 	--skip-inference) SKIP_INFERENCE=true ;;
 	--probe-guardrails) PROBE_GUARDRAILS=true ;;
@@ -203,6 +219,12 @@ die() { echo "error: $*" >&2; exit 1; }
 [[ -z "$API_KEY_FILE" || -f "$API_KEY_FILE" ]] || die "API key file not found: $API_KEY_FILE"
 [[ -z "$SAVE_KEY_FILE" ]] || $CREATE_KEY || die "--save-api-key needs --create-api-key"
 [[ -z "$API_KEY_FILE" ]] || ! $CREATE_KEY || die "use either --api-key-file or --create-api-key"
+! $CAPELLA_KEY || { ! $CREATE_KEY && [[ -z "$API_KEY_FILE" ]]; } || die "use only one of --capella-api-key, --create-api-key and --api-key-file"
+[[ "$KEY_EXPIRY" =~ ^[0-9]+$ && "$KEY_EXPIRY" -ge 60 && "$KEY_EXPIRY" -le 31622400 ]] || die "--key-expiry must be a number of seconds, from 60 to a year"
+# A control plane session comes from a login (--cp-user) or from a JWT in CP_JWT.
+CP_AUTH=false
+[[ -n "$CP_USER" || -n "${CP_JWT:-}" ]] && CP_AUTH=true
+! $CAPELLA_KEY || $CP_AUTH || die "--capella-api-key needs a Capella sign-in: --cp-user EMAIL, or a session JWT in CP_JWT"
 ! $INFRA && $SKIP_INFERENCE && die "--inference-only and --skip-inference leave nothing to run"
 ! $INFRA && [[ "$MODE" == fix ]] && die "--inference-only has nothing to fix; use --check"
 [[ "$BURST_MAX" =~ ^[0-9]+$ && "$BURST_MAX" -ge 2 ]] || die "--burst-max must be a number of requests, 2 or more"
@@ -352,9 +374,23 @@ curl_escape() { local v="${1//\\/\\\\}"; printf '%s' "${v//\"/\\\"}"; }
 basic_config() { printf 'header = "Authorization: Basic %s"\n' "$(printf '%s' "$1" | base64 | tr -d '\n')"; }
 bearer_config() { printf 'header = "Authorization: Bearer %s"\n' "$(curl_escape "$1")"; }
 
-for tool in jq aws curl nc; do
+# The tenant lookup finds the gateway instance, whose public DNS (or user data) leads to the
+# gateway URL. It is not needed when the control plane can be asked directly.
+NEED_LOOKUP=false
+[[ -z "$AIGW_URL" && (-n "$TENANT_ID" || -n "$AIGW_INSTANCE") ]] && ! { $CP_AUTH && [[ -n "$CP_URL" ]]; } && NEED_LOOKUP=true
+# AWS is needed for the infrastructure checks, for --create-api-key (the gateway's admin
+# secret) and for that lookup. Probing the models with your own or a Capella key is not:
+# that works without the AWS CLI and without AWS credentials (e.g. against production).
+NEED_AWS=false
+if $INFRA || $CREATE_KEY || $NEED_LOOKUP; then NEED_AWS=true; fi
+for tool in jq curl; do
 	command -v "$tool" >/dev/null || die "'$tool' is required"
 done
+if $NEED_AWS; then
+	for tool in aws nc; do
+		command -v "$tool" >/dev/null || die "'$tool' is required for the infrastructure checks and --create-api-key (not for --inference-only with --capella-api-key or your own key)"
+	done
+fi
 
 # ---------- 0. AWS credentials ----------
 
@@ -1318,25 +1354,38 @@ resp_init() {
 # step_cp_endpoint: log in to the control plane and read the gateway endpoint that the
 # org's language models in this region are served from. One gateway serves a tenant's
 # region, so every model there carries the same network.endpoint (https://<fqdn>, port 443).
-step_cp_endpoint() {
-	[[ -z "$AIGW_URL" && -n "$CP_USER" ]] || return 0
-	$SKIP_INFERENCE && return 0
-	step "7a. Gateway endpoint from the Capella control plane"
-	local org="${ORG_ID:-$TENANT_ID}" jwt code page last all="[]" endpoints n
+CP_ORG="" CP_SESSION=""
+
+# cp_resolve: the control plane API URL (CP_URL) and the organization (CP_ORG). The URL comes
+# from --cp-url, else from the gateway instance's user data. Returns 1 when either is missing.
+cp_resolve() {
+	CP_ORG="${ORG_ID:-$TENANT_ID}"
 	if [[ -z "$CP_URL" && -n "$AIGW_INSTANCE" ]]; then
 		info "reading the control plane URL (api) from the gateway's user data"
 		CP_URL=$(userdata_field api)
 		[[ -n "$CP_URL" ]] && CP_URL=$(public_cp_url "$CP_URL")
 		info "control plane API: ${CP_URL:-<not found>}"
 	fi
-	allowed check || { CP_URL="${CP_URL:-<cp-url>}"; org="${org:-<org-id>}"; }
+	allowed check || { CP_URL="${CP_URL:-<cp-url>}"; CP_ORG="${CP_ORG:-<org-id>}"; }
 	if [[ -z "$CP_URL" ]]; then
 		fail "control plane: no API URL (pass --cp-url, or --tenant-id to read it from the gateway)"
 		hint "pass --cp-url https://api.<env>.<domain>/v2/organizations/<org id> (the Capella console API URL)"
-		return 0
-	elif [[ -z "$org" ]]; then
+		return 1
+	elif [[ -z "$CP_ORG" ]]; then
 		fail "control plane: no organization id (pass --org-id or --tenant-id)"
 		hint "pass --org-id <org id> (the UUID after /organizations/ in the console URL)"
+		return 1
+	fi
+}
+
+# cp_session: a control plane session JWT in CP_SESSION: the one in CP_JWT, else a login as
+# --cp-user (POST /sessions). Done once per run. Returns 1 when there is no session.
+cp_session() {
+	local code
+	[[ -z "$CP_SESSION" ]] || return 0
+	if [[ -n "${CP_JWT:-}" ]]; then
+		CP_SESSION="${CP_JWT#Bearer }"
+		info "control plane session: the JWT in CP_JWT"
 		return 0
 	fi
 	if allowed check && [[ -z "${CP_PASSWORD:-}" ]]; then
@@ -1347,36 +1396,46 @@ step_cp_endpoint() {
 		fi
 		if [[ -z "${CP_PASSWORD:-}" ]]; then
 			fail "control plane: no password (set CP_PASSWORD or run from a terminal)"
-			hint "export CP_PASSWORD=... (or set it in the UI .env), or run in a terminal to be prompted"
-			return 0
+			hint "export CP_PASSWORD=... (or set it in the UI .env), or run in a terminal to be prompted; with SSO set CP_JWT to a session JWT"
+			return 1
 		fi
 	fi
-
-	{
-		printf '   %s[check] $ curl -sk -X POST %s/sessions -H %s%s\n' "$DIM" "$CP_URL" \
-			"'Authorization: Basic <redacted>'" "$RST"
-		printf '   %s[check] $ curl -sk %s/v2/organizations/%s/languagemodels?page=1\&perPage=100 -H %s%s\n' \
-			"$DIM" "$CP_URL" "$org" "'Authorization: Bearer <session jwt>'" "$RST"
-	} | show check
+	printf '   %s[check] $ curl -sk -X POST %s/sessions -H %s%s\n' "$DIM" "$CP_URL" \
+		"'Authorization: Basic <redacted>'" "$RST" | show check
 	allowed check || return 0
 	resp_init
 	code=$(curl -sk --max-time 30 -K <(basic_config "$CP_USER:$CP_PASSWORD") -o "$RESP_FILE" \
 		-w '%{http_code}' -X POST "$CP_URL/sessions")
-	jwt=$(jq -r '.jwt // empty' "$RESP_FILE" 2>/dev/null)
+	CP_SESSION=$(jq -r '.jwt // empty' "$RESP_FILE" 2>/dev/null)
 	: >"$RESP_FILE"
 	if [[ "$code" == 000 ]]; then
 		fail "control plane: cannot reach $CP_URL (check --cp-url)"
 		hint "check the URL and that your network or VPN can reach the sandbox"
-		return 0
+		return 1
 	elif [[ "$code" == 404 ]]; then
 		fail "control plane: $CP_URL has no /sessions login (not the public API?); pass --cp-url https://api.<env>.<domain>"
-		return 0
-	elif [[ -z "$jwt" ]]; then
+		return 1
+	elif [[ -z "$CP_SESSION" ]]; then
 		fail "control plane: login as $CP_USER failed (HTTP $code)"
-		hint "HTTP 401: wrong password, or the user is not in this sandbox; the API needs a password login, not SSO"
-		return 0
+		hint "HTTP 401: wrong password, or the user is not in this sandbox; the API needs a password login, not SSO (with SSO set CP_JWT to a session JWT)"
+		return 1
 	fi
 	info "logged in to $CP_URL as $CP_USER"
+}
+
+step_cp_endpoint() {
+	[[ -z "$AIGW_URL" ]] && $CP_AUTH || return 0
+	$SKIP_INFERENCE && return 0
+	step "7a. Gateway endpoint from the Capella control plane"
+	local org jwt code page last all="[]" endpoints n
+	cp_resolve || return 0
+	org="$CP_ORG"
+	cp_session || return 0
+	jwt="$CP_SESSION"
+	printf '   %s[check] $ curl -sk %s/v2/organizations/%s/languagemodels?page=1\&perPage=100 -H %s%s\n' \
+		"$DIM" "$CP_URL" "$org" "'Authorization: Bearer <session jwt>'" "$RST" | show check
+	allowed check || return 0
+	resp_init
 
 	page=1 last=1
 	while ((page <= last && page <= 50)); do
@@ -1560,6 +1619,86 @@ create_api_key() {
 	else
 		pass "api key: created temporary key $KEY_ID (expires in 1 hour, deleted at the end of the run)"
 	fi
+}
+
+# saved_capella_key ORG: use a saved Capella key for this organization and region that has
+# at least five minutes left. Keys live in KEYS_DIR as <name>.key (the key) and <name>.json
+# (id, expiry, organization, region), the same files the UI writes.
+CAPELLA_KEY_FILE=""
+saved_capella_key() {
+	local org="$1" meta name now left
+	now=$(date +%s)
+	for meta in "$KEYS_DIR"/*.json; do
+		[[ -f "$meta" && -f "${meta%.json}.key" ]] || continue
+		left=$(jq -r --arg o "$org" --arg r "$REGION" --argjson now "$now" \
+			'select(.orgId == $o and .region == $r and ((.expiresAt // 0) - $now) > 300) | (.expiresAt - $now)' "$meta" 2>/dev/null)
+		[[ "$left" =~ ^[0-9]+$ ]] || continue
+		name=$(basename "${meta%.json}")
+		API_KEY=$(tr -d '[:space:]' <"${meta%.json}.key")
+		[[ -n "$API_KEY" ]] || continue
+		CAPELLA_KEY_FILE="${meta%.json}.key"
+		pass "api key: using the saved Capella key $name ($((left / 3600))h $((left % 3600 / 60))m left)"
+		return 0
+	done
+	return 1
+}
+
+# capella_api_key: a model API key from the Capella control plane, for every model in the
+# region. A saved one is reused; otherwise one is created and saved for the next run.
+capella_api_key() {
+	local name body code key_id expiry now base n=0 reserved=""
+	cp_resolve || return 1
+	allowed check && saved_capella_key "$CP_ORG" && return 0
+	cp_session || return 1
+	name="aigw-doctor-$(date +%Y%m%d-%H%M%S)"
+	# Reserve the name: <name>.key is created exclusively (noclobber), so two runs in the
+	# same second get different names and never write each other's files. The empty file is
+	# not a saved key yet: a key counts only once its <name>.json is there.
+	if allowed check; then
+		base="$name"
+		while [[ $n -le 50 ]]; do
+			[[ $n -gt 0 ]] && name="$base-$n"
+			if (umask 077 && mkdir -p "$KEYS_DIR" && set -o noclobber && : >"$KEYS_DIR/$name.key") 2>/dev/null; then
+				reserved=1
+				break
+			fi
+			[[ -e "$KEYS_DIR/$name.key" ]] || break # the folder cannot be written: the key is not saved
+			n=$((n + 1))
+		done
+	fi
+	body=$(jq -nc --arg n "$name" --arg r "$REGION" --argjson e "$KEY_EXPIRY" '{name: $n,
+		description: "created by aigw-doctor", expiryDuration: $e, region: $r, accessPolicy: {allowedIPs: ["0.0.0.0/0"]}}')
+	printf '   %s[check] $ curl -sk -X POST %s/v2/organizations/%s/languageModelApiKeys -H %s -d %s%s\n' "$DIM" \
+		"$CP_URL" "$CP_ORG" "'Authorization: Bearer <session jwt>'" "$(shellquote "$body")" "$RST" | show check
+	allowed check || return 0
+	code=$(curl -sk --max-time 60 -K <(bearer_config "$CP_SESSION") -H 'Content-Type: application/json' \
+		-o "$RESP_FILE" -w '%{http_code}' -X POST --data "$body" "$CP_URL/v2/organizations/$CP_ORG/languageModelApiKeys")
+	API_KEY=$(jq -r '.apiKey // empty' "$RESP_FILE" 2>/dev/null)
+	if [[ "$code" != 2* || -z "$API_KEY" ]]; then
+		fail "api key: creating a Capella key returned HTTP $code: $(resp_error)"
+		hint "HTTP 401: the session is not valid (wrong login, or an expired CP_JWT); HTTP 403: your Capella role may not create model API keys; HTTP 4xx: check --region and the organization in --cp-url"
+		: >"$RESP_FILE"
+		[[ -n "$reserved" ]] && rm -f "$KEYS_DIR/$name.key"
+		return 1
+	fi
+	key_id=$(jq -r '.keyId // empty' "$RESP_FILE")
+	expiry=$(jq -r '.expiry // empty' "$RESP_FILE")
+	now=$(date +%s)
+	# The key goes into the reserved file; the metadata is written aside and renamed into
+	# place last, so a reader sees the pair complete or not at all.
+	if [[ -n "$reserved" ]] && (umask 077 && printf '%s\n' "$API_KEY" >"$KEYS_DIR/$name.key" &&
+		jq --arg n "$name" --arg o "$CP_ORG" --arg u "$CP_URL" --arg g "$AIGW_URL" --arg r "$REGION" --argjson now "$now" --argjson e "$KEY_EXPIRY" \
+			'{keyId, name: $n, expiry, region: (.region // $r), orgId: $o, cpUrl: $u, endpoint: $g, createdAt: $now,
+				expiresAt: ($now + (.expiryDuration // $e))}' "$RESP_FILE" >"$KEYS_DIR/.$name.json.$$" &&
+		mv "$KEYS_DIR/.$name.json.$$" "$KEYS_DIR/$name.json") 2>/dev/null; then
+		CAPELLA_KEY_FILE="$KEYS_DIR/$name.key"
+		pass "api key: created the Capella key $name ($key_id${expiry:+, expires $expiry}), saved to $KEYS_DIR/$name.key"
+	else
+		[[ -n "$reserved" ]] && rm -f "$KEYS_DIR/$name.key" "$KEYS_DIR/.$name.json.$$"
+		warn "api key: created the Capella key $name ($key_id), but could not save it in $KEYS_DIR"
+		hint "the key works for this run only; check that the folder can be written, or pass --keys-dir DIR"
+	fi
+	: >"$RESP_FILE"
 }
 
 # delete_api_key: revoke the temporary key unless it was saved. Also runs on exit.
@@ -2021,7 +2160,7 @@ gateway_info() {
 		return 1
 	elif [[ "$code" != 200 ]]; then
 		warn "gateway: /v1/info returned HTTP $code: $(resp_error)"
-		hint "HTTP 401: the API key is invalid or expired"
+		hint "HTTP 401: the API key is invalid or expired${CAPELLA_KEY_FILE:+; a saved Capella key that was deleted in Capella is still on disk: remove $CAPELLA_KEY_FILE and its .json to create a new one}"
 		return 0
 	fi
 	v=$(jq -r '.version // empty' "$RESP_FILE")
@@ -2075,7 +2214,7 @@ step_inference() {
 	step "7. Inference: model probes and cache hits"
 	local models model kind std sem threshold dims rpm jb guard ref batch rc limits_on
 	# Without a control plane login, try the instance directly (often blocked by its security group).
-	[[ -z "$AIGW_URL" && -z "$CP_USER" && -n "$AIGW_PUBLIC" ]] && AIGW_URL="https://$AIGW_PUBLIC:8081"
+	[[ -z "$AIGW_URL" ]] && ! $CP_AUTH && [[ -n "$AIGW_PUBLIC" ]] && AIGW_URL="https://$AIGW_PUBLIC:8081"
 	allowed check || AIGW_URL="${AIGW_URL:-https://<ai-gateway public dns>:8081}"
 
 	# "modelName kind standard semantic threshold dims rpm jailbreak guard ref batch" for
@@ -2107,7 +2246,7 @@ step_inference() {
 	elif [[ -z "$models" ]]; then
 		skip "inference: no models in the config${MODELS_FILTER:+ matching --models}"
 		return 0
-	elif [[ -z "$AIGW_URL" && -n "$CP_USER" ]]; then
+	elif [[ -z "$AIGW_URL" ]] && $CP_AUTH; then
 		skip "inference: no gateway endpoint (see the control plane result above)"
 		return 0
 	elif [[ -z "$AIGW_URL" ]]; then
@@ -2121,8 +2260,10 @@ step_inference() {
 	[[ -n "$API_KEY_FILE" ]] && API_KEY=$(tr -d '[:space:]' <"$API_KEY_FILE")
 	if $CREATE_KEY; then
 		create_api_key || return 0
+	elif $CAPELLA_KEY; then
+		capella_api_key || return 0
 	elif [[ -z "$API_KEY" && "$MODE" != dry-run ]]; then
-		skip "inference: pass --api-key-file FILE, set AIGW_API_KEY, or use --create-api-key"
+		skip "inference: pass --api-key-file FILE, set AIGW_API_KEY, or use --create-api-key or --capella-api-key"
 		return 0
 	fi
 
@@ -2377,13 +2518,7 @@ elif ! $VERBOSE; then
 	note "${DIM}--verbose shows commands and details${RST}"
 fi
 
-# AWS is needed for the infrastructure checks, for --create-api-key (admin secret), and
-# to find the gateway URL from the tenant's instances.
-# The tenant lookup finds the gateway instance, whose public DNS (or, with --cp-user, whose
-# user data) leads to the gateway URL.
-NEED_LOOKUP=false
-[[ -z "$AIGW_URL" && (-n "$TENANT_ID" || -n "$AIGW_INSTANCE") ]] && NEED_LOOKUP=true
-if $INFRA || $CREATE_KEY || $NEED_LOOKUP; then
+if $NEED_AWS; then
 	step_aws
 fi
 step_config

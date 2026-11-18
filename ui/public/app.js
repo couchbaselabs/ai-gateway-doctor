@@ -237,7 +237,8 @@ function renderConfig(c) {
       kv('DB credential (Secrets Manager name)', c.store.dbCredKey),
       kv('Admin credential (Secrets Manager name)', c.store.adminKey),
       kv('Service', c.serviceName),
-      kv('Rate limit', c.rateLimit)));
+      kv('Rate limit', c.rateLimit),
+      kv('Custom metric labels (metricsCustomLabels)', c.metricsCustomLabels === 'none' ? 'none (off)' : c.metricsCustomLabels)));
 
   // Keystone 2: shown only when the config uses a rate limit, spend cap or Bedrock control.
   const k2 = c.keystone2 || {};
@@ -314,8 +315,7 @@ $('version-btn').addEventListener('click', async () => {
   $('gw-version').textContent = 'checking…';
   const resp = await fetch('/api/info', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sandbox: run.sandbox, config: run.config, region: run.region, aigwUrl: run.aigwUrl,
-      keySource: run.keySource, apiKey: form.elements.apiKey.value, apiKeyFile: form.elements.apiKeyFile.value.trim() }),
+    body: JSON.stringify({ sandbox: run.sandbox, config: run.config, region: run.region, aigwUrl: run.aigwUrl, ...keyChoice(run) }),
   });
   const data = await resp.json();
   if (!resp.ok) {
@@ -410,7 +410,7 @@ playForm.elements.model.addEventListener('change', updatePlayCache);
 function playEntry(r) {
   const ok = r.status >= 200 && r.status < 300;
   const tokens = tokensText(r.usage);
-  const prompt = r.request.messages ? r.request.messages[r.request.messages.length - 1].content : r.request.input;
+  const prompt = r.prompt ?? (r.request.messages ? r.request.messages[r.request.messages.length - 1].content : r.request.input);
   return el('div', { class: `exchange ${ok ? '' : 'bad'}` },
     el('div', { class: 'ex-head' },
       el('span', { class: 'ex-model' }, r.model),
@@ -423,12 +423,18 @@ function playEntry(r) {
       tokens && el('span', { class: 'ex-tokens' }, tokens),
       el('span', { class: 'ex-time' }, `${(r.ms / 1000).toFixed(2)}s · ${new Date(r.at).toLocaleTimeString()}`)),
     el('div', { class: 'ex-body' },
-      el('div', { class: 'ex-q' }, el('span', { class: 'ex-label' }, 'Q'), el('span', {}, prompt)),
-      el('div', { class: 'ex-a' }, el('span', { class: 'ex-label' }, 'A'), el('span', {}, ok ? r.content : r.error))),
+      el('div', { class: 'ex-q' }, el('span', { class: 'ex-label' }, 'Q'), el('span', { class: 'pre-line' }, prompt)),
+      el('div', { class: 'ex-a' }, el('span', { class: 'ex-label' }, 'A'),
+        el('span', { class: 'pre-line' }, ok ? r.content : [r.error, r.content].filter(Boolean).join('\n')))),
+    r.steps && el('div', { class: 'debug-headers' }, r.steps.map((st) =>
+      el('span', { class: 'chip' }, el('span', { class: 'muted' }, `${st.name}: `), st.status ? `HTTP ${st.status}` : 'failed'))),
+    unreadFiles(r),
     debugHeaders(r.responseHeaders),
     curlBlock(r),
     headerTable('Request headers', r.requestHeaders, `POST ${r.endpoint}`),
     headerTable('Response headers', r.responseHeaders, `HTTP ${r.status}`),
+    r.requestLines && el('details', {}, el('summary', { class: 'small' }, 'Batch file (requests.jsonl)'),
+      el('pre', { class: 'raw-json' }, r.requestLines)),
     el('details', {}, el('summary', { class: 'small' }, `Raw response · ${r.keySource} · ${r.endpoint}`),
       el('pre', { class: 'raw-json' }, (() => {
         try {
@@ -439,9 +445,35 @@ function playEntry(r) {
       })())));
 }
 
+// unreadFiles: result files of a batch that could not be read. The server kept them on the
+// gateway with the key that made them; "Fetch again" reads one through the server, which
+// then deletes it.
+function unreadFiles(r) {
+  if (!r.unread?.length) return null;
+  return el('div', { class: 'unread-files' }, r.unread.map((file) => {
+    const out = el('pre', { class: 'raw-json' });
+    out.hidden = true;
+    const button = el('button', { type: 'button', class: 'small-btn' }, `Fetch the ${file.name} again`);
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      const resp = await fetch('/api/playground/file', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: file.id }),
+      });
+      const data = await resp.json();
+      out.hidden = false;
+      out.textContent = resp.ok ? data.text || '(empty)' : data.error;
+      // Read and deleted: nothing left to fetch. Otherwise it can be tried again.
+      if (resp.ok && data.deleted) button.textContent = `The ${file.name} was fetched and deleted from the gateway`;
+      else button.disabled = resp.status === 404;
+    });
+    return el('div', {}, button, el('span', { class: 'muted small mono' }, ` ${file.id}`), out);
+  }));
+}
+
 // curlCommand: the request as a shareable curl command. The API key is left as
 // $AIGW_API_KEY; -i shows the response headers (X-Cache); -k only when TLS was not verified.
 function curlCommand(r) {
+  if (r.curl) return r.curl; // a batch is several calls; the server writes them out
   const q = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
   // -N prints a streamed answer as it arrives.
   const lines = [`curl -sS -i${r.request?.stream ? ' -N' : ''}${r.insecure ? ' -k' : ''} -X POST ${q(r.endpoint)}`];
@@ -487,6 +519,7 @@ function debugHeaders(headers) {
 
 // isEmbeddingRequest: embeddings are never streamed.
 function isEmbeddingRequest(body) {
+  if (['moderations', 'batch'].includes(body.requestType)) return true; // not streamed either
   if (body.custom) return body.requestType === 'embeddings';
   const m = configData?.models.find((x) => x.modelName === body.model);
   return Boolean(m && /embedding/.test(m.kind));
@@ -540,7 +573,7 @@ async function sendPlayStream(body) {
 async function sendPlay(body) {
   $('play-send').disabled = true;
   $('play-again').disabled = true;
-  $('play-msg').textContent = 'sending…';
+  $('play-msg').textContent = body.requestType === 'batch' ? 'running the batch: upload, create, wait (up to 3 minutes)…' : 'sending…';
   try {
     if (body.stream && !isEmbeddingRequest(body)) {
       await sendPlayStream(body);
@@ -578,6 +611,13 @@ function updatePlayTarget() {
   updateCustomModel();
   for (const x of playForm.querySelectorAll('.custom-only')) x.hidden = !custom;
   for (const x of playForm.querySelectorAll('.sandbox-only')) x.hidden = custom;
+  // A sandbox knows each model's kind, so chat or embeddings follows the model; a custom
+  // endpoint has no config, so the choice is made here.
+  const type = playForm.elements.requestType;
+  for (const opt of type.options) {
+    opt.disabled = custom ? opt.value === 'auto' : opt.value === 'chat' || opt.value === 'embeddings';
+  }
+  if (type.selectedOptions[0]?.disabled) type.value = custom ? 'chat' : 'auto';
   // "(off in config)" describes the sandbox's config; a custom endpoint shows what Detect
   // cache found for the model, or plain names.
   if (custom) showDetectedCache();
@@ -656,7 +696,11 @@ function updateCustomModel() {
 }
 
 function guessRequestType() {
-  playForm.elements.requestType.value = /embed/i.test(customModelName()) ? 'embeddings' : 'chat';
+  // Only between chat and embeddings, and only for a custom endpoint: a chosen moderations
+  // or batch request stays, and a sandbox takes the kind from its config.
+  const type = playForm.elements.requestType;
+  if (playTarget() !== 'custom' || ['moderations', 'batch'].includes(type.value)) return;
+  type.value = /embed/i.test(customModelName()) ? 'embeddings' : 'chat';
 }
 
 playForm.elements.customModelPick.addEventListener('change', () => {
@@ -675,10 +719,154 @@ playForm.elements.requestType.addEventListener('change', showDetectedCache);
 playForm.elements.customUrl.value = localStorage.getItem(CUSTOM_URL_KEY) || '';
 playForm.elements.customUrl.addEventListener('change', () => localStorage.setItem(CUSTOM_URL_KEY, playForm.elements.customUrl.value.trim()));
 
+// ---- Create an API key through the Capella control plane (custom endpoint) ----
+const KEY_FORM_KEY = 'aigw-doctor-cp-key-form'; // URL, region and email are remembered; never the password, JWT or key
+let createdKey = null; // the key made in this page, so it can be deleted again
+
+function cpKeyBody() {
+  const f = playForm.elements;
+  return {
+    cpUrl: f.keyCpUrl.value.trim(), region: f.keyRegion.value.trim(), cpUser: f.keyCpUser.value.trim(),
+    cpPassword: f.keyCpPassword.value, jwt: f.keyJwt.value, verifyTls: f.verifyTls.checked,
+  };
+}
+
+(() => {
+  const f = playForm.elements;
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(KEY_FORM_KEY) || '{}') || {};
+  } catch { /* start empty */ }
+  f.keyCpUrl.value = typeof saved.cpUrl === 'string' ? saved.cpUrl : '';
+  f.keyRegion.value = typeof saved.region === 'string' ? saved.region : '';
+  f.keyCpUser.value = typeof saved.cpUser === 'string' ? saved.cpUser : '';
+  const now = new Date();
+  const two = (n) => String(n).padStart(2, '0');
+  f.keyName.value = `aigw-doctor-${now.getFullYear()}${two(now.getMonth() + 1)}${two(now.getDate())}-${two(now.getHours())}${two(now.getMinutes())}`;
+})();
+
+$('cp-key-create').addEventListener('click', async () => {
+  const f = playForm.elements;
+  const msg = $('cp-key-msg');
+  msg.className = 'muted small';
+  msg.textContent = 'creating…';
+  $('cp-key-create').disabled = true;
+  try {
+    const body = cpKeyBody();
+    localStorage.setItem(KEY_FORM_KEY, JSON.stringify({ cpUrl: body.cpUrl, region: body.region, cpUser: body.cpUser }));
+    const resp = await fetch('/api/cp/apikey', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...body, name: f.keyName.value.trim(), expiryDuration: Number(f.keyExpiry.value), allowedIPs: f.keyAllowedIps.value,
+        save: f.keySave.checked,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      msg.className = 'error-text small';
+      msg.textContent = data.error;
+      return;
+    }
+    f.customKey.value = data.apiKey;
+    createdKey = { keyId: data.keyId, name: data.name, apiKey: data.apiKey };
+    $('cp-key-delete').hidden = !data.keyId;
+    let note = '';
+    if (data.endpoint && !f.customUrl.value.trim()) {
+      f.customUrl.value = data.endpoint;
+      localStorage.setItem(CUSTOM_URL_KEY, data.endpoint);
+      note = ` Gateway URL set to ${data.endpoint}.`;
+    } else if (!data.endpoint) {
+      note = ` No model with an endpoint in ${data.region}: enter the Gateway URL yourself.`;
+    }
+    msg.textContent = `Created ${data.name} (${data.keyId})${data.expiry ? `, expires ${new Date(data.expiry).toLocaleString()}` : ''}. It is in the API key field${data.saved ? ` and saved as ${data.saved} in ${data.savedIn}` : ''}.${note}`;
+    if (data.saved) await loadSavedKeys(data.saved);
+  } catch (err) {
+    msg.className = 'error-text small';
+    msg.textContent = err.message;
+  } finally {
+    $('cp-key-create').disabled = false;
+  }
+});
+
+$('cp-key-delete').addEventListener('click', async () => {
+  if (!createdKey) return;
+  const msg = $('cp-key-msg');
+  msg.className = 'muted small';
+  msg.textContent = 'deleting…';
+  const resp = await fetch('/api/cp/apikey/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...cpKeyBody(), keyId: createdKey.keyId }),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    msg.className = 'error-text small';
+    msg.textContent = data.error;
+    return;
+  }
+  msg.textContent = `Deleted ${createdKey.name} (${createdKey.keyId}).`;
+  // Clear the field only when it still holds the deleted key.
+  if (playForm.elements.customKey.value === createdKey.apiKey) playForm.elements.customKey.value = '';
+  createdKey = null;
+  $('cp-key-delete').hidden = true;
+  await loadSavedKeys(''); // its saved copy is removed with it
+});
+
+// keyChoice: the run form's API key choice, as the server needs it to get a key for a
+// sandbox: the typed key or key file, or what a Capella key needs (control plane and sign-in).
+function keyChoice(run) {
+  return {
+    keySource: run.keySource, apiKey: form.elements.apiKey.value, apiKeyFile: form.elements.apiKeyFile.value.trim(),
+    cpUrl: run.cpUrl, orgId: run.orgId, tenantId: run.tenantId, cpUser: form.elements.cpUser.value.trim(),
+    cpPassword: form.elements.cpPassword.value, cpJwt: form.elements.cpJwt.value,
+  };
+}
+
 function customBody() {
   const f = playForm.elements;
-  return { aigwUrl: f.customUrl.value.trim(), apiKey: f.customKey.value, verifyTls: f.verifyTls.checked };
+  return { aigwUrl: f.customUrl.value.trim(), apiKey: f.customKey.value, savedKey: f.savedKey.value, verifyTls: f.verifyTls.checked };
 }
+
+// ---- saved keys (custom endpoint): keys created earlier, kept in ~/.aigw-doctor/keys ----
+let savedKeyList = [];
+
+async function loadSavedKeys(pick) {
+  const select = playForm.elements.savedKey;
+  const before = pick ?? select.value;
+  try {
+    const data = await (await fetch('/api/keys')).json();
+    savedKeyList = data.keys || [];
+  } catch {
+    savedKeyList = [];
+  }
+  select.replaceChildren(el('option', { value: '' }, 'none: use the API key field'),
+    ...savedKeyList.map((k) => el('option', { value: k.name },
+      `${k.name} · ${k.region || '?'} · ${k.expired ? 'expired' : k.expiresAt ? `until ${new Date(k.expiresAt * 1000).toLocaleString()}` : 'no expiry known'}`)));
+  select.value = savedKeyList.some((k) => k.name === before) ? before : '';
+  showSavedKey();
+}
+
+function showSavedKey() {
+  const f = playForm.elements;
+  const k = savedKeyList.find((x) => x.name === f.savedKey.value);
+  $('saved-key-forget').hidden = !k;
+  f.customKey.placeholder = k ? `using the saved key ${k.name}` : '';
+  $('saved-key-note').textContent = !k ? '' : k.expired ? 'This key has expired: create a new one.'
+    : f.customKey.value ? 'The API key field is filled and wins: clear it to use the saved key.' : '';
+  // The saved key remembers the gateway it was made for.
+  if (k?.endpoint && !f.customUrl.value.trim()) {
+    f.customUrl.value = k.endpoint;
+    localStorage.setItem(CUSTOM_URL_KEY, k.endpoint);
+  }
+}
+
+playForm.elements.savedKey.addEventListener('change', showSavedKey);
+playForm.elements.customKey.addEventListener('input', showSavedKey);
+$('saved-key-forget').addEventListener('click', async () => {
+  const name = playForm.elements.savedKey.value;
+  if (!name || !window.confirm(`Remove the saved key "${name}" from this machine?\n\nThe key stays valid in Capella until it expires or is deleted there.`)) return;
+  await fetch('/api/keys/forget', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+  await loadSavedKeys('');
+});
+loadSavedKeys();
 
 $('custom-connect').addEventListener('click', async () => {
   const info = $('custom-info');
@@ -718,9 +906,18 @@ $('custom-connect').addEventListener('click', async () => {
 playForm.addEventListener('submit', (e) => {
   e.preventDefault();
   const f = playForm.elements;
+  // The endpoint choice and the extra X-cb-* headers, for both targets.
+  const extras = {
+    requestType: f.requestType.value, modelRef: f.modelRef.value.trim(), extraHeaders: f.extraHeaders.value,
+    metricLabels: f.metricLabels.value,
+    suppress: {
+      requestGuardrails: f.suppressRequestGuardrails.checked, requestJailbreak: f.suppressRequestJailbreak.checked,
+      responseGuardrails: f.suppressResponseGuardrails.checked,
+    },
+  };
   if (playTarget() === 'custom') {
     sendPlay({
-      custom: true, ...customBody(), model: customModelName(), requestType: f.requestType.value,
+      custom: true, ...customBody(), model: customModelName(), ...extras,
       cacheType: f.cacheType.value, prompt: f.prompt.value, system: f.system.value,
       maxTokens: f.maxTokens.value, temperature: f.temperature.value, debug: f.debug.checked, stream: f.stream.checked,
     });
@@ -728,10 +925,10 @@ playForm.addEventListener('submit', (e) => {
   }
   const run = formBody();
   sendPlay({
-    sandbox: run.sandbox, config: run.config, region: run.region, aigwUrl: run.aigwUrl,
-    keySource: run.keySource, apiKey: form.elements.apiKey.value, apiKeyFile: form.elements.apiKeyFile.value.trim(),
+    sandbox: run.sandbox, config: run.config, region: run.region, aigwUrl: run.aigwUrl, ...keyChoice(run),
     model: f.model.value, cacheType: f.cacheType.value, prompt: f.prompt.value, system: f.system.value,
     maxTokens: f.maxTokens.value, temperature: f.temperature.value, debug: f.debug.checked, stream: f.stream.checked,
+    ...extras,
   });
 });
 playForm.elements.prompt.addEventListener('keydown', (e) => {
@@ -982,6 +1179,7 @@ function fillForm() {
     form.elements[field].value = '';
     form.elements[field].placeholder = sb?.secrets[key] ? 'set in .env' : '';
   }
+  form.elements.cpJwt.value = ''; // a session JWT belongs to one control plane; never stored
   $('form-title').textContent = sb ? sb.label : 'Custom run';
   updateEditButtons();
   $('save-env-msg').hidden = true;
@@ -1073,6 +1271,7 @@ $('save-env-btn').addEventListener('click', async () => {
 function updateVisibility() {
   const key = radio('keySource');
   $('models-fields').hidden = radio('scope') === 'infra';
+  form.querySelector('.key-capella').hidden = key !== 'capella';
   form.querySelector('.key-file').hidden = key !== 'file';
   form.querySelector('.key-paste').hidden = key !== 'paste';
 }
@@ -1088,6 +1287,8 @@ function formBody() {
     inferenceOnly: scope === 'inference',
     skipInference: scope === 'infra',
     createApiKey: models && key === 'create',
+    capellaApiKey: models && key === 'capella',
+    cpJwt: models && key === 'capella' ? form.elements.cpJwt.value : '',
     apiKeyFile: models && key === 'file' ? v('apiKeyFile') : '',
     apiKey: models && key === 'paste' ? form.elements.apiKey.value : '',
     cpUser: models ? v('cpUser') : '',
