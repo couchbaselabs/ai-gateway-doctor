@@ -1646,11 +1646,26 @@ saved_capella_key() {
 # capella_api_key: a model API key from the Capella control plane, for every model in the
 # region. A saved one is reused; otherwise one is created and saved for the next run.
 capella_api_key() {
-	local name body code key_id expiry now
+	local name body code key_id expiry now base n=0 reserved=""
 	cp_resolve || return 1
 	allowed check && saved_capella_key "$CP_ORG" && return 0
 	cp_session || return 1
 	name="aigw-doctor-$(date +%Y%m%d-%H%M%S)"
+	# Reserve the name: <name>.key is created exclusively (noclobber), so two runs in the
+	# same second get different names and never write each other's files. The empty file is
+	# not a saved key yet: a key counts only once its <name>.json is there.
+	if allowed check; then
+		base="$name"
+		while [[ $n -le 50 ]]; do
+			[[ $n -gt 0 ]] && name="$base-$n"
+			if (umask 077 && mkdir -p "$KEYS_DIR" && set -o noclobber && : >"$KEYS_DIR/$name.key") 2>/dev/null; then
+				reserved=1
+				break
+			fi
+			[[ -e "$KEYS_DIR/$name.key" ]] || break # the folder cannot be written: the key is not saved
+			n=$((n + 1))
+		done
+	fi
 	body=$(jq -nc --arg n "$name" --arg r "$REGION" --argjson e "$KEY_EXPIRY" '{name: $n,
 		description: "created by aigw-doctor", expiryDuration: $e, region: $r, accessPolicy: {allowedIPs: ["0.0.0.0/0"]}}')
 	printf '   %s[check] $ curl -sk -X POST %s/v2/organizations/%s/languageModelApiKeys -H %s -d %s%s\n' "$DIM" \
@@ -1663,18 +1678,23 @@ capella_api_key() {
 		fail "api key: creating a Capella key returned HTTP $code: $(resp_error)"
 		hint "HTTP 401: the session is not valid (wrong login, or an expired CP_JWT); HTTP 403: your Capella role may not create model API keys; HTTP 4xx: check --region and the organization in --cp-url"
 		: >"$RESP_FILE"
+		[[ -n "$reserved" ]] && rm -f "$KEYS_DIR/$name.key"
 		return 1
 	fi
 	key_id=$(jq -r '.keyId // empty' "$RESP_FILE")
 	expiry=$(jq -r '.expiry // empty' "$RESP_FILE")
 	now=$(date +%s)
-	if (umask 077 && mkdir -p "$KEYS_DIR" && printf '%s\n' "$API_KEY" >"$KEYS_DIR/$name.key" &&
-		jq --arg o "$CP_ORG" --arg u "$CP_URL" --arg g "$AIGW_URL" --arg r "$REGION" --argjson now "$now" --argjson e "$KEY_EXPIRY" \
-			'{keyId, name, expiry, region: (.region // $r), orgId: $o, cpUrl: $u, endpoint: $g, createdAt: $now,
-				expiresAt: ($now + (.expiryDuration // $e))}' "$RESP_FILE" >"$KEYS_DIR/$name.json") 2>/dev/null; then
+	# The key goes into the reserved file; the metadata is written aside and renamed into
+	# place last, so a reader sees the pair complete or not at all.
+	if [[ -n "$reserved" ]] && (umask 077 && printf '%s\n' "$API_KEY" >"$KEYS_DIR/$name.key" &&
+		jq --arg n "$name" --arg o "$CP_ORG" --arg u "$CP_URL" --arg g "$AIGW_URL" --arg r "$REGION" --argjson now "$now" --argjson e "$KEY_EXPIRY" \
+			'{keyId, name: $n, expiry, region: (.region // $r), orgId: $o, cpUrl: $u, endpoint: $g, createdAt: $now,
+				expiresAt: ($now + (.expiryDuration // $e))}' "$RESP_FILE" >"$KEYS_DIR/.$name.json.$$" &&
+		mv "$KEYS_DIR/.$name.json.$$" "$KEYS_DIR/$name.json") 2>/dev/null; then
 		CAPELLA_KEY_FILE="$KEYS_DIR/$name.key"
 		pass "api key: created the Capella key $name ($key_id${expiry:+, expires $expiry}), saved to $KEYS_DIR/$name.key"
 	else
+		[[ -n "$reserved" ]] && rm -f "$KEYS_DIR/$name.key" "$KEYS_DIR/.$name.json.$$"
 		warn "api key: created the Capella key $name ($key_id), but could not save it in $KEYS_DIR"
 		hint "the key works for this run only; check that the folder can be written, or pass --keys-dir DIR"
 	fi

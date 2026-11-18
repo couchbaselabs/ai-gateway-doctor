@@ -1179,6 +1179,7 @@ function fillForm() {
     form.elements[field].value = '';
     form.elements[field].placeholder = sb?.secrets[key] ? 'set in .env' : '';
   }
+  form.elements.cpJwt.value = ''; // a session JWT belongs to one control plane; never stored
   $('form-title').textContent = sb ? sb.label : 'Custom run';
   updateEditButtons();
   $('save-env-msg').hidden = true;

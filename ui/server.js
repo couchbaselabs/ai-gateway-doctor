@@ -727,7 +727,8 @@ function gatewayUrl(ctx, body) {
   throw new Error('no gateway URL: set it under "Instances, URLs and threshold", or run a check with a Capella login first');
 }
 
-async function playgroundKey(ctx, body, gw) {
+// needMs: how long the key must still be valid (a batch waits for minutes).
+async function playgroundKey(ctx, body, gw, needMs = 0) {
   if (body.keySource === 'paste') {
     const k = (typeof body.apiKey === 'string' && body.apiKey.trim()) || envValue(ctx.env, ctx.sandbox, 'AIGW_API_KEY');
     if (!k) throw new Error('paste an API key, or set AIGW_API_KEY in .env');
@@ -739,7 +740,7 @@ async function playgroundKey(ctx, body, gw) {
     const cpUrl = ctx.pick('cpUrl');
     if (!cpUrl) throw new Error('a Capella key needs the Control plane URL (with /v2/organizations/<org id>) in the form');
     const orgId = (cpUrl.match(/\/organizations\/([0-9a-fA-F-]+)/) || [])[1] || ctx.pick('orgId') || ctx.tenantId;
-    const found = orgId && findSavedKey(orgId, ctx.region);
+    const found = orgId && findSavedKey(orgId, ctx.region, Math.max(300, Math.ceil(needMs / 1000)));
     if (found) return { key: readSavedKey(found.name), source: `saved Capella key ${found.name}` };
     const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-');
     const made = await cpCreateKey({
@@ -756,7 +757,7 @@ async function playgroundKey(ctx, body, gw) {
   }
   const id = `${ctx.sandbox}|${gw}`;
   const cached = playKeys.get(id);
-  if (cached && cached.expiresAt > Date.now() + 120000) return { key: cached.key, source: `temporary key ${cached.keyId}` };
+  if (cached && cached.expiresAt > Date.now() + Math.max(120000, needMs)) return { key: cached.key, source: `temporary key ${cached.keyId}` };
   const adminKey = ctx.config.adminConfig?.adminKey;
   if (!adminKey) throw new Error('the config has no adminConfig.adminKey to create a temporary key');
   const admin = await aws(['secretsmanager', 'get-secret-value', '--region', ctx.region,
@@ -808,10 +809,22 @@ const SAVED_NAME = /^[\w.@-]{1,120}$/;
 function saveKey(meta, apiKey) {
   const dir = keysDir();
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  let name = String(meta.name || 'key').replace(/[^\w.@-]+/g, '-').slice(0, 100) || 'key';
-  if (fs.existsSync(path.join(dir, `${name}.json`))) name = `${name}-${String(meta.keyId || Date.now()).slice(0, 8)}`;
-  fs.writeFileSync(path.join(dir, `${name}.key`), `${apiKey}\n`, { mode: 0o600 });
-  fs.writeFileSync(path.join(dir, `${name}.json`), `${JSON.stringify({ ...meta, name }, null, 2)}\n`, { mode: 0o600 });
+  const base = String(meta.name || 'key').replace(/[^\w.@-]+/g, '-').slice(0, 100) || 'key';
+  // <name>.key is created exclusively, so a name is never shared with another save or with
+  // a doctor run; the metadata is renamed into place last, so the pair appears complete.
+  let name = base;
+  for (let n = 0; ; n += 1) {
+    name = n ? `${base}-${n}` : base;
+    try {
+      fs.writeFileSync(path.join(dir, `${name}.key`), `${apiKey}\n`, { mode: 0o600, flag: 'wx' });
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST' || n >= 50) throw e;
+    }
+  }
+  const tmp = path.join(dir, `.${name}.json.${process.pid}`);
+  fs.writeFileSync(tmp, `${JSON.stringify({ ...meta, name }, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, path.join(dir, `${name}.json`));
   return name;
 }
 
@@ -856,9 +869,10 @@ function forgetKey(name) {
   return { name, removed };
 }
 
-// findSavedKey: a saved key for this organization and region with at least five minutes left.
-function findSavedKey(orgId, region) {
-  const soon = Math.floor(Date.now() / 1000) + 300;
+// findSavedKey: a saved key for this organization and region with at least five minutes
+// (or minLeft seconds) left.
+function findSavedKey(orgId, region, minLeft = 300) {
+  const soon = Math.floor(Date.now() / 1000) + minLeft;
   return savedKeys().find((k) => k.orgId === orgId && k.region === region && k.expiresAt > soon) || null;
 }
 
@@ -1079,8 +1093,17 @@ async function preparePlayground(body) {
   const prompt = String(body.prompt || '');
   if (!prompt.trim()) throw new Error('type a prompt');
   let gw; let key; let source; let modelName; let embedding; let kind; let verifyTls = false; let modelId = '';
+  // A batch needs its key for the whole wait plus reading the results and cleaning up.
+  const needMs = type === 'batch' ? BATCH_WAIT_MS + BATCH_KEY_MARGIN_MS : 0;
   if (body.custom === true) {
     ({ gw, key, verifyTls } = customTarget(body));
+    if (needMs && body.savedKey && !(typeof body.apiKey === 'string' && body.apiKey.trim())) {
+      const meta = savedKeys().find((k) => k.name === body.savedKey);
+      const left = meta?.expiresAt ? meta.expiresAt * 1000 - Date.now() : Infinity;
+      if (left < needMs) {
+        throw new Error(`saved key ${body.savedKey} ${left > 0 ? `expires in ${Math.ceil(left / 60000)} minute(s)` : 'has expired'}; a batch needs its key for up to ${Math.ceil(needMs / 60000)} minutes. Pick or create another key`);
+      }
+    }
     source = 'your API key';
     modelName = String(body.model || '').trim();
     if (!MODEL_REF.test(modelName)) throw new Error('pick or type a model name');
@@ -1097,7 +1120,7 @@ async function preparePlayground(body) {
     modelId = model.id || '';
     kind = model.kind;
     gw = gatewayUrl(ctx, body);
-    ({ key, source } = await playgroundKey(ctx, body, gw));
+    ({ key, source } = await playgroundKey(ctx, body, gw, needMs));
   }
 
   let path_ = '/v1/embeddings';
@@ -1165,6 +1188,7 @@ function playgroundResult(p, res, text, extra = {}) {
 
 const BATCH_MAX_LINES = 20; // small enough to run request by request, not as a native Bedrock job
 const BATCH_WAIT_MS = Number(process.env.PLAYGROUND_BATCH_WAIT_MS) || 180000;
+const BATCH_KEY_MARGIN_MS = 300000; // upload, create, reading two result files, cancel and deletes
 const BATCH_END = ['completed', 'failed', 'expired', 'cancelled'];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
@@ -1235,8 +1259,8 @@ async function drainBatches() {
   keptFiles.clear();
 }
 
-// fetchKeptFile: read a kept result file again with the key that created it. Once it has
-// been read it is deleted from the gateway.
+// fetchKeptFile: read a kept result file again with the key that created it. The whole
+// file is returned; once it has been read it is deleted from the gateway.
 async function fetchKeptFile(body) {
   const id = String(body.id || '');
   const kept = keptFiles.get(id);
@@ -1246,7 +1270,7 @@ async function fetchKeptFile(body) {
   const del = await kept.call('DELETE', `/v1/files/${encodeURIComponent(id)}`, { timeout: 15000 }).catch((e) => ({ status: 0, text: e.message }));
   const deleted = DELETE_DONE.includes(del.status);
   if (deleted) keptFiles.delete(id);
-  return { id, name: kept.name, deleted, text: res.text.length > 200000 ? `${res.text.slice(0, 200000)}…` : res.text };
+  return { id, name: kept.name, deleted, text: res.text };
 }
 
 // playgroundBatch: one prompt per line becomes a batch through the OpenAI Files and Batches
