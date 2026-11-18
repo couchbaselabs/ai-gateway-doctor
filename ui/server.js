@@ -739,8 +739,11 @@ async function playgroundKey(ctx, body, gw, needMs = 0) {
     // saved key for the organization and region is reused; otherwise one is created and saved.
     const cpUrl = ctx.pick('cpUrl');
     if (!cpUrl) throw new Error('a Capella key needs the Control plane URL (with /v2/organizations/<org id>) in the form');
-    const orgId = (cpUrl.match(/\/organizations\/([0-9a-fA-F-]+)/) || [])[1] || ctx.pick('orgId') || ctx.tenantId;
-    const found = orgId && findSavedKey(orgId, ctx.region, Math.max(300, Math.ceil(needMs / 1000)));
+    // The organization, as the doctor script picks it: the Organization id field, else the
+    // one in the URL, else the tenant id.
+    const orgId = ctx.pick('orgId') || (cpUrl.match(/\/organizations\/([0-9a-fA-F-]+)/) || [])[1] || ctx.tenantId;
+    const cpBase = (cpUrl.match(/^https:\/\/[^/]+/) || [''])[0];
+    const found = orgId && findSavedKey(cpBase, orgId, ctx.region, Math.max(300, Math.ceil(needMs / 1000)));
     if (found) return { key: readSavedKey(found.name), source: `saved Capella key ${found.name}` };
     const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-');
     const made = await cpCreateKey({
@@ -869,11 +872,12 @@ function forgetKey(name) {
   return { name, removed };
 }
 
-// findSavedKey: a saved key for this organization and region with at least five minutes
-// (or minLeft seconds) left.
-function findSavedKey(orgId, region, minLeft = 300) {
+// findSavedKey: a saved key for this control plane, organization and region with at least
+// five minutes (or minLeft seconds) left. The control plane is part of the match so that a
+// key from one environment is never sent to another.
+function findSavedKey(cpBase, orgId, region, minLeft = 300) {
   const soon = Math.floor(Date.now() / 1000) + minLeft;
-  return savedKeys().find((k) => k.orgId === orgId && k.region === region && k.expiresAt > soon) || null;
+  return savedKeys().find((k) => k.cpUrl.replace(/\/+$/, '') === cpBase && k.orgId === orgId && k.region === region && k.expiresAt > soon) || null;
 }
 
 // ---------- model API keys through the Capella control plane ----------
