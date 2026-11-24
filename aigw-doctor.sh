@@ -53,9 +53,47 @@
 #
 # Usage:
 #   ./aigw-doctor.sh -c config.json [--check|--fix] [options]
+#   ./aigw-doctor.sh --from URL|ID --check [options]     (fetches the config first)
 #
 # Options:
-#   -c, --config FILE      gateway config.json (required)
+#   -c, --config FILE      gateway config.json (required, unless --from fetches it)
+#   --from URL|ID          start from a Capella console URL that carries the organization
+#                          (...?oid=<org id>, or .../organizations/<org id>), or from an id
+#                          that tags the gateway's instances (the org id). Sets --tenant-id,
+#                          --org-id and --cp-url (https://api.<console host>) unless given.
+#                          Without -c the config is fetched with your AWS credentials: the
+#                          tenant's gateways are found by their tags, in --region or else in
+#                          every enabled region; with several you are asked which one to use
+#                          (or pass --region); the config is read from the Secrets Manager secret
+#                          named in the instance's user data (aigwConfigKey), else from the
+#                          gateway's live config file through SSM. It is saved as
+#                          <name>.config.json (mode 600) and the run continues with it
+#   --name NAME            name for the fetched config (default: gw-<org id start>-<region>)
+#   --config-dir DIR       where a fetched config is saved
+#                          (default: $AIGW_CONFIG_DIR or ~/.aigw-doctor/configs)
+#   --fetch-only           with --from and --check: save the config and stop
+#   --list-gateways        with --from and --check: list the tenant's gateways
+#                          (GATEWAY <region> <instance> <ASG> lines) and stop
+#   --install-build URL    replace the ai-gateway binary on the sandbox gateway with a build, to
+#                          test it. URL is a build folder such as
+#                          https://latestbuilds.service.couchbase.com/builds/latestbuilds/ai-gateway/1.2.1/11/
+#                          (the linux-<arch>.gz file in it is picked), or the .gz file itself.
+#                          Only this is done, not the checks. --check shows what would happen
+#                          (the gateway's binary, its architecture, how the build gets there);
+#                          --fix does it after a confirmation: download and unpack the build
+#                          next to the binary, stop the service, save the current binary as
+#                          <binary>.bak-<time>, put the new one in place and start the service.
+#                          If the service does not come up, the saved binary is put back.
+#                          The build is downloaded by the gateway node when it can reach the
+#                          URL; else by this machine and copied over ssh (--aigw-ssh) or
+#                          through an S3 bucket (--build-bucket)
+#   --build-arch ARCH      arm64 (default) or amd64; must match the gateway node
+#   --build-bucket BUCKET  S3 bucket to pass the build through when the node cannot reach the
+#                          URL: uploaded, fetched by the node with a 15-minute link, deleted
+#   --aigw-service NAME    the gateway's systemd unit (default: ai-gateway.service)
+#   --yes                  with --install-build --fix: do not ask for confirmation
+#   --aws-profile NAME     AWS CLI profile to use (default: $AWS_PROFILE if it is set, else the
+#                          profile named "default")
 #   -v, --verbose          show commands, remote scripts and listings
 #   --inference-only       skip the infrastructure checks; only probe the models
 #   --region REGION        AWS region of the deployment (default: $AWS_REGION or us-east-2)
@@ -130,6 +168,18 @@ CONFIG=""
 REGION="${AWS_REGION:-us-east-2}"
 SM_REGION=""
 TENANT_ID=""
+FROM=""
+SANDBOX_NAME=""
+CONFIG_DIR="${AIGW_CONFIG_DIR:-$HOME/.aigw-doctor/configs}"
+FETCH_ONLY=false
+LIST_GATEWAYS=false
+BUILD_URL=""
+BUILD_ARCH="arm64"
+BUILD_BUCKET=""
+AIGW_SERVICE="ai-gateway.service"
+ASSUME_YES=false
+REGION_SET=false
+SM_REGION_SET=false
 DS_ASG_PREFIX="capella-ds-"
 AIGW_ASG_PREFIX="capella-ai-gateway-"
 CB_INSTANCE=""
@@ -174,8 +224,19 @@ while [[ $# -gt 0 ]]; do
 	--fix) MODE=fix ;;
 	--dry-run) MODE=dry-run ;;
 	--inference-only) INFRA=false ;;
-	--region) REGION="$2"; shift ;;
-	--sm-region) SM_REGION="$2"; shift ;;
+	--region) REGION="$2"; REGION_SET=true; shift ;;
+	--sm-region) SM_REGION="$2"; SM_REGION_SET=true; shift ;;
+	--from) FROM="$2"; shift ;;
+	--name) SANDBOX_NAME="$2"; shift ;;
+	--config-dir) CONFIG_DIR="$2"; shift ;;
+	--fetch-only) FETCH_ONLY=true ;;
+	--list-gateways) LIST_GATEWAYS=true ;;
+	--install-build) BUILD_URL="$2"; shift ;;
+	--build-arch) BUILD_ARCH="$2"; shift ;;
+	--build-bucket) BUILD_BUCKET="$2"; shift ;;
+	--aigw-service) AIGW_SERVICE="$2"; shift ;;
+	--yes) ASSUME_YES=true ;;
+	--aws-profile) export AWS_PROFILE="$2"; shift ;;
 	--tenant-id) TENANT_ID="$2"; shift ;;
 	--ds-asg-prefix) DS_ASG_PREFIX="$2"; shift ;;
 	--aigw-asg-prefix) AIGW_ASG_PREFIX="$2"; shift ;;
@@ -214,8 +275,47 @@ while [[ $# -gt 0 ]]; do
 	shift
 done
 die() { echo "error: $*" >&2; exit 1; }
-[[ -n "$CONFIG" ]] || { echo "error: -c/--config is required" >&2; usage 1; }
-[[ -f "$CONFIG" ]] || die "config not found: $CONFIG"
+[[ -n "$CONFIG" || -n "$FROM" ]] || { echo "error: -c/--config is required (or --from URL|ID to fetch it)" >&2; usage 1; }
+[[ -z "$CONFIG" || -f "$CONFIG" ]] || die "config not found: $CONFIG"
+# --from without -c: the config is fetched from AWS before the run (step 0b).
+FETCH=false
+[[ -n "$FROM" && -z "$CONFIG" ]] && FETCH=true
+! $FETCH_ONLY || $FETCH || die "--fetch-only needs --from, and no -c"
+! $LIST_GATEWAYS || $FETCH || die "--list-gateways needs --from, and no -c"
+[[ -z "$SANDBOX_NAME" || "$SANDBOX_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "--name may hold letters, digits, dots, dashes and underscores"
+
+if [[ -n "$BUILD_URL" ]]; then
+	[[ "$BUILD_URL" =~ ^https://[A-Za-z0-9._:/~%+-]+$ ]] || die "--install-build takes an https:// URL of a build folder or a .gz file"
+	[[ "$BUILD_ARCH" == arm64 || "$BUILD_ARCH" == amd64 ]] || die "--build-arch must be arm64 or amd64"
+	[[ -z "$BUILD_BUCKET" || "$BUILD_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "--build-bucket must be an S3 bucket name"
+	[[ "$AIGW_SERVICE" =~ ^[A-Za-z0-9@_.-]+$ ]] || die "--aigw-service must be a systemd unit name"
+	$INFRA || die "--install-build cannot be combined with --inference-only"
+fi
+
+# --from: a console URL with the organization, or a bare id. The URL also gives the control
+# plane: the console at <host> has its API at api.<host>.
+FROM_ID=""
+if [[ -n "$FROM" ]]; then
+	from_oid='[?&]oid=([0-9a-fA-F-]{8,64})'
+	from_org='/organizations/([0-9a-fA-F-]{8,64})'
+	if [[ "$FROM" =~ ^https?://([^/?#]+) ]]; then
+		from_host="${BASH_REMATCH[1]}"
+		if [[ "$FROM" =~ $from_oid || "$FROM" =~ $from_org ]]; then
+			FROM_ID="${BASH_REMATCH[1]}"
+		else
+			die "--from: no organization in that URL (expected ...?oid=<org id> or .../organizations/<org id>)"
+		fi
+		if [[ -z "$CP_URL" ]]; then
+			if [[ "$from_host" == api.* ]]; then CP_URL="https://$from_host"; else CP_URL="https://api.$from_host"; fi
+		fi
+		ORG_ID="${ORG_ID:-$FROM_ID}"
+		TENANT_ID="${TENANT_ID:-$FROM_ID}"
+	elif [[ "$FROM" =~ ^[0-9a-fA-F-]{8,64}$ ]]; then
+		FROM_ID="$FROM"
+	else
+		die "--from takes a Capella console URL with the organization, or an id"
+	fi
+fi
 [[ -z "$API_KEY_FILE" || -f "$API_KEY_FILE" ]] || die "API key file not found: $API_KEY_FILE"
 [[ -z "$SAVE_KEY_FILE" ]] || $CREATE_KEY || die "--save-api-key needs --create-api-key"
 [[ -z "$API_KEY_FILE" ]] || ! $CREATE_KEY || die "use either --api-key-file or --create-api-key"
@@ -308,12 +408,13 @@ run() {
 	fi
 }
 
-# remote KIND TARGET SCRIPT: print SCRIPT, run it on TARGET ("ssh:user@host", "ssm:i-xxx" or "local").
+# remote KIND TARGET SCRIPT [SHOWN]: print SCRIPT (or SHOWN, when SCRIPT holds a link that must
+# not be printed), run it on TARGET ("ssh:user@host", "ssm:i-xxx" or "local").
 remote() {
-	local kind="$1" target="$2" script="$3"
+	local kind="$1" target="$2" script="$3" shown="${4:-$3}"
 	{
 		printf '   %s[%s] on %s:%s\n' "$DIM" "$kind" "$(target_label "$target")" "$RST"
-		printf '%s\n' "$script" | sed "s/^/      $DIM| /; s/\$/$RST/"
+		printf '%s\n' "$shown" | sed "s/^/      $DIM| /; s/\$/$RST/"
 	} | show "$kind"
 	allowed "$kind" || return 0
 	case "$target" in
@@ -382,13 +483,13 @@ NEED_LOOKUP=false
 # secret) and for that lookup. Probing the models with your own or a Capella key is not:
 # that works without the AWS CLI and without AWS credentials (e.g. against production).
 NEED_AWS=false
-if $INFRA || $CREATE_KEY || $NEED_LOOKUP; then NEED_AWS=true; fi
+if $INFRA || $CREATE_KEY || $NEED_LOOKUP || $FETCH; then NEED_AWS=true; fi
 for tool in jq curl; do
 	command -v "$tool" >/dev/null || die "'$tool' is required"
 done
 if $NEED_AWS; then
 	for tool in aws nc; do
-		command -v "$tool" >/dev/null || die "'$tool' is required for the infrastructure checks and --create-api-key (not for --inference-only with --capella-api-key or your own key)"
+		command -v "$tool" >/dev/null || die "'$tool' is required for the infrastructure checks, --from and --create-api-key (not for --inference-only with --capella-api-key or your own key)"
 	done
 fi
 
@@ -398,10 +499,387 @@ step_aws() {
 	step "0. AWS credentials"
 	if ! CALLER=$(run check aws sts get-caller-identity --region "$REGION" --query Arn --output text); then
 		fail "AWS credentials missing or expired; refresh them (e.g. aws sso login, or re-export the session) and re-run"
-		hint "check with: aws sts get-caller-identity --region $REGION"
+		hint "profile ${AWS_PROFILE:-default} was used; check with: aws sts get-caller-identity --region $REGION${AWS_PROFILE:+ --profile $AWS_PROFILE}, or pass --aws-profile NAME"
 		exit 1
 	fi
-	allowed check && pass "AWS credentials: ${CALLER##*/}"
+	allowed check && pass "AWS credentials: ${CALLER##*/} (profile ${AWS_PROFILE:-default})"
+}
+
+# ---------- 0b. fetch the gateway config (--from without -c) ----------
+
+# gateway_rows ID REGION...: "region<TAB>instance<TAB>asg" for each running gateway instance
+# tagged with ID, in every REGION given. The regions are asked in parallel.
+gateway_rows() {
+	local id="$1" dir r
+	shift
+	printf '   %s[check] $ aws ec2 describe-instances --region <%s> --filters Name=tag-value,Values=%s Name=instance-state-name,Values=running%s\n' \
+		"$DIM" "$(tr ' ' '|' <<<"$*")" "$id" "$RST" | show check
+	allowed check || return 0
+	dir=$(mktemp -d "${TMPDIR:-/tmp}/aigw-doctor.XXXXXX") || return 1
+	for r in "$@"; do
+		aws ec2 describe-instances --region "$r" \
+			--filters "Name=tag-value,Values=$id" "Name=instance-state-name,Values=running" \
+			--query 'Reservations[].Instances[].[InstanceId, Tags[?Key==`aws:autoscaling:groupName`]|[0].Value]' \
+			--output text >"$dir/$r" 2>/dev/null &
+	done
+	wait
+	for r in "$@"; do
+		awk -F'\t' -v p="$AIGW_ASG_PREFIX" -v r="$r" 'index($2, p) == 1 {print r "\t" $1 "\t" $2}' "$dir/$r" 2>/dev/null
+	done
+	rm -rf "$dir"
+}
+
+# valid_config FILE: is this a gateway config (JSON with modelConfig.models)?
+valid_config() { jq -e '(.modelConfig.models | type) == "array"' "$1" >/dev/null 2>&1; }
+
+# node_config FILE: copy the gateway's live config file from the node through SSM. The file
+# is the one the running ai-gateway process reads (AIGW_CONFIG_FILE, default config.json in
+# its working directory). SSM returns at most 24,000 characters of output, so the file is
+# sent gzipped and base64-encoded, 20,000 characters per command.
+node_config() {
+	local out="$1" target="ssm:$AIGW_INSTANCE" data="" chunk part=0 total="" script
+	while [[ $part -lt 25 ]]; do
+		script="pid=\$(pgrep -o -x ai-gateway || pgrep -o -f 'bin/ai-gateway')
+[ -n \"\$pid\" ] || { echo NOPROC; exit 0; }
+f=\$(sudo cat /proc/\$pid/environ 2>/dev/null | tr '\\0' '\\n' | sed -n 's/^AIGW_CONFIG_FILE=//p')
+f=\${f:-config.json}
+case \"\$f\" in /*) ;; *) f=\$(sudo readlink /proc/\$pid/cwd)/\$f ;; esac
+sudo test -f \"\$f\" || { echo \"NOFILE \$f\"; exit 0; }
+b=\$(sudo cat \"\$f\" | gzip -c | base64 | tr -d '\\n')
+echo \"FILE \$f\"
+echo \"TOTAL \${#b}\"
+echo \"DATA \$(printf '%s' \"\$b\" | cut -c$((part * 20000 + 1))-$(((part + 1) * 20000)))\""
+		chunk=$(remote check "$target" "$script") || { NODE_WHY="the SSM command on $AIGW_INSTANCE failed"; return 1; }
+		if grep -q '^NOPROC' <<<"$chunk"; then NODE_WHY="no ai-gateway process is running on $AIGW_INSTANCE"; return 1; fi
+		if grep -q '^NOFILE' <<<"$chunk"; then NODE_WHY="the gateway has no config file at $(sed -n 's/^NOFILE //p' <<<"$chunk" | tr -d '\t')"; return 1; fi
+		total=$(sed -n 's/^TOTAL //p' <<<"$chunk" | tr -dc '0-9')
+		NODE_FILE=$(sed -n 's/^FILE //p' <<<"$chunk" | head -n 1 | tr -d '\t')
+		data+=$(sed -n 's/^DATA //p' <<<"$chunk" | tr -dc 'A-Za-z0-9+/=')
+		part=$((part + 1))
+		[[ -n "$total" && ${#data} -lt $total ]] || break
+	done
+	if [[ -z "$total" || ${#data} -ne $total ]]; then NODE_WHY="the config file did not arrive whole (${#data} of ${total:-?} characters)"; return 1; fi
+	printf '%s' "$data" | { base64 --decode 2>/dev/null || base64 -D; } | gunzip -c >"$out" 2>/dev/null
+	valid_config "$out" || { NODE_WHY="$NODE_FILE on the node is not a gateway config"; return 1; }
+}
+
+NODE_WHY="" NODE_FILE=""
+step_fetch_config() {
+	step "0b. Fetch the gateway config (--from $FROM)"
+	local rows="" regions n pick row ud key ud_region tmp dest src="" why="" old_umask node_ok=false
+
+	if ! allowed check; then
+		[[ -n "$AIGW_INSTANCE" ]] || gateway_rows "$FROM_ID" "$($REGION_SET && echo "$REGION" || echo "every-enabled-region")" >/dev/null
+		info "then: with several gateways, ask which one to use (by region)"
+		info "then: read tenantId, region, api and aigwConfigKey from the gateway instance's user data"
+		info "then: aws secretsmanager get-secret-value --secret-id <aigwConfigKey>, else the gateway's config file through SSM"
+		info "then: save it as $CONFIG_DIR/<name>.config.json (mode 600)"
+		note "dry run: the config is not fetched. Next: $0 --from $(shellquote "$FROM") --check"
+		[[ -n "$BUILD_URL" ]] && return 0
+		exit 0
+	fi
+
+	# 1. the tenant's gateways: running instances tagged with the id, in an ASG named
+	# <gateway prefix>..., in --region or else in every enabled region. One line per gateway
+	# (region and ASG); with several, the user picks.
+	if [[ -z "$AIGW_INSTANCE" ]]; then
+		if $REGION_SET; then
+			regions="$REGION"
+		else
+			regions=$(run check aws ec2 describe-regions --region "$REGION" --query 'Regions[].RegionName' --output text | tr '\t\n' '  ')
+			regions="${regions:-$REGION}"
+		fi
+		# shellcheck disable=SC2086
+		rows=$(gateway_rows "$FROM_ID" $regions | sort -u -t "$(printf '\t')" -k1,1 -k3,3)
+		n=$(grep -c . <<<"$rows")
+		if [[ "$n" -eq 0 ]]; then
+			fail "config: no running ${AIGW_ASG_PREFIX}* instance is tagged $FROM_ID in $($REGION_SET && echo "$REGION" || echo "any enabled region")"
+			hint "check the id and the AWS account (${CALLER:-unknown identity}); or pass --aigw-instance <id> to name the gateway"
+			exit 1
+		fi
+		if $LIST_GATEWAYS; then
+			awk -F'\t' '{printf "   GATEWAY %s %s %s\n", $1, $2, $3}' <<<"$rows"
+			exit 0
+		fi
+		pick=1
+		if [[ "$n" -gt 1 ]]; then
+			note "$n AI gateways are tagged $FROM_ID:"
+			awk -F'\t' '{printf "      %d) %-16s %s  %s\n", NR, $1, $3, $2}' <<<"$rows"
+			if { : >/dev/tty; } 2>/dev/null; then
+				printf '   %s?%s Which one? [1-%s] ' "$YEL" "$RST" "$n" >/dev/tty
+				read -r pick </dev/tty || pick=""
+				[[ "$pick" =~ ^[0-9]+$ && "$pick" -ge 1 && "$pick" -le "$n" ]] || { fail "config: no gateway picked"; exit 1; }
+			else
+				fail "config: $n gateways are tagged $FROM_ID; pick one"
+				hint "re-run with --region <one of the regions above>, or --aigw-instance <id> when a region has several"
+				exit 1
+			fi
+		fi
+		row=$(sed -n "${pick}p" <<<"$rows")
+		REGION=$(cut -f1 <<<"$row")
+		AIGW_INSTANCE=$(cut -f2 <<<"$row")
+		AIGW_ASG=$(cut -f3 <<<"$row")
+	fi
+	$SM_REGION_SET || SM_REGION="$REGION"
+	AIGW_TARGET=$(target_for "$AIGW_INSTANCE" "$AIGW_SSH" local)
+	pass "gateway: $AIGW_INSTANCE${AIGW_ASG:+ ($AIGW_ASG)} in $REGION"
+
+	# 2. its user data. Only four fields are kept; the certificate and key in it are dropped.
+	ud=$(run check aws ec2 describe-instance-attribute --region "$REGION" --instance-id "$AIGW_INSTANCE" \
+		--attribute userData --query UserData.Value --output text |
+		{ base64 --decode 2>/dev/null || base64 -D; } | jq -c '{tenantId, region, api, aigwConfigKey}' 2>/dev/null)
+	ud="${ud:-{\}}"
+	TENANT_ID="${TENANT_ID:-$(jq -r '.tenantId // empty' <<<"$ud")}"
+	key=$(jq -r '.aigwConfigKey // empty' <<<"$ud")
+	ud_region=$(jq -r '.region // empty' <<<"$ud")
+	if [[ -z "$CP_URL" ]]; then
+		CP_URL=$(jq -r '.api // empty' <<<"$ud")
+		[[ -n "$CP_URL" ]] && CP_URL=$(public_cp_url "$CP_URL")
+	fi
+	info "tenant id: ${TENANT_ID:-<not in user data>}, config secret: ${key:-<none>}, control plane: ${CP_URL:-<unknown>}"
+
+	# 3. the config: the secret the gateway loads it from, else its file on the node.
+	(umask 077 && mkdir -p "$CONFIG_DIR") || die "cannot create $CONFIG_DIR"
+	tmp="$CONFIG_DIR/.fetch.$$.json"
+	FETCH_TMP="$tmp"
+	if [[ -n "$key" ]]; then
+		if (umask 077 && run check aws secretsmanager get-secret-value --region "${ud_region:-$SM_REGION}" \
+			--secret-id "$key" --query SecretString --output text >"$tmp") && valid_config "$tmp"; then
+			src="secret $key"
+		else
+			why="the secret $key could not be read or is not a gateway config"
+			info "$why; trying the gateway's config file"
+		fi
+	fi
+	if [[ -z "$src" ]]; then
+		old_umask=$(umask)
+		umask 077
+		node_config "$tmp" && node_ok=true
+		umask "$old_umask"
+		if $node_ok; then
+			src="$NODE_FILE on $AIGW_INSTANCE"
+		else
+			rm -f "$tmp"
+			fail "config: could not fetch it: ${why:+$why; }$NODE_WHY"
+			hint "you need secretsmanager:GetSecretValue on the config secret, or ssm:SendCommand on the gateway instance; or copy the config by hand and pass -c"
+			exit 1
+		fi
+	fi
+
+	# 4. save it. A different earlier file of that name is kept as <name>.config.json.prev.
+	[[ -n "$SANDBOX_NAME" ]] || SANDBOX_NAME="gw-$(cut -c1-8 <<<"${TENANT_ID:-$FROM_ID}")-$REGION"
+	dest="$CONFIG_DIR/$SANDBOX_NAME.config.json"
+	if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
+		rm -f "$tmp"
+		pass "config: $(jq '[.modelConfig.models[]?] | length' "$dest") model(s) from $src; $dest is already up to date"
+	else
+		[[ -f "$dest" ]] && mv "$dest" "$dest.prev" && info "the earlier $dest is kept as $dest.prev"
+		mv "$tmp" "$dest" || die "cannot write $dest"
+		pass "config: $(jq '[.modelConfig.models[]?] | length' "$dest") model(s) from $src, saved to $dest"
+	fi
+	FETCH_TMP=""
+	CONFIG="$dest"
+	if $FETCH_ONLY; then
+		note "Next: $0 -c $(shellquote "$CONFIG") --region $REGION${TENANT_ID:+ --tenant-id $TENANT_ID} --check"
+		exit 0
+	fi
+}
+FETCH_TMP=""
+
+# ---------- install a gateway build (--install-build) ----------
+
+# build_file: the .gz to install. A folder URL is listed from this machine and the
+# linux-<arch>.gz in it is picked.
+BUILD_FILE_URL=""
+build_file() {
+	local base="$BUILD_URL" name
+	if [[ "$base" == *.gz ]]; then
+		BUILD_FILE_URL="$base"
+		return 0
+	fi
+	base="${base%/}/"
+	name=$(run check curl -fsS --max-time 30 "$base" | grep -o 'href="[^"]*"' | sed 's/^href="//; s/"$//' |
+		grep -E "linux-${BUILD_ARCH}\.gz$" | head -n 1)
+	if ! allowed check; then
+		BUILD_FILE_URL="${base}ai-gateway-<version>-linux-${BUILD_ARCH}.gz"
+		return 0
+	fi
+	if [[ -z "$name" ]]; then
+		fail "build: no linux-${BUILD_ARCH}.gz file is listed at $base"
+		hint "open the URL to check it (latestbuilds needs the VPN); or pass the .gz file's own URL, or --build-arch amd64"
+		return 1
+	fi
+	BUILD_FILE_URL="$base${name##*/}"
+}
+
+step_install_build() {
+	step "Install a gateway build ($BUILD_URL)"
+	local target out arch node_arch bin sha active reach method="" src shown_src remote_tmp local_gz key link script shown result new_sha backup unit="$AIGW_SERVICE"
+	target=$(target_for "$AIGW_INSTANCE" "$AIGW_SSH")
+	if allowed check && [[ -z "$target" ]]; then
+		fail "build: the gateway is not identified"
+		hint "pass --from <Capella URL>, --tenant-id <org id> or --aigw-instance <id>"
+		return 1
+	fi
+	target="${target:-ssm:<gateway instance>}"
+	build_file || return 1
+	info "build file: $BUILD_FILE_URL"
+
+	# 1. the node: its architecture, the service's binary, and whether it can reach the URL.
+	out=$(remote check "$target" "unit='$unit'
+echo \"ARCH \$(uname -m)\"
+pid=\$(systemctl show -p MainPID --value \"\$unit\" 2>/dev/null)
+bin=''
+[ -n \"\$pid\" ] && [ \"\$pid\" != 0 ] && bin=\$(sudo readlink /proc/\$pid/exe 2>/dev/null | sed 's/ (deleted)\$//')
+[ -n \"\$bin\" ] || bin=\$(systemctl show -p ExecStart --value \"\$unit\" 2>/dev/null | sed -n 's/.*path=\\([^ ;]*\\).*/\\1/p')
+echo \"BIN \$bin\"
+[ -n \"\$bin\" ] && echo \"SHA \$(sudo sha256sum \"\$bin\" 2>/dev/null | cut -c1-64)\"
+echo \"ACTIVE \$(systemctl is-active \"\$unit\" 2>/dev/null)\"
+curl -fsSI --max-time 15 -o /dev/null '$BUILD_FILE_URL' 2>/dev/null && echo 'REACH yes' || echo 'REACH no'")
+	if allowed check; then
+		node_arch=$(sed -n 's/^ARCH //p' <<<"$out" | head -n 1)
+		bin=$(sed -n 's/^BIN //p' <<<"$out" | head -n 1)
+		sha=$(sed -n 's/^SHA //p' <<<"$out" | head -n 1)
+		active=$(sed -n 's/^ACTIVE //p' <<<"$out" | head -n 1)
+		reach=$(sed -n 's/^REACH //p' <<<"$out" | head -n 1)
+		case "$node_arch" in aarch64 | arm64) arch=arm64 ;; x86_64 | amd64) arch=amd64 ;; *) arch="$node_arch" ;; esac
+		if [[ -z "$node_arch" ]]; then
+			fail "build: could not run a command on $(target_label "$target")"
+			hint "check SSM access to the instance (ssm:SendCommand), or pass --aigw-ssh user@host"
+			return 1
+		elif [[ -z "$bin" || "$bin" != /* ]]; then
+			fail "build: $unit has no binary path on $(target_label "$target") (is the unit name right?)"
+			hint "list the units on the node with: systemctl list-units 'ai-gateway*'; pass --aigw-service NAME"
+			return 1
+		elif [[ "$arch" != "$BUILD_ARCH" ]]; then
+			fail "build: the gateway node is $node_arch, the build picked is $BUILD_ARCH"
+			hint "re-run with --build-arch $arch"
+			return 1
+		fi
+		pass "gateway binary: $bin on $(target_label "$target") ($node_arch, service ${active:-unknown}, sha256 ${sha:0:12})"
+	else
+		bin="<binary of $unit>"
+		reach=yes
+	fi
+
+	# 2. how the build gets to the node.
+	if [[ "$reach" == yes ]]; then
+		method="downloaded by the gateway node"
+	elif [[ "$target" == ssh:* ]]; then
+		method="downloaded here and copied over ssh"
+	elif [[ -n "$BUILD_BUCKET" ]]; then
+		method="downloaded here and passed through s3://$BUILD_BUCKET"
+	else
+		fail "build: the gateway node cannot reach $BUILD_FILE_URL"
+		hint "pass --build-bucket <S3 bucket you can write to> (the build is uploaded, fetched by the node with a 15-minute link, then deleted), or --aigw-ssh user@host"
+		return 1
+	fi
+	info "the build is $method"
+
+	if [[ "$MODE" == check ]]; then
+		note "to install it: stop $unit, save $bin as $bin.bak-<time>, put the new binary in place, start $unit"
+		note "Next: re-run with --fix in place of --check"
+		multi_gateway_note
+		return 0
+	fi
+	if [[ "$MODE" == fix ]] && ! $ASSUME_YES &&
+		! confirm "replace $bin on $(target_label "$target") with ${BUILD_FILE_URL##*/}? $unit is stopped while it is replaced"; then
+		note "nothing was changed (answer y to the question, or pass --yes when there is no terminal)"
+		return 0
+	fi
+
+	# 3. get the .gz to the node (when the node cannot download it itself).
+	src="sudo curl -fsSL --max-time 900 -o \"\$tmp.gz\" '$BUILD_FILE_URL'"
+	shown_src="$src"
+	if [[ "$method" != "downloaded by the gateway node" ]]; then
+		resp_init
+		local_gz="$RESP_DIR/${BUILD_FILE_URL##*/}"
+		run fix curl -fsSL --max-time 900 -o "$local_gz" "$BUILD_FILE_URL" || { allowed fix && { fail "build: could not download $BUILD_FILE_URL here"; return 1; }; }
+		if [[ "$target" == ssh:* ]]; then
+			remote_tmp="/tmp/aigw-doctor-build.$$.gz"
+			run fix scp -o BatchMode=yes -o ConnectTimeout=10 "$local_gz" "${target#ssh:}:$remote_tmp" || { allowed fix && { fail "build: could not copy the build to ${target#ssh:}"; return 1; }; }
+			src="sudo mv '$remote_tmp' \"\$tmp.gz\""
+			shown_src="$src"
+		else
+			key="aigw-doctor/$(date +%Y%m%d%H%M%S)-$$/${BUILD_FILE_URL##*/}"
+			BUILD_S3="s3://$BUILD_BUCKET/$key"
+			run fix aws s3 cp --region "$REGION" --only-show-errors "$local_gz" "$BUILD_S3" || { allowed fix && { BUILD_S3=""; fail "build: could not upload to s3://$BUILD_BUCKET"; hint "you need s3:PutObject on the bucket"; return 1; }; }
+			link=$(run fix aws s3 presign --region "$REGION" --expires-in 900 "$BUILD_S3")
+			src="sudo curl -fsSL --max-time 900 -o \"\$tmp.gz\" '$link'"
+			shown_src="sudo curl -fsSL --max-time 900 -o \"\$tmp.gz\" '<15-minute link to $BUILD_S3>'"
+		fi
+	fi
+
+	# 4. on the node: unpack next to the binary, check it, stop, save, swap, start. If the
+	# service does not come up, the saved binary is put back and the service started again.
+	script="set -e
+unit='$unit'; bin='$bin'
+tmp=\$(sudo mktemp \"\$bin.new.XXXXXX\")
+trap 'sudo rm -f \"\$tmp\" \"\$tmp.gz\"' EXIT
+__SRC__
+sudo sh -c \"gunzip -c '\$tmp.gz' > '\$tmp'\"
+[ \"\$(sudo head -c 4 \"\$tmp\" | od -An -c | tr -d ' ')\" = '177ELF' ] || { echo 'RESULT notbinary'; exit 0; }
+m=\$(sudo od -An -t u1 -j 18 -N 1 \"\$tmp\" | tr -d ' ')
+case \"\$(uname -m):\$m\" in aarch64:183 | x86_64:62) ;; *) echo \"RESULT wrongarch \$m\"; exit 0 ;; esac
+echo \"NEWSHA \$(sudo sha256sum \"\$tmp\" | cut -c1-64)\"
+sudo chown --reference=\"\$bin\" \"\$tmp\"; sudo chmod --reference=\"\$bin\" \"\$tmp\"
+bak=\"\$bin.bak-\$(date +%Y%m%d-%H%M%S)\"
+sudo systemctl stop \"\$unit\"
+sudo cp -p \"\$bin\" \"\$bak\"
+echo \"BACKUP \$bak\"
+sudo mv -f \"\$tmp\" \"\$bin\"
+sudo systemctl start \"\$unit\" || true
+sleep 10
+if [ \"\$(systemctl is-active \"\$unit\")\" = active ]; then
+  echo 'RESULT ok'
+else
+  sudo journalctl -u \"\$unit\" -n 12 --no-pager 2>/dev/null | sed 's/^/LOG /'
+  sudo systemctl stop \"\$unit\" || true
+  sudo cp -p \"\$bak\" \"\$bin\"
+  sudo systemctl start \"\$unit\" || true
+  sleep 5
+  echo \"RESULT rolledback \$(systemctl is-active \"\$unit\")\"
+fi"
+	shown="${script/__SRC__/$shown_src}"
+	script="${script/__SRC__/$src}"
+	out=$(remote fix "$target" "$script" "$shown")
+	[[ -z "$BUILD_S3" ]] || { run fix aws s3 rm --region "$REGION" --only-show-errors "$BUILD_S3" && BUILD_S3=""; }
+	allowed fix || return 0
+
+	result=$(sed -n 's/^RESULT //p' <<<"$out" | tail -n 1)
+	new_sha=$(sed -n 's/^NEWSHA //p' <<<"$out" | head -n 1)
+	backup=$(sed -n 's/^BACKUP //p' <<<"$out" | head -n 1)
+	case "$result" in
+	ok)
+		BUILD_INSTALLED=true
+		pass "build: ${BUILD_FILE_URL##*/} is installed as $bin (sha256 ${new_sha:0:12}) and $unit is active"
+		note "the earlier binary is saved as $backup"
+		note "to go back: sudo systemctl stop $unit && sudo cp -p $backup $bin && sudo systemctl start $unit"
+		multi_gateway_note
+		;;
+	rolledback*)
+		fail "build: $unit did not start with the new binary; the earlier one was put back (service now ${result#rolledback })"
+		sed -n 's/^LOG //p' <<<"$out" | indent
+		hint "the lines above are the service's last log lines with the new build"
+		;;
+	notbinary) fail "build: ${BUILD_FILE_URL##*/} did not unpack to a Linux binary; nothing was changed" ;;
+	wrongarch*) fail "build: the unpacked binary is not built for this node; nothing was changed" ;;
+	*)
+		fail "build: the install did not finish on $(target_label "$target")${backup:+; the earlier binary is saved as $backup}"
+		hint "check the node: systemctl status $unit; the output of the run is in the full log"
+		tail -n 8 <<<"$out" | indent
+		;;
+	esac
+}
+BUILD_S3=""
+BUILD_INSTALLED=false
+
+# multi_gateway_note: only one instance is changed, and a replaced instance loses the build.
+multi_gateway_note() {
+	local n=0
+	[[ -n "${AIGW_ASG:-}" ]] && n=$(in_asg "$AIGW_ASG" | grep -c . || true)
+	[[ "$n" -gt 1 ]] && note "the gateway group $AIGW_ASG has $n instances; only $AIGW_INSTANCE gets the build"
+	note "an instance the Auto Scaling group replaces later starts with the released binary again"
 }
 
 # ---------- 1. gateway config ----------
@@ -2501,6 +2979,8 @@ cleanup() {
 	local rc=$?
 	batch_leftovers
 	delete_api_key
+	[[ -z "$FETCH_TMP" ]] || rm -f "$FETCH_TMP"
+	[[ -z "$BUILD_S3" ]] || aws s3 rm --region "$REGION" --only-show-errors "$BUILD_S3" 2>/dev/null
 	[[ -z "$RESP_DIR" ]] || rm -rf "$RESP_DIR"
 	[[ -z "$RUN_LOG" ]] || printf '%s# finished: %s, exit %s%s\n' "$MARK" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 		"$rc" "$( ((rc > 128)) && echo ' (interrupted)')"
@@ -2520,6 +3000,25 @@ fi
 
 if $NEED_AWS; then
 	step_aws
+fi
+$FETCH && step_fetch_config
+if [[ -n "$BUILD_URL" ]]; then
+	# Only the build is installed: find the gateway, then replace its binary.
+	if [[ -n "$CONFIG" ]]; then
+		step_config
+		[[ -n "$AIGW_INSTANCE$AIGW_SSH" ]] || step_locate_tenant
+	fi
+	step_install_build
+	if [[ "$MODE" == dry-run ]]; then
+		note "dry run only. Next: --check shows what would be replaced, --fix replaces it"
+		[[ -z "$RUN_LOG" ]] || note "Full log: $RUN_LOG"
+		exit 0
+	fi
+	printf '\n%sResult:%s %s%d passed%s, %s%d warnings%s, %s%d failed%s\n' "$B" "$RST" \
+		"$GRN" "$N_PASS" "$RST" "$YEL" "$N_WARN" "$RST" "$RED" "$N_FAIL" "$RST"
+	! $BUILD_INSTALLED || note "Next: run the checks against the new build with --check"
+	[[ -z "$RUN_LOG" ]] || note "Full log: $RUN_LOG"
+	exit "$FAILED"
 fi
 step_config
 if $INFRA; then

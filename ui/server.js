@@ -3,7 +3,8 @@
 // Server-Sent Events. Each sandbox keeps its own current (or last) run.
 //
 // It listens on 127.0.0.1 only, because the doctor runs with this machine's AWS
-// credentials. Only dry-run and check modes are offered: --fix asks for confirmation
+// credentials. Only dry-run and check modes are offered (apart from installing a gateway
+// build, which the page confirms first): --fix asks for confirmation
 // on the terminal, which a browser cannot answer.
 //
 // Secrets from .env (CP_PASSWORD, AIGW_API_KEY and their per-sandbox forms) never go to
@@ -232,7 +233,9 @@ const ADD_FIELDS = {
 // addSandbox: save an uploaded config into the config directory (or point at an existing
 // one) and append the sandbox's settings to .env as a commented block. Values are checked
 // against their patterns, so nothing else can be written into .env.
-function addSandbox(body) {
+// newSandbox: the checked name and .env lines of a sandbox to add; throws when the name is
+// taken or a value does not match its pattern.
+function newSandbox(body) {
   const name = String(body.name || '').trim();
   if (!SANDBOX_NAME.test(name)) throw new Error('name: letters, digits and dashes, e.g. dev-1');
   const env = readEnv();
@@ -247,10 +250,96 @@ function addSandbox(body) {
     if (!pattern.test(value)) throw new Error(`invalid ${field}: ${value}`);
     lines.push(`${prefix}_${key}=${/\s/.test(value) ? `"${value}"` : value}`);
   }
+  return { name, env, prefix, lines };
+}
+
+// newSandboxLines: as newSandbox, for a sandbox whose fetched config file is already in
+// the config folder (so the name is listed), checked by addFetchedSandbox beforehand.
+function newSandboxLines(body) {
+  const name = String(body.name || '').trim();
+  const env = readEnv();
+  const prefix = envPrefix(name);
+  const lines = [];
+  for (const [field, [key, pattern]] of Object.entries(ADD_FIELDS)) {
+    const value = String(body[field] ?? '').trim();
+    if (value && pattern.test(value)) lines.push(`${prefix}_${key}=${/\s/.test(value) ? `"${value}"` : value}`);
+  }
+  return { name, env, prefix, lines };
+}
+
+// fromParts: what "Capella URL or id" names. A console URL carries the organization
+// (?oid=<org id>, or /organizations/<org id>) and gives the control plane (api.<host>); a
+// bare id is looked up as a tag on the gateway's instances. Only the host and id go on.
+function fromParts(raw) {
+  const text = String(raw || '').trim();
+  const id = /^[0-9a-fA-F-]{8,64}$/;
+  if (id.test(text)) return { arg: text, id: text, cpUrl: '' };
+  const m = text.match(/^https:\/\/([\w.-]+)(?::\d+)?(?:[/?#]|$)/);
+  const oid = (text.match(/[?&]oid=([0-9a-fA-F-]{8,64})/) || text.match(/\/organizations\/([0-9a-fA-F-]{8,64})/) || [])[1];
+  if (!m || !oid) throw new Error('enter a Capella console URL that has the organization (…?oid=<org id>), or the organization id');
+  const host = m[1].startsWith('api.') ? m[1] : `api.${m[1]}`;
+  return { arg: `https://${m[1]}/?oid=${oid}`, id: oid, cpUrl: `https://${host}/v2/organizations/${oid}` };
+}
+
+// doctor: run the doctor script to the end and resolve to its output lines (no shell).
+function doctor(args, timeout = 180000) {
+  return new Promise((resolve) => {
+    execFile('bash', [SCRIPT, ...args, '--no-log'], { timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      const lines = `${stdout}\n${stderr}`.split('\n').map((l) => l.trim()).filter(Boolean);
+      resolve({ ok: !err, lines });
+    });
+  });
+}
+// doctorError: the script's own words for a failed step: its FAIL and HINT lines.
+function doctorError(lines, what) {
+  const said = lines.filter((l) => /^(FAIL|HINT|error:)/.test(l)).map((l) => l.replace(/^(FAIL|error:)\s*/, '').replace(/^HINT\s*/, 'Hint: '));
+  return new Error(said.length ? said.join(' ') : `${what} failed: ${lines.slice(-1)[0] || 'no output'}`);
+}
+
+// findGateways: the AI gateways of a tenant in every enabled region, found by the script
+// with this machine's AWS credentials.
+async function findGateways(body) {
+  const from = fromParts(body.from);
+  const region = String(body.region || '').trim();
+  if (region && !OPTIONS.region[1].test(region)) throw new Error(`invalid region: ${region}`);
+  const { ok, lines } = await doctor(['--from', from.arg, '--check', '--list-gateways', ...(region ? ['--region', region] : [])]);
+  if (!ok) throw doctorError(lines, 'the gateway lookup');
+  const gateways = lines.flatMap((l) => {
+    const m = l.match(/^GATEWAY (\S+) (i-[0-9a-f]+) (\S+)$/);
+    return m ? [{ region: m[1], instance: m[2], asg: m[3] }] : [];
+  });
+  return { id: from.id, cpUrl: from.cpUrl, gateways };
+}
+
+// addFetchedSandbox: add a sandbox whose config the script fetches from AWS: from the
+// secret named in the gateway's user data, else from the gateway's live config file.
+async function addFetchedSandbox(body) {
+  const from = fromParts(body.from);
+  const region = String(body.gatewayRegion || '').trim();
+  const instance = String(body.gatewayInstance || '').trim();
+  if (!OPTIONS.region[1].test(region) || !/^i-[0-9a-f]{8,17}$/.test(instance)) throw new Error('find the gateways first and pick one');
+  const filled = { ...body, region, cpUrl: String(body.cpUrl || '').trim() || from.cpUrl };
+  const { name, env } = newSandbox(filled); // name and values are checked before anything is fetched
+  const dir = expandHome(env.AIGW_CONFIG_DIR || DEFAULT_CONFIG_DIR);
+  if (fs.existsSync(path.join(dir, `${name}.config.json`))) throw Object.assign(new Error(`${name}.config.json already exists in ${dir}`), { status: 409 });
+  const { ok, lines } = await doctor(['--from', from.arg, '--region', region, '--aigw-instance', instance,
+    '--check', '--fetch-only', '--name', name, '--config-dir', dir]);
+  if (!ok) throw doctorError(lines, 'fetching the config');
+  const tenant = (lines.join('\n').match(/--tenant-id ([0-9a-fA-F-]{8,64})/) || [])[1] || '';
+  const added = addSandbox({ ...filled, tenantId: String(body.tenantId || '').trim() || tenant }, true);
+  return { ...added, source: (lines.find((l) => /^PASS config:/.test(l)) || '').replace(/^PASS config:\s*/, '') };
+}
+
+function addSandbox(body, fetched = false) {
+  const { name, env, prefix, lines } = fetched ? { ...newSandboxLines(body) } : newSandbox(body);
 
   let configFile;
   let listed = false; // whether the name must be added to SANDBOXES
-  if (typeof body.configJson === 'string' && body.configJson.trim()) {
+  if (fetched) {
+    // The script saved <name>.config.json in the config folder, where sandboxes are found.
+    if (!env.AIGW_CONFIG_DIR) lines.unshift(`AIGW_CONFIG_DIR=${DEFAULT_CONFIG_DIR}`);
+    configFile = path.join(expandHome(env.AIGW_CONFIG_DIR || DEFAULT_CONFIG_DIR), `${name}.config.json`);
+  } else if (typeof body.configJson === 'string' && body.configJson.trim()) {
     let parsed;
     try {
       parsed = JSON.parse(body.configJson);
@@ -1676,13 +1765,27 @@ function existingFile(value, label) {
 // buildArgs turns the form into doctor arguments, rejecting anything unexpected.
 function buildArgs(body) {
   if (!body.config) throw new Error('no config file yet: download it from Fleet Manager, then set the Config file field and Save to .env');
+  // Installing a gateway build is the one change the UI makes: the page asks first, and
+  // the script then runs with --fix --yes. Everything else is dry-run or check.
+  const build = body.installBuild && typeof body.installBuild === 'object' ? body.installBuild : null;
   if (!['dry-run', 'check'].includes(body.mode)) throw new Error('mode must be dry-run or check');
-  const args = ['--config', existingFile(body.config, 'config'), `--${body.mode}`, '--verbose'];
+  const mode = build && build.install === true ? 'fix' : body.mode;
+  const args = ['--config', existingFile(body.config, 'config'), `--${mode}`, '--verbose'];
   for (const [field, [flag, pattern]] of Object.entries(OPTIONS)) {
     const value = String(body[field] ?? '').trim();
     if (!value) continue;
     if (!pattern.test(value)) throw new Error(`invalid ${field}: ${value}`);
     args.push(flag, value);
+  }
+  if (build) {
+    const url = String(build.url || '').trim();
+    const bucket = String(build.bucket || '').trim();
+    if (!/^https:\/\/[A-Za-z0-9._:/~%+-]+$/.test(url)) throw new Error('enter the build URL, e.g. https://latestbuilds.service.couchbase.com/builds/latestbuilds/ai-gateway/1.2.1/11/');
+    if (bucket && !/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) throw new Error(`invalid S3 bucket name: ${bucket}`);
+    args.push('--install-build', url, '--build-arch', build.arch === 'amd64' ? 'amd64' : 'arm64');
+    if (bucket) args.push('--build-bucket', bucket);
+    if (mode === 'fix') args.push('--yes');
+    return args; // only the build is handled: no model probes, no API key
   }
   for (const [field, flag] of Object.entries(FLAGS)) {
     if (body[field] === true) args.push(flag);
@@ -1870,9 +1973,18 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (req.method === 'POST' && url.pathname === '/api/gateways') {
+    try {
+      return send(res, 200, await findGateways(await readJson(req)));
+    } catch (err) {
+      return send(res, err.status || 400, { error: err.message });
+    }
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/sandboxes') {
     try {
-      return send(res, 200, addSandbox(await readJson(req, MAX_CONFIG_BODY)));
+      const body = await readJson(req, MAX_CONFIG_BODY);
+      return send(res, 200, body.from ? await addFetchedSandbox(body) : addSandbox(body));
     } catch (err) {
       return send(res, err.status || 400, { error: err.message });
     }

@@ -23,6 +23,10 @@ It comes as a command-line script, `aigw-doctor.sh`, and a local web UI in `ui/`
 git clone https://github.com/couchbaselabs/ai-gateway-doctor.git
 cd ai-gateway-doctor
 
+# Simplest start: give the Capella URL of the organization. The script finds its AI gateways
+# with your AWS credentials, fetches the config and runs the checks
+./aigw-doctor.sh --from 'https://<console host>/product-hub/models?oid=<org id>' --check
+
 # Dry run: show every command, run nothing
 ./aigw-doctor.sh -c /path/to/gateway.config.json --region us-east-2 --tenant-id <tenant id>
 
@@ -34,7 +38,36 @@ cd ai-gateway-doctor
 cd ui && cp .env.example .env && $EDITOR .env && npm start   # http://127.0.0.1:4545
 ```
 
-The gateway config is the AI Gateway's `config.json`; a sandbox's Fleet Manager can provide it. Run `./aigw-doctor.sh --help` for every option.
+The gateway config is the AI Gateway's `config.json`. `--from` fetches it; a sandbox's Fleet Manager can also provide it. Run `./aigw-doctor.sh --help` for every option.
+
+### Starting from a Capella URL or id: `--from`
+
+`--from` takes a Capella console URL that carries the organization (`...?oid=<org id>` or `.../organizations/<org id>`), or a bare id that tags the gateway's instances (the organization id). It needs AWS credentials for the sandbox account: `--aws-profile NAME` picks the profile; without it the AWS CLI's usual choice applies, which is `AWS_PROFILE` if it is set and the `default` profile otherwise. The first result line names the profile used.
+
+- **Finding the gateway:** running instances tagged with the id, in an Auto Scaling group named `capella-ai-gateway-*`, are looked up in every enabled region (only in `--region` when you pass it). With one gateway it is used. With several you are asked which one, by region; without a terminal, pass `--region`.
+- **Fetching the config:** the gateway instance's user data names the Secrets Manager secret the gateway loads its config from (`aigwConfigKey`); the script reads that secret. Without it, or when it cannot be read, the script copies the gateway's live config file from the node through SSM. Only the tenant id, region, API URL and secret name are taken from the user data.
+- **Where it is saved:** `<name>.config.json`, mode 600, in `~/.aigw-doctor/configs` (`--config-dir`, or `AIGW_CONFIG_DIR`), the folder the UI lists sandboxes from. `--name` sets the name (default `gw-<org id start>-<region>`). A different earlier file of that name is kept as `.prev`.
+- **What else it sets:** the tenant id, the organization id and the control plane URL (`https://api.<console host>`), unless you pass them.
+- **Only fetch:** `--fetch-only` saves the config and stops; `--list-gateways` only lists the gateways.
+- **You need:** `ec2:DescribeInstances`, `ec2:DescribeRegions`, `ec2:DescribeInstanceAttribute`, and either `secretsmanager:GetSecretValue` on the config secret or `ssm:SendCommand` on the gateway instance.
+
+### Testing a new gateway build on a sandbox: `--install-build`
+
+```bash
+# What would happen: the gateway's binary, its architecture, how the build gets there. Changes nothing
+./aigw-doctor.sh --from '<Capella URL>' --install-build https://latestbuilds.service.couchbase.com/builds/latestbuilds/ai-gateway/1.2.1/11/ --check
+
+# Replace the binary (asks first; --yes skips the question)
+./aigw-doctor.sh --from '<Capella URL>' --install-build https://latestbuilds.service.couchbase.com/builds/latestbuilds/ai-gateway/1.2.1/11/ --fix
+```
+
+- **The build:** give the build folder and the `linux-arm64.gz` file in it is picked (`--build-arch amd64` for the other one), or give the `.gz` file itself. The architecture must match the gateway node, or nothing is changed.
+- **What it does on the gateway node:** downloads and unpacks the build next to the current binary, checks that it is a Linux binary for the node, stops `ai-gateway.service`, saves the current binary as `<binary>.bak-<time>`, puts the new one in place with the same owner and mode, and starts the service with `systemctl`. The binary is the one the service runs (`--aigw-service` names another unit).
+- **If the service does not start:** the saved binary is put back, the service is started again, and the run fails with the service's last log lines.
+- **Going back later:** the run prints the command, which copies the `.bak-<time>` file back and restarts the service.
+- **How the build reaches the node:** the node downloads it when it can reach the URL. If it cannot (latestbuilds is inside the VPN), this machine downloads it and passes it on: over ssh with `--aigw-ssh`, or through an S3 bucket with `--build-bucket NAME` (uploaded, fetched by the node with a 15-minute link, then deleted).
+- **Only this is done:** the checks are not run. Run them afterwards with `--check`.
+- **Limits:** one gateway instance is changed. An instance that the Auto Scaling group replaces later starts with the released binary again.
 
 ## The doctor script: `aigw-doctor.sh`
 Checks why the semantic cache stopped working, typically because the cache Couchbase cluster became unreachable when a volume on its EC2 node filled up. Then it confirms end to end that the deployed models answer and that repeated requests hit the cache. It runs these steps:
@@ -210,12 +243,14 @@ On the first start without a `.env`, the server creates one from `.env.example` 
   - **Where the link comes from:** the control plane URL (`api.<env>.<domain>` becomes `fm.<env>.<domain>`), or the sandbox name with `SANDBOX_DOMAIN` from `.env` (`fm.<sandbox>.<SANDBOX_DOMAIN>`).
   - **Override:** set `FM_URL` or `<NAME>_FM_URL` in `.env` for other environments.
 - **Adding a sandbox:** click **+ Add sandbox** under the list.
-  - **Fields:** a name (e.g. `my-sandbox`), a label, and the gateway config, either uploaded or as a path on this machine. Then the region, tenant id, control plane URL (the console API URL with `/v2/organizations/<org id>` works), Capella login and models.
+  - **Fetch from AWS (the default):** paste the Capella URL of the organization (it has `?oid=<org id>`) or the organization id and press **Find gateways**. The organization's AI gateways in every region are listed; pick one. **Add** then fetches that gateway's config with this machine's AWS credentials (see `--from` above), saves it in the config folder, and fills the region, tenant id and control plane URL.
+  - **Fields:** a name (e.g. `my-sandbox`), a label, and the gateway config, fetched, uploaded or as a path on this machine. Then the region, tenant id, control plane URL (the console API URL with `/v2/organizations/<org id>` works), Capella login and models.
   - **Without a config (Later):** the sandbox is saved by name, region and tenant id, so you can use its Capella UI and Fleet Manager links, its Couchbase console and its terminals right away. The nodes are found from the tenant's running instances by their ASG names (`capella-ai-gateway-*`, `capella-ds-*`). Runs, the Config tab, the Playground and copying the Couchbase credentials need the config. Add it later by setting the Config file path and pressing **Save to .env**, or by putting `<name>.config.json` in the config folder.
   - **Upload:** an uploaded config is saved as `<name>.config.json` in `AIGW_CONFIG_DIR` (default `~/.aigw-doctor/configs`), with mode 600.
   - **`.env`:** the settings are appended as a commented `<NAME>_*` block, and a path-based sandbox is also added to `SANDBOXES`.
   - **Passwords and API keys:** not written by the UI. Add `CP_PASSWORD` or `<NAME>_CP_PASSWORD` to `.env` yourself, or type them in the run form.
   - **By hand:** you can instead drop `<name>.config.json` into `AIGW_CONFIG_DIR` and add `<NAME>_*` keys to `.env`.
+- **Installing a gateway build:** **Install a gateway build** at the bottom of the run form takes the build URL, the architecture (arm64 by default) and, if needed, an S3 bucket. **Check first** shows what would be replaced. **Install build…** asks in the page, then runs `--install-build` with `--fix --yes`; the result appears under Results. This is the only change the UI makes to a sandbox.
 - **Deleting a sandbox:** **Delete** next to the sandbox title, after a confirmation, removes the sandbox's `<NAME>_*` lines, the comment header the UI wrote for it, and its `SANDBOXES` entry from `.env` (the previous file is kept as `.env.bak`).
   - **Config file:** one in `AIGW_CONFIG_DIR` is moved to `.deleted/` there, or the sandbox would be found again. A config elsewhere is left alone.
   - **Kept:** saved runs and logs.
