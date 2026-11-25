@@ -312,6 +312,12 @@ if [[ -n "$FROM" ]]; then
 		TENANT_ID="${TENANT_ID:-$FROM_ID}"
 	elif [[ "$FROM" =~ ^[0-9a-fA-F-]{8,64}$ ]]; then
 		FROM_ID="$FROM"
+		# With -c nothing is fetched: the id is then the organization, as in a URL. When
+		# the config is fetched, the tenant id is read from the gateway's user data.
+		if ! $FETCH; then
+			ORG_ID="${ORG_ID:-$FROM_ID}"
+			TENANT_ID="${TENANT_ID:-$FROM_ID}"
+		fi
 	else
 		die "--from takes a Capella console URL with the organization, or an id"
 	fi
@@ -425,18 +431,34 @@ remote() {
 	esac
 }
 
+# SSM_WAIT: how long (seconds) a remote command may run. The command gets the same limit on
+# the node (executionTimeout), so it cannot go on after the doctor stopped waiting.
+SSM_WAIT=180
 ssm_exec() {
 	local inst="$1" script="$2" cid status="" i
 	cid=$(aws ssm send-command --region "$REGION" --instance-ids "$inst" \
 		--document-name AWS-RunShellScript \
-		--parameters "$(jq -n --arg c "$script" '{commands: [$c]}')" \
+		--parameters "$(jq -n --arg c "$script" --arg t "$SSM_WAIT" '{commands: [$c], executionTimeout: [$t]}')" \
 		--query Command.CommandId --output text) || return 1
-	for i in $(seq 1 90); do
+	for i in $(seq 1 $((SSM_WAIT / 2 + 15))); do
 		status=$(aws ssm get-command-invocation --region "$REGION" --command-id "$cid" \
 			--instance-id "$inst" --query Status --output text 2>/dev/null || echo Pending)
 		case "$status" in Success | Failed | Cancelled | TimedOut) break ;; esac
 		sleep 2
 	done
+	# Still not finished: cancel it and wait for the node to confirm, so nothing is reported
+	# or cleaned up while the command may still be running.
+	case "$status" in Success | Failed | Cancelled | TimedOut) ;; *)
+		aws ssm cancel-command --region "$REGION" --command-id "$cid" --instance-ids "$inst" >/dev/null 2>&1
+		for i in $(seq 1 30); do
+			status=$(aws ssm get-command-invocation --region "$REGION" --command-id "$cid" \
+				--instance-id "$inst" --query Status --output text 2>/dev/null || echo Pending)
+			case "$status" in Success | Failed | Cancelled | TimedOut) break ;; esac
+			sleep 2
+		done
+		echo "SSM command $cid on $inst did not finish within ${SSM_WAIT}s; cancelled (status: $status)" >&2
+		;;
+	esac
 	aws ssm get-command-invocation --region "$REGION" --command-id "$cid" --instance-id "$inst" \
 		--query '[StandardOutputContent, StandardErrorContent]' --output text
 	[[ "$status" == Success ]]
@@ -507,6 +529,7 @@ step_aws() {
 
 # ---------- 0b. fetch the gateway config (--from without -c) ----------
 
+GATEWAY_ERRS="" # file: "region<TAB>error" for each region the lookup failed in
 # gateway_rows ID REGION...: "region<TAB>instance<TAB>asg" for each running gateway instance
 # tagged with ID, in every REGION given. The regions are asked in parallel.
 gateway_rows() {
@@ -520,10 +543,15 @@ gateway_rows() {
 		aws ec2 describe-instances --region "$r" \
 			--filters "Name=tag-value,Values=$id" "Name=instance-state-name,Values=running" \
 			--query 'Reservations[].Instances[].[InstanceId, Tags[?Key==`aws:autoscaling:groupName`]|[0].Value]' \
-			--output text >"$dir/$r" 2>/dev/null &
+			--output text >"$dir/$r" 2>"$dir/$r.err" || echo failed >"$dir/$r.failed" &
 	done
 	wait
 	for r in "$@"; do
+		# A region that could not be asked is recorded, so the list is never passed off as whole.
+		if [[ -e "$dir/$r.failed" ]]; then
+			[[ -z "$GATEWAY_ERRS" ]] || printf '%s\t%s\n' "$r" "$(tail -n 1 "$dir/$r.err" | tr '\t' ' ' | cut -c1-200)" >>"$GATEWAY_ERRS"
+			continue
+		fi
 		awk -F'\t' -v p="$AIGW_ASG_PREFIX" -v r="$r" 'index($2, p) == 1 {print r "\t" $1 "\t" $2}' "$dir/$r" 2>/dev/null
 	done
 	rm -rf "$dir"
@@ -566,7 +594,7 @@ echo \"DATA \$(printf '%s' \"\$b\" | cut -c$((part * 20000 + 1))-$(((part + 1) *
 NODE_WHY="" NODE_FILE=""
 step_fetch_config() {
 	step "0b. Fetch the gateway config (--from $FROM)"
-	local rows="" regions n pick row ud key ud_region tmp dest src="" why="" old_umask node_ok=false
+	local rows="" regions n pick row ud key ud_region tmp dest src="" why="" old_umask node_ok=false skipped=0 incomplete=false secret_region
 
 	if ! allowed check; then
 		[[ -n "$AIGW_INSTANCE" ]] || gateway_rows "$FROM_ID" "$($REGION_SET && echo "$REGION" || echo "every-enabled-region")" >/dev/null
@@ -589,28 +617,47 @@ step_fetch_config() {
 			regions=$(run check aws ec2 describe-regions --region "$REGION" --query 'Regions[].RegionName' --output text | tr '\t\n' '  ')
 			regions="${regions:-$REGION}"
 		fi
+		resp_init
+		GATEWAY_ERRS="$RESP_DIR/gateway-errors"
+		: >"$GATEWAY_ERRS"
 		# shellcheck disable=SC2086
 		rows=$(gateway_rows "$FROM_ID" $regions | sort -u -t "$(printf '\t')" -k1,1 -k3,3)
 		n=$(grep -c . <<<"$rows")
+		skipped=$(grep -c . "$GATEWAY_ERRS")
 		if [[ "$n" -eq 0 ]]; then
-			fail "config: no running ${AIGW_ASG_PREFIX}* instance is tagged $FROM_ID in $($REGION_SET && echo "$REGION" || echo "any enabled region")"
-			hint "check the id and the AWS account (${CALLER:-unknown identity}); or pass --aigw-instance <id> to name the gateway"
+			if [[ "$skipped" -gt 0 ]]; then
+				fail "config: no gateway tagged $FROM_ID was found, and $skipped region(s) could not be searched"
+				awk -F'\t' '{printf "%s: %s\n", $1, $2}' "$GATEWAY_ERRS" | indent
+				hint "refresh the AWS credentials or pass --region <the gateway's region>"
+			else
+				fail "config: no running ${AIGW_ASG_PREFIX}* instance is tagged $FROM_ID in $($REGION_SET && echo "$REGION" || echo "any enabled region")"
+				hint "check the id and the AWS account (${CALLER:-unknown identity}); or pass --aigw-instance <id> to name the gateway"
+			fi
 			exit 1
 		fi
 		if $LIST_GATEWAYS; then
 			awk -F'\t' '{printf "   GATEWAY %s %s %s\n", $1, $2, $3}' <<<"$rows"
+			awk -F'\t' '{printf "   UNSEARCHED %s %s\n", $1, $2}' "$GATEWAY_ERRS"
 			exit 0
 		fi
+		# Regions that could not be searched (no permission there, throttling): the list may
+		# miss a gateway, so say so and do not pick one silently.
+		if [[ "$skipped" -gt 0 ]]; then
+			warn "config: $skipped region(s) could not be searched, so the list of gateways may be incomplete"
+			awk -F'\t' '{printf "%s: %s\n", $1, $2}' "$GATEWAY_ERRS" | indent
+			hint "pass --region <region> to search only the gateway's region"
+			incomplete=true
+		fi
 		pick=1
-		if [[ "$n" -gt 1 ]]; then
-			note "$n AI gateways are tagged $FROM_ID:"
+		if [[ "$n" -gt 1 ]] || $incomplete; then
+			note "$n AI gateway(s) found tagged $FROM_ID:"
 			awk -F'\t' '{printf "      %d) %-16s %s  %s\n", NR, $1, $3, $2}' <<<"$rows"
 			if { : >/dev/tty; } 2>/dev/null; then
 				printf '   %s?%s Which one? [1-%s] ' "$YEL" "$RST" "$n" >/dev/tty
 				read -r pick </dev/tty || pick=""
 				[[ "$pick" =~ ^[0-9]+$ && "$pick" -ge 1 && "$pick" -le "$n" ]] || { fail "config: no gateway picked"; exit 1; }
 			else
-				fail "config: $n gateways are tagged $FROM_ID; pick one"
+				fail "config: $($incomplete && echo "the search was incomplete" || echo "$n gateways are tagged $FROM_ID"); pick one"
 				hint "re-run with --region <one of the regions above>, or --aigw-instance <id> when a region has several"
 				exit 1
 			fi
@@ -643,7 +690,10 @@ step_fetch_config() {
 	tmp="$CONFIG_DIR/.fetch.$$.json"
 	FETCH_TMP="$tmp"
 	if [[ -n "$key" ]]; then
-		if (umask 077 && run check aws secretsmanager get-secret-value --region "${ud_region:-$SM_REGION}" \
+		# The gateway reads the secret in its own region (user data); --sm-region overrides that.
+		secret_region="${ud_region:-$SM_REGION}"
+		$SM_REGION_SET && secret_region="$SM_REGION"
+		if (umask 077 && run check aws secretsmanager get-secret-value --region "$secret_region" \
 			--secret-id "$key" --query SecretString --output text >"$tmp") && valid_config "$tmp"; then
 			src="secret $key"
 		else
@@ -709,7 +759,15 @@ build_file() {
 		hint "open the URL to check it (latestbuilds needs the VPN); or pass the .gz file's own URL, or --build-arch amd64"
 		return 1
 	fi
-	BUILD_FILE_URL="$base${name##*/}"
+	# The name comes from the listing's HTML, and the URL goes into commands run on the
+	# gateway: only a plain file name is accepted.
+	name="${name##*/}"
+	if [[ ! "$name" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+		fail "build: the listing at $base names a file this script will not use: $(printf '%q' "$name")"
+		hint "pass the .gz file's own URL"
+		return 1
+	fi
+	BUILD_FILE_URL="$base$name"
 }
 
 step_install_build() {
@@ -718,11 +776,20 @@ step_install_build() {
 	target=$(target_for "$AIGW_INSTANCE" "$AIGW_SSH")
 	if allowed check && [[ -z "$target" ]]; then
 		fail "build: the gateway is not identified"
-		hint "pass --from <Capella URL>, --tenant-id <org id> or --aigw-instance <id>"
+		if [[ -n "$(in_asg "$AIGW_ASG_PREFIX")" ]]; then
+			hint "the gateway group has several instances; re-run with --aigw-instance <one of these>:"
+			in_asg "$AIGW_ASG_PREFIX" | indent
+		else
+			hint "pass --from <Capella URL>, --tenant-id <org id> or --aigw-instance <id>"
+		fi
 		return 1
 	fi
 	target="${target:-ssm:<gateway instance>}"
 	build_file || return 1
+	if allowed check && [[ ! "$BUILD_FILE_URL" =~ ^https://[A-Za-z0-9._:/~%+-]+$ ]]; then
+		fail "build: not a usable build URL: $(printf '%q' "$BUILD_FILE_URL")"
+		return 1
+	fi
 	info "build file: $BUILD_FILE_URL"
 
 	# 1. the node: its architecture, the service's binary, and whether it can reach the URL.
@@ -789,7 +856,7 @@ curl -fsSI --max-time 15 -o /dev/null '$BUILD_FILE_URL' 2>/dev/null && echo 'REA
 	fi
 
 	# 3. get the .gz to the node (when the node cannot download it itself).
-	src="sudo curl -fsSL --max-time 900 -o \"\$tmp.gz\" '$BUILD_FILE_URL'"
+	src="sudo curl -fsSL --max-time 600 -o \"\$tmp.gz\" '$BUILD_FILE_URL'"
 	shown_src="$src"
 	if [[ "$method" != "downloaded by the gateway node" ]]; then
 		resp_init
@@ -805,8 +872,8 @@ curl -fsSI --max-time 15 -o /dev/null '$BUILD_FILE_URL' 2>/dev/null && echo 'REA
 			BUILD_S3="s3://$BUILD_BUCKET/$key"
 			run fix aws s3 cp --region "$REGION" --only-show-errors "$local_gz" "$BUILD_S3" || { allowed fix && { BUILD_S3=""; fail "build: could not upload to s3://$BUILD_BUCKET"; hint "you need s3:PutObject on the bucket"; return 1; }; }
 			link=$(run fix aws s3 presign --region "$REGION" --expires-in 900 "$BUILD_S3")
-			src="sudo curl -fsSL --max-time 900 -o \"\$tmp.gz\" '$link'"
-			shown_src="sudo curl -fsSL --max-time 900 -o \"\$tmp.gz\" '<15-minute link to $BUILD_S3>'"
+			src="sudo curl -fsSL --max-time 600 -o \"\$tmp.gz\" '$link'"
+			shown_src="sudo curl -fsSL --max-time 600 -o \"\$tmp.gz\" '<15-minute link to $BUILD_S3>'"
 		fi
 	fi
 
@@ -824,25 +891,38 @@ case \"\$(uname -m):\$m\" in aarch64:183 | x86_64:62) ;; *) echo \"RESULT wronga
 echo \"NEWSHA \$(sudo sha256sum \"\$tmp\" | cut -c1-64)\"
 sudo chown --reference=\"\$bin\" \"\$tmp\"; sudo chmod --reference=\"\$bin\" \"\$tmp\"
 bak=\"\$bin.bak-\$(date +%Y%m%d-%H%M%S)\"
-sudo systemctl stop \"\$unit\"
 sudo cp -p \"\$bin\" \"\$bak\"
 echo \"BACKUP \$bak\"
-sudo mv -f \"\$tmp\" \"\$bin\"
-sudo systemctl start \"\$unit\" || true
+set +e
+# From here the service is touched: whatever fails, the saved binary goes back and the
+# service is started again (also when this script is ended early).
+phase=stopping
+restore() { sudo systemctl stop \"\$unit\" 2>/dev/null; sudo cp -p \"\$bak\" \"\$bin\"; sudo systemctl start \"\$unit\"; sleep 5; }
+trap 'sudo rm -f \"\$tmp\" \"\$tmp.gz\"; [ \"\$phase\" = done ] || { restore; echo \"RESULT interrupted \$(systemctl is-active \"\$unit\")\"; }' EXIT
+if ! sudo systemctl stop \"\$unit\"; then
+  sudo systemctl start \"\$unit\"; phase=done
+  echo \"RESULT stopfailed \$(systemctl is-active \"\$unit\")\"; exit 0
+fi
+phase=swapping
+if ! sudo mv -f \"\$tmp\" \"\$bin\"; then
+  restore; phase=done
+  echo \"RESULT swapfailed \$(systemctl is-active \"\$unit\")\"; exit 0
+fi
+sudo systemctl start \"\$unit\"
 sleep 10
 if [ \"\$(systemctl is-active \"\$unit\")\" = active ]; then
+  phase=done
   echo 'RESULT ok'
 else
   sudo journalctl -u \"\$unit\" -n 12 --no-pager 2>/dev/null | sed 's/^/LOG /'
-  sudo systemctl stop \"\$unit\" || true
-  sudo cp -p \"\$bak\" \"\$bin\"
-  sudo systemctl start \"\$unit\" || true
-  sleep 5
+  restore; phase=done
   echo \"RESULT rolledback \$(systemctl is-active \"\$unit\")\"
 fi"
 	shown="${script/__SRC__/$shown_src}"
 	script="${script/__SRC__/$src}"
+	SSM_WAIT=1200 # download (up to 10 minutes) plus stop, swap and start
 	out=$(remote fix "$target" "$script" "$shown")
+	SSM_WAIT=180
 	[[ -z "$BUILD_S3" ]] || { run fix aws s3 rm --region "$REGION" --only-show-errors "$BUILD_S3" && BUILD_S3=""; }
 	allowed fix || return 0
 
@@ -861,6 +941,11 @@ fi"
 		fail "build: $unit did not start with the new binary; the earlier one was put back (service now ${result#rolledback })"
 		sed -n 's/^LOG //p' <<<"$out" | indent
 		hint "the lines above are the service's last log lines with the new build"
+		;;
+	stopfailed*) fail "build: $unit could not be stopped; nothing was replaced (service now ${result#stopfailed })" ;;
+	swapfailed* | interrupted*)
+		fail "build: the binary could not be replaced; the earlier one was put back (service now ${result#* })"
+		hint "check free space and permissions next to $bin on the node"
 		;;
 	notbinary) fail "build: ${BUILD_FILE_URL##*/} did not unpack to a Linux binary; nothing was changed" ;;
 	wrongarch*) fail "build: the unpacked binary is not built for this node; nothing was changed" ;;
@@ -3004,8 +3089,13 @@ fi
 $FETCH && step_fetch_config
 if [[ -n "$BUILD_URL" ]]; then
 	# Only the build is installed: find the gateway, then replace its binary.
+	# The config is read only for the deployment id that names the gateway's ASG; its
+	# checks belong to a normal run.
 	if [[ -n "$CONFIG" ]]; then
-		step_config
+		CRED_KEY=$(jq -r '.modelServiceStoreConfig.defaults.dbCredKey // empty' "$CONFIG" 2>/dev/null)
+		DEPLOY_ID=""
+		[[ "$CRED_KEY" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_ ]] && DEPLOY_ID="${CRED_KEY%%_*}"
+		HAS_CB=false # the cache node is not needed here
 		[[ -n "$AIGW_INSTANCE$AIGW_SSH" ]] || step_locate_tenant
 	fi
 	step_install_build

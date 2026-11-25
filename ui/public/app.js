@@ -981,6 +981,8 @@ function showAdd(show) {
   if (show) {
     addForm.reset();
     setGateways([]);
+    foundFor = '';
+    autoFilled = {};
     $('add-find-msg').textContent = FIND_HINT;
     $('add-error').textContent = '';
     updateAddVisibility();
@@ -1009,6 +1011,7 @@ function updateAddVisibility() {
 const FIND_HINT = $('add-find-msg').textContent;
 let foundGateways = []; // [{ region, instance, asg }] for the URL or id last looked up
 let foundFor = '';
+let autoFilled = {}; // field -> the value the last lookup put there
 
 function setGateways(list) {
   foundGateways = list;
@@ -1043,18 +1046,31 @@ async function findGateways() {
   }
   foundFor = from;
   setGateways(data.gateways);
+  // A field the last lookup filled follows this lookup; one the user typed is left alone.
   const f = addForm.elements;
-  if (!f.cpUrl.value.trim() && data.cpUrl) f.cpUrl.value = data.cpUrl;
-  if (!f.tenantId.value.trim() && data.cpUrl) f.tenantId.value = data.id; // a URL names the organization
+  const fill = (name, value) => {
+    const now = f[name].value.trim();
+    if (!now || now === autoFilled[name]) {
+      f[name].value = value;
+      autoFilled[name] = value;
+    }
+  };
+  fill('cpUrl', data.cpUrl || '');
+  fill('tenantId', data.cpUrl ? data.id : ''); // a URL names the organization
   syncGatewayRegion();
-  msg.textContent = data.gateways.length === 1 ? 'Found one AI gateway.' : `Found ${data.gateways.length} AI gateways: pick the one for this sandbox.`;
+  const missed = (data.unsearched || []).map((u) => u.region).join(', ');
+  msg.textContent = (data.gateways.length === 1 ? 'Found one AI gateway.' : `Found ${data.gateways.length} AI gateways: pick the one for this sandbox.`)
+    + (missed ? ` Could not search ${missed}, so the list may be incomplete.` : '');
   updateAddVisibility();
   return data.gateways;
 }
 
 function syncGatewayRegion() {
   const g = foundGateways[Number($('add-gateway').value)];
-  if (g) addForm.elements.region.value = g.region;
+  if (g) {
+    addForm.elements.region.value = g.region;
+    autoFilled.region = g.region;
+  }
 }
 $('add-find').addEventListener('click', findGateways);
 $('add-gateway').addEventListener('change', syncGatewayRegion);
@@ -1069,7 +1085,11 @@ addForm.addEventListener('submit', async (e) => {
   $('add-error').textContent = '';
   const f = addForm.elements;
   const body = {};
-  for (const k of ['name', 'label', 'region', 'tenantId', 'cpUrl', 'cpUser', 'models']) body[k] = f[k].value.trim();
+  // Read after any lookup below has finished, so its values are the ones saved.
+  const readFields = () => {
+    for (const k of ['name', 'label', 'region', 'tenantId', 'cpUrl', 'cpUser', 'models']) body[k] = f[k].value.trim();
+  };
+  readFields();
   const source = addForm.querySelector('input[name="configSource"]:checked').value;
   if (source === 'fetch') {
     const from = f.from.value.trim();
@@ -1084,6 +1104,7 @@ addForm.addEventListener('submit', async (e) => {
       }
     }
     const g = foundGateways[Number($('add-gateway').value)];
+    readFields();
     Object.assign(body, { from, gatewayRegion: g.region, gatewayInstance: g.instance, region: g.region });
     $('add-error').textContent = 'Fetching the config…';
   } else if (source === 'later') {
@@ -1256,7 +1277,7 @@ function fillForm() {
   form.elements.cpJwt.value = ''; // a session JWT belongs to one control plane; never stored
   $('build-url').value = ''; // a build is installed on one sandbox: never carried to another
   $('build-bucket').value = '';
-  $('build-confirm').hidden = true;
+  cancelBuildQuestion();
   $('form-title').textContent = sb ? sb.label : 'Custom run';
   updateEditButtons();
   $('save-env-msg').hidden = true;
@@ -1420,17 +1441,28 @@ form.addEventListener('submit', async (e) => {
 
 // ---------- install a gateway build ----------
 
-// runBuild: start a doctor run that only handles the build: a check (nothing changes), or
-// the install itself after the question in the page was answered with yes.
-async function runBuild(install) {
-  $('form-error').textContent = '';
-  $('build-confirm').hidden = true;
+// buildRequest: the build run as the form stands now, or null (with a message) without a URL.
+function buildRequest(install) {
   const url = $('build-url').value.trim();
   if (!url) {
     $('form-error').textContent = 'enter the build URL';
-    return;
+    return null;
   }
-  const body = { ...formBody(), mode: 'check', installBuild: { url, arch: $('build-arch').value, bucket: $('build-bucket').value.trim(), install } };
+  return { ...formBody(), mode: 'check', installBuild: { url, arch: $('build-arch').value, bucket: $('build-bucket').value.trim(), install } };
+}
+
+// runBuild: start a doctor run that only handles the build: a check (nothing changes), or
+// the install itself. An install sends the request the question was asked about, not the
+// form as it stands when Yes is pressed.
+var confirmedBuild = null; // var: fillForm may run before this line
+function cancelBuildQuestion() {
+  confirmedBuild = null;
+  $('build-confirm').hidden = true;
+}
+async function runBuild(body) {
+  $('form-error').textContent = '';
+  cancelBuildQuestion();
+  if (!body) return;
   const resp = await fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!resp.ok) {
     $('form-error').textContent = (await resp.json()).error;
@@ -1443,18 +1475,21 @@ async function runBuild(install) {
   loadSandboxes();
   loadRuns();
 }
-$('build-check').addEventListener('click', () => runBuild(false));
+$('build-check').addEventListener('click', () => runBuild(buildRequest(false)));
 $('build-install').addEventListener('click', () => {
-  const url = $('build-url').value.trim();
-  if (!url) {
-    $('form-error').textContent = 'enter the build URL';
-    return;
-  }
-  $('build-confirm-text').textContent = `Replace the ai-gateway binary on ${current()?.label || 'this sandbox'} with the ${$('build-arch').value} build from ${url}? The gateway is down while it is replaced. `;
+  $('form-error').textContent = '';
+  confirmedBuild = buildRequest(true);
+  if (!confirmedBuild) return;
+  const b = confirmedBuild.installBuild;
+  const where = confirmedBuild.aigwInstance ? `gateway ${confirmedBuild.aigwInstance}` : 'the gateway';
+  $('build-confirm-text').textContent = `Replace the ai-gateway binary on ${where} of ${current()?.label || 'this sandbox'} with the ${b.arch} build from ${b.url}? The gateway is down while it is replaced. `;
   $('build-confirm').hidden = false;
 });
-$('build-yes').addEventListener('click', () => runBuild(true));
-$('build-no').addEventListener('click', () => { $('build-confirm').hidden = true; });
+$('build-yes').addEventListener('click', () => runBuild(confirmedBuild));
+$('build-no').addEventListener('click', cancelBuildQuestion);
+// Any edit of the form withdraws the question: what was asked no longer matches the form.
+form.addEventListener('input', cancelBuildQuestion);
+form.addEventListener('change', cancelBuildQuestion);
 
 $('cancel-btn').addEventListener('click', () => {
   fetch('/api/cancel', {

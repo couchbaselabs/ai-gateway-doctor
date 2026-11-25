@@ -235,10 +235,14 @@ const ADD_FIELDS = {
 // against their patterns, so nothing else can be written into .env.
 // newSandbox: the checked name and .env lines of a sandbox to add; throws when the name is
 // taken or a value does not match its pattern.
+// adding: names of sandboxes whose config is being fetched right now. A second add of the
+// same name is refused until the first is over, whichever way it adds the config.
+const adding = new Set();
 function newSandbox(body) {
   const name = String(body.name || '').trim();
   if (!SANDBOX_NAME.test(name)) throw new Error('name: letters, digits and dashes, e.g. dev-1');
   const env = readEnv();
+  if (adding.has(name.toLowerCase())) throw Object.assign(new Error(`sandbox ${name} is being added right now`), { status: 409 });
   if (sandboxList(env).some((s) => s.name.toLowerCase() === name.toLowerCase())) {
     throw Object.assign(new Error(`sandbox ${name} already exists`), { status: 409 });
   }
@@ -308,7 +312,12 @@ async function findGateways(body) {
     const m = l.match(/^GATEWAY (\S+) (i-[0-9a-f]+) (\S+)$/);
     return m ? [{ region: m[1], instance: m[2], asg: m[3] }] : [];
   });
-  return { id: from.id, cpUrl: from.cpUrl, gateways };
+  // Regions the lookup could not search (no permission there, throttling): the list may be incomplete.
+  const unsearched = lines.flatMap((l) => {
+    const m = l.match(/^UNSEARCHED (\S+) ?(.*)$/);
+    return m ? [{ region: m[1], error: m[2] }] : [];
+  });
+  return { id: from.id, cpUrl: from.cpUrl, gateways, unsearched };
 }
 
 // addFetchedSandbox: add a sandbox whose config the script fetches from AWS: from the
@@ -322,12 +331,19 @@ async function addFetchedSandbox(body) {
   const { name, env } = newSandbox(filled); // name and values are checked before anything is fetched
   const dir = expandHome(env.AIGW_CONFIG_DIR || DEFAULT_CONFIG_DIR);
   if (fs.existsSync(path.join(dir, `${name}.config.json`))) throw Object.assign(new Error(`${name}.config.json already exists in ${dir}`), { status: 409 });
-  const { ok, lines } = await doctor(['--from', from.arg, '--region', region, '--aigw-instance', instance,
-    '--check', '--fetch-only', '--name', name, '--config-dir', dir]);
-  if (!ok) throw doctorError(lines, 'fetching the config');
-  const tenant = (lines.join('\n').match(/--tenant-id ([0-9a-fA-F-]{8,64})/) || [])[1] || '';
-  const added = addSandbox({ ...filled, tenantId: String(body.tenantId || '').trim() || tenant }, true);
-  return { ...added, source: (lines.find((l) => /^PASS config:/.test(l)) || '').replace(/^PASS config:\s*/, '') };
+  // No await between the checks above and this reservation, so two requests cannot both pass.
+  const key = name.toLowerCase();
+  adding.add(key);
+  try {
+    const { ok, lines } = await doctor(['--from', from.arg, '--region', region, '--aigw-instance', instance,
+      '--check', '--fetch-only', '--name', name, '--config-dir', dir]);
+    if (!ok) throw doctorError(lines, 'fetching the config');
+    const tenant = (lines.join('\n').match(/--tenant-id ([0-9a-fA-F-]{8,64})/) || [])[1] || '';
+    const added = addSandbox({ ...filled, tenantId: String(body.tenantId || '').trim() || tenant }, true);
+    return { ...added, source: (lines.find((l) => /^PASS config:/.test(l)) || '').replace(/^PASS config:\s*/, '') };
+  } finally {
+    adding.delete(key);
+  }
 }
 
 function addSandbox(body, fetched = false) {
