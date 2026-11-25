@@ -40,20 +40,35 @@
           </div>
           <h3>Gateway config</h3>
           <div class="segmented" role="radiogroup" aria-label="Config source">
-            <label><input type="radio" name="configSource" value="upload" checked><span>Upload config.json</span></label>
+            <label><input type="radio" name="configSource" value="fetch" checked><span>Fetch from AWS</span></label>
+            <label><input type="radio" name="configSource" value="upload"><span>Upload config.json</span></label>
             <label><input type="radio" name="configSource" value="path"><span>Path on this machine</span></label>
             <label><input type="radio" name="configSource" value="later"><span>Later</span></label>
           </div>
           <p class="hint config-later" hidden>Without a config you can still open the sandbox's Capella UI, Fleet Manager,
             Couchbase console and terminals (set the tenant id below). Add the config later by setting its path and
             Save to .env, or by putting <code>&lt;name&gt;.config.json</code> in the config folder.</p>
-          <label class="config-upload">Config file
+          <div class="config-fetch">
+            <label>Capella URL or organization id
+              <input name="from" id="add-from" placeholder="https://<console host>/product-hub/models?oid=<org id>">
+            </label>
+            <div class="row">
+              <button type="button" class="small-btn" id="add-find">Find gateways</button>
+              <label id="add-gateway-label" hidden>AI gateway
+                <select name="gateway" id="add-gateway"></select>
+              </label>
+            </div>
+            <p class="hint" id="add-find-msg">Finds the organization's AI gateways in every AWS region with this machine's AWS
+              credentials, then reads the config of the one you pick (from its Secrets Manager secret, else from the gateway
+              node) and saves it in the config folder.</p>
+          </div>
+          <label class="config-upload" hidden>Config file
             <input name="configFile" type="file" accept=".json,application/json">
           </label>
           <label class="config-path" hidden>Config path
-            <input name="configPath" placeholder="~/aigw-doctor/configs/my-sandbox.config.json">
+            <input name="configPath" placeholder="~/.aigw-doctor/configs/my-sandbox.config.json">
           </label>
-          <p class="hint">Download the AI gateway config from the sandbox's Fleet Manager
+          <p class="hint config-manual">Download the AI gateway config from the sandbox's Fleet Manager
             (<a class="fm-link" target="_blank" rel="noopener">https://fm.&lt;sandbox&gt;.&lt;domain&gt;/</a>).</p>
         </section>
         <section class="group">
@@ -115,7 +130,7 @@
         <section class="group">
           <h3>Deployment</h3>
           <label>Config file
-            <input name="config" required placeholder="~/aigw-doctor/configs/my-sandbox.config.json">
+            <input name="config" required placeholder="~/.aigw-doctor/configs/my-sandbox.config.json">
           </label>
           <a class="fm-link small" target="_blank" rel="noopener" hidden>Get this sandbox's AI gateway config from Fleet Manager ↗</a>
           <div class="row">
@@ -210,6 +225,39 @@
             <input type="checkbox" name="probeRateLimit"> Test rate limits (one burst per limited model)</label>
           <label class="check-inline" title="Submits a two-request batch to each model with batch enabled and waits up to 5 minutes for its results. The probe's files are deleted afterwards.">
             <input type="checkbox" name="probeBatch"> Test batch (a two-request batch per batch model)</label>
+        </section>
+
+        <section class="group">
+          <details id="build-box">
+            <summary>Install a gateway build (to test a new build on this sandbox)</summary>
+            <label>Build URL (a build folder, or the .gz file)
+              <input name="buildUrl" id="build-url" placeholder="https://latestbuilds.service.couchbase.com/builds/latestbuilds/ai-gateway/1.2.1/11/">
+            </label>
+            <div class="row">
+              <label>Architecture
+                <select name="buildArch" id="build-arch">
+                  <option value="arm64" selected>arm64 (default)</option>
+                  <option value="amd64">amd64</option>
+                </select>
+              </label>
+              <label>S3 bucket (only if the gateway cannot reach the URL)
+                <input name="buildBucket" id="build-bucket" placeholder="optional">
+              </label>
+            </div>
+            <div class="actions">
+              <button type="button" class="small-btn" id="build-check">Check first</button>
+              <button type="button" class="small-btn" id="build-install">Install build…</button>
+              <span id="build-confirm" hidden>
+                <span id="build-confirm-text"></span>
+                <button type="button" class="small-btn" id="build-yes">Yes, replace it</button>
+                <button type="button" class="small-btn" id="build-no">No</button>
+              </span>
+            </div>
+            <p class="hint">Stops <code>ai-gateway.service</code> on the sandbox's gateway, saves the current binary as
+              <code>&lt;binary&gt;.bak-&lt;time&gt;</code>, puts the build in place and starts the service with systemctl. If the
+              service does not come up, the saved binary is put back. Check first shows the gateway's binary and how the build
+              gets there, and changes nothing. The result appears under Results.</p>
+          </details>
         </section>
 
         <div class="actions">
