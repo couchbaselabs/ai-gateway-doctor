@@ -76,6 +76,9 @@
 #                          (default: $AIGW_CONFIG_DIR, else the folder in ui/.env,
 #                          else ~/.aigw-doctor/configs)
 #   --fetch-only           with --from and --check: save the config and stop
+#   --list-models          with --from URL (or --cp-url and --org-id), --cp-user and --check:
+#                          list the organization's models and the gateway endpoint of each
+#                          region from the Capella control plane; needs no AWS and no config
 #   --list-gateways        with --from and --check: list the tenant's gateways
 #                          (GATEWAY <region> <instance> <ASG> lines) and stop
 #   --install-build URL    replace the ai-gateway binary on the sandbox gateway with a build, to
@@ -212,6 +215,7 @@ fi
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.aigw-doctor/configs}"
 FETCH_ONLY=false
 LIST_GATEWAYS=false
+LIST_MODELS=false
 BUILD_URL=""
 BUILD_ARCH="arm64"
 BUILD_BUCKET=""
@@ -271,6 +275,7 @@ while [[ $# -gt 0 ]]; do
 	--config-dir) CONFIG_DIR="$2"; shift ;;
 	--fetch-only) FETCH_ONLY=true ;;
 	--list-gateways) LIST_GATEWAYS=true ;;
+	--list-models) LIST_MODELS=true ;;
 	--install-build) BUILD_URL="$2"; shift ;;
 	--build-arch) BUILD_ARCH="$2"; shift ;;
 	--build-bucket) BUILD_BUCKET="$2"; shift ;;
@@ -315,11 +320,16 @@ while [[ $# -gt 0 ]]; do
 	shift
 done
 die() { echo "error: $*" >&2; exit 1; }
-[[ -n "$CONFIG" || -n "$FROM" ]] || { echo "error: -c/--config is required (or --from URL|ID to fetch it)" >&2; usage 1; }
+[[ -n "$CONFIG" || -n "$FROM" ]] || $LIST_MODELS || { echo "error: -c/--config is required (or --from URL|ID to fetch it)" >&2; usage 1; }
 [[ -z "$CONFIG" || -f "$CONFIG" ]] || die "config not found: $CONFIG"
 # --from without -c: the config is fetched from AWS before the run (step 0b).
 FETCH=false
 [[ -n "$FROM" && -z "$CONFIG" ]] && FETCH=true
+# --list-models asks only the Capella control plane: no config, no AWS.
+if $LIST_MODELS; then
+	FETCH=false
+	INFRA=false
+fi
 ! $FETCH_ONLY || $FETCH || die "--fetch-only needs --from, and no -c"
 ! $LIST_GATEWAYS || $FETCH || die "--list-gateways needs --from, and no -c"
 [[ -z "$SANDBOX_NAME" || "$SANDBOX_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "--name may hold letters, digits, dots, dashes and underscores"
@@ -384,6 +394,7 @@ FETCH_REGIONS="${AIGW_FETCH_REGIONS:-us-east-1 us-east-2}"
 # A control plane session comes from a login (--cp-user) or from a JWT in CP_JWT.
 CP_AUTH=false
 [[ -n "$CP_USER" || -n "${CP_JWT:-}" ]] && CP_AUTH=true
+! $LIST_MODELS || $CP_AUTH || die "--list-models needs a Capella sign-in: --cp-user EMAIL (password in CP_PASSWORD, or a prompt), or a session JWT in CP_JWT"
 ! $CAPELLA_KEY || $CP_AUTH || die "--capella-api-key needs a Capella sign-in: --cp-user EMAIL, or a session JWT in CP_JWT"
 ! $INFRA && $SKIP_INFERENCE && die "--inference-only and --skip-inference leave nothing to run"
 ! $INFRA && [[ "$MODE" == fix ]] && die "--inference-only has nothing to fix; use --check"
@@ -2140,28 +2151,22 @@ cp_session() {
 	info "logged in to $CP_URL as $CP_USER"
 }
 
-step_cp_endpoint() {
-	[[ -z "$AIGW_URL" ]] && $CP_AUTH || return 0
-	$SKIP_INFERENCE && return 0
-	step "7a. Gateway endpoint from the Capella control plane"
-	local org jwt code page last all="[]" endpoints n
-	cp_resolve || return 0
-	org="$CP_ORG"
-	cp_session || return 0
-	jwt="$CP_SESSION"
+# cp_models ORG JWT: the organization's language models from the control plane, as a JSON
+# array in CP_MODELS. Returns 1 (after a FAIL) when they cannot be listed.
+CP_MODELS="[]"
+cp_models() {
+	local org="$1" jwt="$2" code page=1 last=1 all="[]"
 	printf '   %s[check] $ curl -sk %s/v2/organizations/%s/languagemodels?page=1\&perPage=100 -H %s%s\n' \
 		"$DIM" "$CP_URL" "$org" "'Authorization: Bearer <session jwt>'" "$RST" | show check
 	allowed check || return 0
 	resp_init
-
-	page=1 last=1
 	while ((page <= last && page <= 50)); do
 		code=$(curl -sk --max-time 30 -K <(bearer_config "$jwt") -o "$RESP_FILE" -w '%{http_code}' \
 			"$CP_URL/v2/organizations/$org/languagemodels?page=$page&perPage=100")
 		if [[ "$code" != 200 ]]; then
 			fail "control plane: listing language models in org $org returned HTTP $code: $(resp_error)"
 			hint "HTTP 403/404: the org id may be wrong; pass --org-id <the UUID after /organizations/ in the console URL>"
-			return 0
+			return 1
 		fi
 		# Items are wrapped as {"data": {...model...}}; accept unwrapped items too.
 		all=$(jq -s '.[0] + [.[1].data[]? | (.data // .)]' <(printf '%s' "$all") "$RESP_FILE")
@@ -2170,6 +2175,44 @@ step_cp_endpoint() {
 		page=$((page + 1))
 	done
 	: >"$RESP_FILE"
+	CP_MODELS="$all"
+}
+
+# step_list_models (--list-models): the organization's models and the gateway endpoint each
+# region serves them from, read from the Capella control plane alone (no AWS, no config).
+# One "MODEL <region> <status> <endpoint> <id> <name>" line per model, "-" where there is none.
+step_list_models() {
+	step "Models of the organization (Capella control plane)"
+	local n
+	cp_resolve || return 0
+	cp_session || return 0
+	cp_models "$CP_ORG" "$CP_SESSION" || return 0
+	allowed check || return 0
+	n=$(jq 'length' <<<"$CP_MODELS")
+	if [[ "$n" -eq 0 ]]; then
+		fail "control plane: organization $CP_ORG has no language models"
+		hint "deploy a model in the Capella console (AI Services, Models), or check the organization id"
+		return 0
+	fi
+	jq -r '.[] | ["   MODEL", (.modelConfig.cloudConfig.region.name // "-"), (.modelConfig.status // "-" | gsub("\\s"; "_")),
+		(.network.endpoint // "-" | if . == "" then "-" else . end), (.id // .modelConfig.id // "-"),
+		(.modelConfig.modelName // .name // "-")] | join(" ")' <<<"$CP_MODELS"
+	pass "control plane: $n model(s) in $CP_ORG; gateway endpoints: $(jq -r '[.[] | select((.network.endpoint // "") != "") |
+		"\(.modelConfig.cloudConfig.region.name // "?") \(.network.endpoint)"] | unique | join(", ") | if . == "" then "none yet" else . end' <<<"$CP_MODELS")"
+}
+
+step_cp_endpoint() {
+	[[ -z "$AIGW_URL" ]] && $CP_AUTH || return 0
+	$SKIP_INFERENCE && return 0
+	step "7a. Gateway endpoint from the Capella control plane"
+	local org jwt all="[]" endpoints n
+	cp_resolve || return 0
+	org="$CP_ORG"
+	cp_session || return 0
+	jwt="$CP_SESSION"
+	cp_models "$org" "$jwt" || return 0
+	allowed check || return 0
+	all="$CP_MODELS"
 
 	jq -r '.[] | "\(.modelConfig.modelName // .name // "-")  region=\(.modelConfig.cloudConfig.region.name // "-")  status=\(.modelConfig.status // "-")  endpoint=\(.network.endpoint // "-")"' \
 		<<<"$all" | vindent
@@ -3237,6 +3280,10 @@ elif ! $VERBOSE; then
 	note "${DIM}--verbose shows commands and details${RST}"
 fi
 
+if $LIST_MODELS; then
+	step_list_models
+	exit "$FAILED"
+fi
 if $NEED_AWS; then
 	step_aws
 fi

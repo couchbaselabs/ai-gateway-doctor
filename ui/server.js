@@ -293,9 +293,11 @@ function fromParts(raw, tenantId = '') {
 }
 
 // doctor: run the doctor script to the end and resolve to its output lines (no shell).
-function doctor(args, timeout = 180000) {
+// extraEnv carries a secret (CP_PASSWORD) to the script without putting it on a command line.
+function doctor(args, timeout = 180000, extraEnv = null) {
   return new Promise((resolve) => {
-    execFile('bash', [SCRIPT, ...args, '--no-log'], { timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const opts = { timeout, maxBuffer: 4 * 1024 * 1024, ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}) };
+    execFile('bash', [SCRIPT, ...args, '--no-log'], opts, (err, stdout, stderr) => {
       const lines = `${stdout}\n${stderr}`.split('\n').map((l) => l.trim()).filter(Boolean);
       resolve({ ok: !err, lines });
     });
@@ -330,6 +332,42 @@ async function findGateways(body) {
     return m ? [{ region: m[1], error: m[2] }] : [];
   });
   return { id: from.id, cpUrl: from.cpUrl, gateways, unsearched };
+}
+
+// findModels: the second way to find a tenant's gateways: its models, from the Capella
+// control plane (AI Services, Models), with the gateway endpoint each region serves them
+// from. It needs a Capella sign-in: the login and password typed in the form, else CP_USER
+// and CP_PASSWORD from .env. The password goes to the script in its environment only.
+async function findModels(body) {
+  const env = readEnv();
+  const typedCp = String(body.cpUrl || '').trim().replace(/\/+$/, '');
+  if (typedCp && !OPTIONS.cpUrl[1].test(typedCp)) throw new Error('invalid Control plane URL');
+  const from = fromParts(body.from, body.tenantId);
+  const cpUrl = typedCp || from.cpUrl;
+  if (!cpUrl) throw new Error('an organization id alone does not name the Capella environment: paste a Capella URL, or fill in Control plane URL');
+  const user = String(body.cpUser || '').trim() || envValue(env, '', 'CP_USER');
+  const password = (typeof body.cpPassword === 'string' && body.cpPassword) || envValue(env, '', 'CP_PASSWORD');
+  if (!user || !password) {
+    throw new Error(`the Capella lookup needs the Capella login and password: ${!user ? 'type the login (email)' : 'type the password'}, or set CP_USER and CP_PASSWORD in .env`);
+  }
+  if (!OPTIONS.cpUser[1].test(user)) throw new Error('the Capella login must be an email address');
+  const { ok, lines } = await doctor(['--list-models', '--check', '--cp-url', cpUrl, '--org-id', from.id, '--cp-user', user], 90000, { CP_PASSWORD: password });
+  if (!ok) throw doctorError(lines, 'the Capella lookup');
+  // MODEL <region> <status> <endpoint> <id> <name>, "-" where there is none.
+  const models = lines.flatMap((l) => {
+    const m = l.match(/^MODEL (\S+) (\S+) (\S+) (\S+) (.+)$/);
+    const val = (v) => (v !== '-' ? v : '');
+    return m ? [{ region: val(m[1]), status: val(m[2]), endpoint: /^https?:\/\/[\w.:/-]+$/.test(m[3]) ? m[3] : '', id: val(m[4]), name: m[5] }] : [];
+  });
+  // One gateway per region and endpoint, with the models it serves.
+  const byKey = new Map();
+  for (const m of models) {
+    if (!m.region) continue;
+    const key = `${m.region} ${m.endpoint}`;
+    if (!byKey.has(key)) byKey.set(key, { region: m.region, url: m.endpoint, models: [] });
+    byKey.get(key).models.push({ name: m.name, status: m.status });
+  }
+  return { id: from.id, cpUrl, user, models, gateways: [...byKey.values()].sort((a, b) => a.region.localeCompare(b.region)) };
 }
 
 // addFetchedSandbox: add a sandbox whose config the script fetches from AWS: from the
@@ -2001,6 +2039,14 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, saveSettings(await readJson(req)));
     } catch (err) {
       return send(res, 400, { error: err.message });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/models') {
+    try {
+      return send(res, 200, await findModels(await readJson(req)));
+    } catch (err) {
+      return send(res, err.status || 400, { error: err.message });
     }
   }
 

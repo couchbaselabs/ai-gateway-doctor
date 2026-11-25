@@ -59,9 +59,18 @@
               </label>
             </div>
             <div class="hint" id="add-gateway-details" hidden></div>
+            <div class="row">
+              <button type="button" class="small-btn" id="add-find-cp">Find through Capella</button>
+              <label>Capella password
+                <input type="password" name="cpPassword" autocomplete="off" placeholder="not saved; empty uses CP_PASSWORD from .env">
+              </label>
+            </div>
+            <div class="hint" id="add-models" hidden></div>
             <p class="hint" id="add-find-msg">Finds the organization's AI gateways in the Region below (us-east-1 and us-east-2 when it is empty) with this machine's AWS
               credentials, then reads the config of the one you pick (from its Secrets Manager secret, else from the gateway
-              node) and saves it in the config folder.</p>
+              node) and saves it in the config folder. <strong>Find through Capella</strong> is a second way to find them: it signs in to
+              the Capella control plane with the Capella login below and this password (or CP_USER and CP_PASSWORD from .env) and lists
+              the organization's models and the gateway URL of each region.</p>
           </div>
           <label class="config-upload" hidden>Config file
             <input name="configFile" type="file" accept=".json,application/json">

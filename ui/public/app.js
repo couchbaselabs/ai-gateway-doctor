@@ -983,6 +983,7 @@ function showAdd(show) {
     setGateways([]);
     foundFor = '';
     autoFilled = {};
+    $('add-models').hidden = true;
     $('add-find-msg').textContent = FIND_HINT;
     $('add-error').textContent = '';
     updateAddVisibility();
@@ -1093,7 +1094,58 @@ function syncGatewayRegion() {
     autoFilled.region = g.region;
   }
 }
+// findThroughCapella: the second way to find the gateways: the organization's models from
+// the Capella control plane, with the gateway URL of each region. It needs the Capella login
+// and password (typed, or CP_USER and CP_PASSWORD from .env). The AWS instance, which the
+// config fetch needs, is then looked up in the region the models are served from.
+async function findThroughCapella() {
+  const f = addForm.elements;
+  const msg = $('add-find-msg');
+  const box = $('add-models');
+  const from = f.from.value.trim();
+  if (!from) {
+    msg.textContent = 'Paste the Capella URL of the organization (it has ?oid=<org id>) first.';
+    return;
+  }
+  $('add-find-cp').disabled = true;
+  msg.textContent = 'Signing in to Capella and listing the organization\'s models…';
+  let resp; let data;
+  try {
+    resp = await fetch('/api/models', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, tenantId: f.tenantId.value.trim(), cpUrl: f.cpUrl.value.trim(), cpUser: f.cpUser.value.trim(), cpPassword: f.cpPassword.value }),
+    });
+    data = await resp.json();
+  } catch (err) {
+    data = { error: err.message };
+  }
+  $('add-find-cp').disabled = false;
+  if (!resp?.ok) {
+    box.hidden = true;
+    msg.textContent = data.error || 'the Capella lookup failed';
+    return;
+  }
+  box.hidden = false;
+  box.replaceChildren(
+    el('div', {}, el('strong', {}, `${data.models.length} model(s) in Capella, signed in as ${data.user}`)),
+    ...data.gateways.map((g) => el('div', {},
+      el('strong', {}, `${g.region}: `), g.url || 'no gateway URL yet',
+      el('div', {}, g.models.map((m) => (m.status ? `${m.name} (${m.status})` : m.name)).join(', ')))));
+  if (!f.cpUrl.value.trim()) f.cpUrl.value = data.cpUrl;
+  if (!f.tenantId.value.trim()) f.tenantId.value = data.id;
+  // The models say where the gateway runs: look for its instance there.
+  const regions = [...new Set(data.gateways.map((g) => g.region))];
+  if (regions.length === 1) {
+    f.region.value = regions[0];
+    autoFilled.region = ''; // a region to search, as if typed
+  } else if (regions.some((r) => r !== 'us-east-1' && r !== 'us-east-2')) {
+    msg.textContent = `Models are served in ${regions.join(', ')}. Type the Region of the gateway you want and press Find gateways.`;
+    return;
+  }
+  await findGateways();
+}
 $('add-find').addEventListener('click', findGateways);
+$('add-find-cp').addEventListener('click', findThroughCapella);
 $('add-gateway').addEventListener('change', syncGatewayRegion);
 
 $('add-btn').addEventListener('click', () => showAdd(true));
