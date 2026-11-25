@@ -2457,13 +2457,27 @@ chat_body() { # chat_body MODEL PROMPT
 # cache_test MODEL TYPE THRESHOLD: ask a new question twice with X-cb-cache: TYPE. The first
 # answer should be a MISS and the repeat a HIT. A first HIT means an older entry matched the
 # new question, so try another question (up to three).
+# cache_usage MODEL TYPE X_CACHE SECONDS: the usage of one answered cache request, checked
+# while its response is still the last one. A fresh answer (MISS) without usage is a
+# failure like any other; an answer served from the cache (HIT) without it is a warning.
+cache_usage() {
+	local label="$2 cache ${3/-/request}"
+	info "$1 $label: $(usage_text chat)"
+	if [[ "$3" == HIT ]]; then
+		usage_check "$1" chat "$4" "$label" warn || hint "an answer served from the cache should carry the usage of the stored answer; the gateway counts it in its cached token counters"
+	else
+		usage_check "$1" chat "$4" "$label" || true
+	fi
+}
+
 cache_test() {
-	local model="$1" type="$2" threshold="$3" prompt body code x1 x2 c2 wait attempt reason score
+	local model="$1" type="$2" threshold="$3" prompt body code x1 x2 c2 c3 s1 s2 wait attempt reason score hit_tokens
 	for attempt in 1 2 3; do
 		prompt=$(random_question)
 		body=$(chat_body "$model" "$prompt")
-		read -r code x1 _ <<<"$(call /v1/chat/completions "$type" "$body")"
+		read -r code x1 s1 <<<"$(call /v1/chat/completions "$type" "$body")"
 		allowed check || return 0
+		[[ "$code" != 200 ]] || cache_usage "$model" "$type" "$x1" "$s1"
 		if [[ "$code" != 200 ]] && k2_refusal "$model" "$type cache" "$code"; then
 			return 0
 		elif [[ "$code" != 200 ]]; then
@@ -2489,11 +2503,13 @@ cache_test() {
 	for wait in 2 5; do
 		sleep "$wait"
 		# X-cb-debug makes the gateway say why a lookup missed, and how close the match was.
-		read -r c2 x2 _ <<<"$(call /v1/chat/completions "$type" "$body" 'X-cb-debug: true')"
+		read -r c2 x2 s2 <<<"$(call /v1/chat/completions "$type" "$body" 'X-cb-debug: true')"
+		[[ "$c2" != 200 ]] || cache_usage "$model" "$type" "$x2" "$s2"
 		[[ "$x2" == HIT ]] && break
 	done
 	if [[ "$x2" == HIT ]]; then
-		pass "inference: $model $type cache MISS -> HIT"
+		hit_tokens=$(usage_text chat)
+		pass "inference: $model $type cache MISS -> HIT (the HIT: $hit_tokens)"
 	elif [[ "$c2" != 200 ]] && k2_refusal "$model" "$type cache repeat" "$c2"; then
 		return 0
 	else
@@ -2508,8 +2524,9 @@ cache_test() {
 	if [[ "$type" == semantic ]]; then
 		[[ "$prompt" =~ what\ do\ (.+)\ and\ (.+)\ have\ in\ common\?\ (\(ref\ [0-9]+\)) ]] || return 0
 		body=$(chat_body "$model" "Briefly, what is shared by ${BASH_REMATCH[1]} and ${BASH_REMATCH[2]}? ${BASH_REMATCH[3]}")
-		read -r _ x2 _ <<<"$(call /v1/chat/completions semantic "$body")"
+		read -r c3 x2 s2 <<<"$(call /v1/chat/completions semantic "$body")"
 		info "semantic cache on a reworded question: $x2 (score threshold $threshold)"
+		[[ "$c3" != 200 ]] || cache_usage "$model" semantic "$x2" "$s2"
 	fi
 }
 
@@ -2836,10 +2853,13 @@ usage_text() {
 		echo "tokens: ${p/#-/?} in, ${c/#-/?} out, ${t/#-/?} total"
 	fi
 }
-# usage_check MODEL KIND SECONDS: the answer to a served request must say how many tokens it
-# used. Returns 1 (after a FAIL) when it does not, so the caller prints no PASS for it.
+# usage_check MODEL KIND SECONDS [LABEL] [warn]: the answer to a served request must say how
+# many tokens it used. Returns 1 (after a FAIL) when it does not, so the caller prints no PASS
+# for it. LABEL names the request in the message (default KIND); "warn" reports a WARN
+# instead, for an answer served from the cache.
 usage_check() {
-	local model="$1" kind="$2" p c t wrong=""
+	local model="$1" kind="$2" label="${4:-$2}" say=fail p c t wrong=""
+	[[ "${5:-}" == warn ]] && say=warn
 	read -r p c t <<<"$(resp_usage)"
 	if [[ "$p" == - && "$c" == - && "$t" == - ]]; then
 		wrong="has no token usage"
@@ -2849,12 +2869,12 @@ usage_check() {
 		wrong="reports ${c/#-/no} completion tokens"
 	fi
 	if [[ -n "$wrong" ]]; then
-		fail "inference: $model $kind answered (${3:-?}s), but the response $wrong (usage: $(jq -c '.usage // "missing"' "$RESP_FILE" 2>/dev/null | cut -c1-120))"
+		"$say" "inference: $model $label answered (${3:-?}s), but the response $wrong (usage: $(jq -c '.usage // "missing"' "$RESP_FILE" 2>/dev/null | cut -c1-120))"
 		hint "the gateway counts tokens, spend and the usage shown in Capella from this, so requests to $model are served but metered as 0 (as in AV-153389); the gateway must fill in usage for this model's provider"
 		return 1
 	fi
 	if [[ "$kind" == chat && "$t" != - && "$t" -ne $((p + c)) ]]; then
-		warn "inference: $model chat usage does not add up: $p prompt + $c completion tokens, total $t"
+		warn "inference: $model $label usage does not add up: $p prompt + $c completion tokens, total $t"
 		hint "total_tokens should be prompt_tokens + completion_tokens; check how the gateway maps the provider's usage"
 	elif [[ "$kind" == embeddings && "$t" != - && "$t" -lt "$p" ]]; then
 		warn "inference: $model embeddings usage does not add up: $p prompt tokens, total $t"
@@ -2922,7 +2942,11 @@ step_token_usage() {
 	fi
 	[[ -s "$USAGE_LOG" ]] && probed=true
 	if ! $probed; then
-		[[ -n "$quiet" ]] || pass "token counters: every model that served requests on this node has prompt tokens counted ($(grep -c . <<<"$TOKENS_BEFORE" || true) model(s) with counters)"
+		if [[ -z "$TOKENS_BEFORE" ]]; then
+			skip "token counters: no per-model request or token counters in the gateway's metrics (it has served nothing yet, or this build names them differently)"
+		elif [[ -z "$quiet" ]]; then
+			pass "token counters: every model that served requests on this node has prompt tokens counted ($(grep -c . <<<"$TOKENS_BEFORE") model(s) with counters)"
+		fi
 		info "no model request of this run was answered, so there is nothing to compare"
 		return 0
 	fi
@@ -2934,18 +2958,19 @@ step_token_usage() {
 			continue
 		fi
 		b_row=$(awk -F'\t' -v m="$model" '$2 == m || $3 == m' <<<"$TOKENS_BEFORE" | head -n 1)
-		dreq=$(($(cut -f4 <<<"$row") - $(cut -f4 <<<"${b_row:-0	0	0	0}")))
+		# Requests that were answered: an error counts as a request, but can carry no tokens.
+		dreq=$(($(awk -F'\t' '{print $4 - $5}' <<<"$row") - $(awk -F'\t' '{print $4 - $5}' <<<"${b_row:-0	0	0	0	0}")))
 		dtok=$(($(awk -F'\t' '{print $6 + $8}' <<<"$row") - $(awk -F'\t' '{print $6 + $8}' <<<"${b_row:-0	0	0	0	0	0	0	0}")))
 		if ((dreq <= 0)); then
-			skip "token counters: $model: this node counted none of the $n request(s) (another gateway instance served them)"
+			skip "token counters: $model: this node counted no answered request for it (another gateway instance served the $n request(s))"
 		elif ((dtok <= 0)); then
-			fail "token counters: $model: the gateway counted $dreq more request(s) but no prompt tokens (its answers reported $sum_p)"
+			fail "token counters: $model: the gateway counted $dreq more answered request(s) but no prompt tokens (its answers reported $sum_p)"
 			hint "requests are served but not metered, as in AV-153389: ai_model_service_gateway_total_requests_count grows while ..._prompt_tokens_total stays; the gateway must take the usage from the provider's answer (Bedrock Cohere embed sends it in the x-amzn-bedrock-input-token-count header)"
 		elif ((dtok < sum_p)); then
 			warn "token counters: $model: the gateway counted $dtok prompt tokens over $dreq request(s), fewer than the $sum_p its answers reported for $n request(s)"
 			hint "some answers were not metered, or another gateway instance served part of them; run again and compare"
 		else
-			pass "token counters: $model: +$dreq request(s), +$dtok prompt tokens counted (the answers to this run's $n request(s) reported $sum_p)"
+			pass "token counters: $model: +$dreq answered request(s), +$dtok prompt tokens counted (the answers to this run's $n request(s) reported $sum_p)"
 		fi
 	done < <(awk -F'\t' '{n[$1]++; if ($4 ~ /^[0-9]+$/) p[$1] += $4} END {for (m in n) printf "%s\t%d\t%d\n", m, n[m], p[m]}' "$USAGE_LOG" | sort)
 }
@@ -3060,6 +3085,7 @@ probe_embedding() {
 	if [[ "$dims" != - && -n "$n" && "$n" != "$dims" ]]; then
 		warn "inference: $model embeddings returned $n dimensions, config says $dims"
 		hint "set embeddingDimensions in the model config to match, or check which embedding model is deployed"
+		usage_check "$model" embeddings "$secs" || true # the two problems are reported apart
 	elif usage_check "$model" embeddings "$secs"; then
 		pass "inference: $model embeddings OK (${n:-?} dimensions, ${secs}s, $(usage_text embeddings))"
 	fi
