@@ -1018,6 +1018,7 @@ function setGateways(list) {
   const select = $('add-gateway');
   select.replaceChildren(...list.map((g, i) => el('option', { value: String(i) }, `${g.region}  ·  ${g.asg}  ·  ${g.instance}`)));
   $('add-gateway-label').hidden = list.length === 0;
+  showGatewayDetails();
 }
 
 // findGateways: look up the organization's gateways; fills region, tenant id and control
@@ -1029,11 +1030,15 @@ async function findGateways() {
     msg.textContent = 'Paste the Capella URL of the organization (it has ?oid=<org id>), or the organization id.';
     return null;
   }
+  // The Region field narrows the search. A value the last lookup filled in is not a choice
+  // of the user's, so it does not narrow the next one. Without it: us-east-1 and us-east-2.
+  const typed = addForm.elements.region.value.trim();
+  const region = typed && typed !== autoFilled.region ? typed : '';
   $('add-find').disabled = true;
-  msg.textContent = 'Looking for AI gateways in every AWS region…';
+  msg.textContent = `Looking for AI gateways in ${region || 'us-east-1 and us-east-2'}…`;
   let resp; let data;
   try {
-    resp = await fetch('/api/gateways', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from }) });
+    resp = await fetch('/api/gateways', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from, region, tenantId: addForm.elements.tenantId.value.trim() }) });
     data = await resp.json();
   } catch (err) {
     data = { error: err.message };
@@ -1060,12 +1065,28 @@ async function findGateways() {
   syncGatewayRegion();
   const missed = (data.unsearched || []).map((u) => u.region).join(', ');
   msg.textContent = (data.gateways.length === 1 ? 'Found one AI gateway.' : `Found ${data.gateways.length} AI gateways: pick the one for this sandbox.`)
+    + (region ? '' : ' Searched us-east-1 and us-east-2; for another region, type it in Region and search again.')
     + (missed ? ` Could not search ${missed}, so the list may be incomplete.` : '');
   updateAddVisibility();
   return data.gateways;
 }
 
+// showGatewayDetails: the picked gateway's URL and instance details, under the list.
+function showGatewayDetails() {
+  const g = foundGateways[Number($('add-gateway').value)];
+  const box = $('add-gateway-details');
+  box.hidden = !g;
+  if (!g) return;
+  const started = g.launched ? new Date(g.launched) : null;
+  box.replaceChildren(
+    el('div', {}, el('strong', {}, 'Gateway URL: '), g.url || 'no public DNS name (reached through its load balancer)'),
+    el('div', {}, [`Instance ${g.instance}`, g.type, g.privateIp && `private IP ${g.privateIp}`,
+      started && !Number.isNaN(started.getTime()) && `started ${started.toLocaleString()}`].filter(Boolean).join('  ·  ')),
+    el('div', {}, `Auto Scaling group ${g.asg}  ·  ${g.region}`));
+}
+
 function syncGatewayRegion() {
+  showGatewayDetails();
   const g = foundGateways[Number($('add-gateway').value)];
   if (g) {
     addForm.elements.region.value = g.region;

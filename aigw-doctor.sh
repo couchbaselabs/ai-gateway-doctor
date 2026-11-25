@@ -61,10 +61,13 @@
 #                          (...?oid=<org id>, or .../organizations/<org id>), or from an id
 #                          that tags the gateway's instances (the org id). Sets --tenant-id,
 #                          --org-id and --cp-url (https://api.<console host>) unless given.
+#                          A URL without the organization, such as the Fleet Manager's
+#                          (https://fm.<env>/), works with --tenant-id <org id>.
 #                          Without -c the config is fetched with your AWS credentials: the
-#                          tenant's gateways are found by their tags, in --region or else in
-#                          every enabled region; with several you are asked which one to use
-#                          (or pass --region); the config is read from the Secrets Manager secret
+#                          tenant's gateways are found by their tags in --region, else in
+#                          us-east-1 and us-east-2 (AIGW_FETCH_REGIONS sets other defaults);
+#                          with several you are asked which one to use; the config is read
+#                          from the Secrets Manager secret
 #                          named in the instance's user data (aigwConfigKey), else from the
 #                          gateway's live config file through SSM. It is saved as
 #                          <name>.config.json (mode 600) and the run continues with it
@@ -339,14 +342,20 @@ if [[ -n "$FROM" ]]; then
 		from_host="${BASH_REMATCH[1]}"
 		if [[ "$FROM" =~ $from_oid || "$FROM" =~ $from_org ]]; then
 			FROM_ID="${BASH_REMATCH[1]}"
+		elif [[ -n "${TENANT_ID:-$ORG_ID}" ]]; then
+			# A URL without the organization, such as the Fleet Manager's (https://fm.<env>/):
+			# it gives the environment, --tenant-id gives the organization.
+			FROM_ID="${TENANT_ID:-$ORG_ID}"
 		else
-			die "--from: no organization in that URL (expected ...?oid=<org id> or .../organizations/<org id>)"
+			die "--from: no organization in that URL (expected ...?oid=<org id> or .../organizations/<org id>); for a URL without it, such as the Fleet Manager's, add --tenant-id <org id>"
 		fi
 		if [[ -z "$CP_URL" ]]; then
-			# cloud.couchbase.com and ui.<env>.<domain> (a sandbox console) both have their API at api.
+			# cloud.couchbase.com, ui.<env>.<domain> (a sandbox console) and fm.<env>.<domain>
+			# (its Fleet Manager) all have their API at api.
 			case "$from_host" in
 			api.*) CP_URL="https://$from_host" ;;
 			ui.*) CP_URL="https://api.${from_host#ui.}" ;;
+			fm.*) CP_URL="https://api.${from_host#fm.}" ;;
 			*) CP_URL="https://api.$from_host" ;;
 			esac
 		fi
@@ -364,6 +373,9 @@ if [[ -n "$FROM" ]]; then
 		die "--from takes a Capella console URL with the organization, or an id"
 	fi
 fi
+# Where --from looks for the gateways when --region is not given. Not every enabled region:
+# that search hangs for minutes when one regional endpoint cannot be reached.
+FETCH_REGIONS="${AIGW_FETCH_REGIONS:-us-east-1 us-east-2}"
 [[ -z "$API_KEY_FILE" || -f "$API_KEY_FILE" ]] || die "API key file not found: $API_KEY_FILE"
 [[ -z "$SAVE_KEY_FILE" ]] || $CREATE_KEY || die "--save-api-key needs --create-api-key"
 [[ -z "$API_KEY_FILE" ]] || ! $CREATE_KEY || die "use either --api-key-file or --create-api-key"
@@ -631,9 +643,10 @@ gateway_rows() {
 	allowed check || return 0
 	dir=$(mktemp -d "${TMPDIR:-/tmp}/aigw-doctor.XXXXXX") || return 1
 	for r in "$@"; do
-		aws ec2 describe-instances --region "$r" \
+		# A regional endpoint that does not answer fails within seconds, not minutes.
+		AWS_MAX_ATTEMPTS=2 aws ec2 describe-instances --region "$r" --cli-connect-timeout 10 --cli-read-timeout 30 \
 			--filters "Name=tag-value,Values=$id" "Name=instance-state-name,Values=running" \
-			--query 'Reservations[].Instances[].[InstanceId, Tags[?Key==`aws:autoscaling:groupName`]|[0].Value]' \
+			--query 'Reservations[].Instances[].[InstanceId, Tags[?Key==`aws:autoscaling:groupName`]|[0].Value, PublicDnsName, PrivateIpAddress, InstanceType, LaunchTime]' \
 			--output text >"$dir/$r" 2>"$dir/$r.err" || echo failed >"$dir/$r.failed" &
 	done
 	wait
@@ -643,7 +656,10 @@ gateway_rows() {
 			[[ -z "$GATEWAY_ERRS" ]] || printf '%s\t%s\n' "$r" "$(tail -n 1 "$dir/$r.err" | tr '\t' ' ' | cut -c1-200)" >>"$GATEWAY_ERRS"
 			continue
 		fi
-		awk -F'\t' -v p="$AIGW_ASG_PREFIX" -v r="$r" 'index($2, p) == 1 {print r "\t" $1 "\t" $2}' "$dir/$r" 2>/dev/null
+		# region, instance, ASG, public DNS, private IP, type, launch time ("-" where there is none)
+		awk -F'\t' -v p="$AIGW_ASG_PREFIX" -v r="$r" 'index($2, p) == 1 {
+			for (i = 3; i <= 6; i++) if ($i == "" || $i == "None") $i = "-"
+			print r "\t" $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6}' "$dir/$r" 2>/dev/null
 	done
 	rm -rf "$dir"
 }
@@ -685,10 +701,11 @@ echo \"DATA \$(printf '%s' \"\$b\" | cut -c$((part * 20000 + 1))-$(((part + 1) *
 NODE_WHY="" NODE_FILE=""
 step_fetch_config() {
 	step "0b. Fetch the gateway config (--from $FROM)"
-	local rows="" regions n pick row ud key ud_region tmp dest src="" why="" old_umask node_ok=false skipped=0 incomplete=false secret_region
+	local rows="" regions n pick row gw_dns gw_more="" ud key ud_region tmp dest src="" why="" old_umask node_ok=false skipped=0 incomplete=false secret_region
 
 	if ! allowed check; then
-		[[ -n "$AIGW_INSTANCE" ]] || gateway_rows "$FROM_ID" "$($REGION_SET && echo "$REGION" || echo "every-enabled-region")" >/dev/null
+		# shellcheck disable=SC2086
+		[[ -n "$AIGW_INSTANCE" ]] || gateway_rows "$FROM_ID" $($REGION_SET && echo "$REGION" || echo "$FETCH_REGIONS") >/dev/null
 		info "then: with several gateways, ask which one to use (by region)"
 		info "then: read tenantId, region, api and aigwConfigKey from the gateway instance's user data"
 		info "then: aws secretsmanager get-secret-value --secret-id <aigwConfigKey>, else the gateway's config file through SSM"
@@ -699,22 +716,11 @@ step_fetch_config() {
 	fi
 
 	# 1. the tenant's gateways: running instances tagged with the id, in an ASG named
-	# <gateway prefix>..., in --region or else in every enabled region. One line per gateway
-	# (region and ASG); with several, the user picks.
+	# <gateway prefix>..., in --region, else in the default regions (us-east-1 and us-east-2).
+	# One line per gateway (region and ASG); with several, the user picks.
 	if [[ -z "$AIGW_INSTANCE" ]]; then
-		if $REGION_SET; then
-			regions="$REGION"
-		else
-			# Without the list of regions the search would cover one region only and could
-			# pick a gateway there as if it were the only one: stop instead.
-			regions=$(run check aws ec2 describe-regions --region "$REGION" --query 'Regions[].RegionName' --output text) || regions=""
-			regions=$(tr '\t\n' '  ' <<<"$regions")
-			if [[ -z "${regions// /}" ]]; then
-				fail "config: the enabled regions could not be listed (ec2:DescribeRegions in $REGION), so the gateways cannot be searched for"
-				hint "pass --region <the gateway's region> to look in that region only, or refresh the AWS credentials"
-				exit 1
-			fi
-		fi
+		regions="$REGION"
+		$REGION_SET || regions="$FETCH_REGIONS"
 		resp_init
 		GATEWAY_ERRS="$RESP_DIR/gateway-errors"
 		: >"$GATEWAY_ERRS"
@@ -728,13 +734,14 @@ step_fetch_config() {
 				awk -F'\t' '{printf "%s: %s\n", $1, $2}' "$GATEWAY_ERRS" | indent
 				hint "refresh the AWS credentials or pass --region <the gateway's region>"
 			else
-				fail "config: no running ${AIGW_ASG_PREFIX}* instance is tagged $FROM_ID in $($REGION_SET && echo "$REGION" || echo "any enabled region")"
-				hint "check the id and the AWS account (${CALLER:-unknown identity}); or pass --aigw-instance <id> to name the gateway"
+				fail "config: no running ${AIGW_ASG_PREFIX}* instance is tagged $FROM_ID in ${regions// /, }"
+				hint "pass --region <the gateway's region> when it is in another region; check the id and the AWS account (${CALLER:-unknown identity}); or pass --aigw-instance <id> to name the gateway"
 			fi
 			exit 1
 		fi
 		if $LIST_GATEWAYS; then
-			awk -F'\t' '{printf "   GATEWAY %s %s %s\n", $1, $2, $3}' <<<"$rows"
+			# region, instance, ASG, then the details: public DNS, private IP, type, launch time
+			awk -F'\t' '{printf "   GATEWAY %s %s %s %s %s %s %s\n", $1, $2, $3, $4, $5, $6, $7}' <<<"$rows"
 			awk -F'\t' '{printf "   UNSEARCHED %s %s\n", $1, $2}' "$GATEWAY_ERRS"
 			exit 0
 		fi
@@ -749,7 +756,7 @@ step_fetch_config() {
 		pick=1
 		if [[ "$n" -gt 1 ]] || $incomplete; then
 			note "$n AI gateway(s) found tagged $FROM_ID:"
-			awk -F'\t' '{printf "      %d) %-16s %s  %s\n", NR, $1, $3, $2}' <<<"$rows"
+			awk -F'\t' '{printf "      %d) %-16s %s  %s  %s\n", NR, $1, $3, $2, ($4 == "-" ? "no public DNS, " $5 : "https://" $4 ":8081")}' <<<"$rows"
 			if { : >/dev/tty; } 2>/dev/null; then
 				printf '   %s?%s Which one? [1-%s] ' "$YEL" "$RST" "$n" >/dev/tty
 				read -r pick </dev/tty || pick=""
@@ -764,10 +771,12 @@ step_fetch_config() {
 		REGION=$(cut -f1 <<<"$row")
 		AIGW_INSTANCE=$(cut -f2 <<<"$row")
 		AIGW_ASG=$(cut -f3 <<<"$row")
+		gw_dns=$(cut -f4 <<<"$row")
+		gw_more="$([[ "$gw_dns" == - ]] && echo "no public DNS" || echo "https://$gw_dns:8081"), private IP $(cut -f5 <<<"$row"), $(cut -f6 <<<"$row"), started $(cut -f7 <<<"$row")"
 	fi
 	$SM_REGION_SET || SM_REGION="$REGION"
 	AIGW_TARGET=$(target_for "$AIGW_INSTANCE" "$AIGW_SSH" local)
-	pass "gateway: $AIGW_INSTANCE${AIGW_ASG:+ ($AIGW_ASG)} in $REGION"
+	pass "gateway: $AIGW_INSTANCE${AIGW_ASG:+ ($AIGW_ASG)} in $REGION${gw_more:+: $gw_more}"
 
 	# 2. its user data. Only four fields are kept; the certificate and key in it are dropped.
 	ud=$(run check aws ec2 describe-instance-attribute --region "$REGION" --instance-id "$AIGW_INSTANCE" \

@@ -58,7 +58,8 @@
                 <select name="gateway" id="add-gateway"></select>
               </label>
             </div>
-            <p class="hint" id="add-find-msg">Finds the organization's AI gateways in every AWS region with this machine's AWS
+            <div class="hint" id="add-gateway-details" hidden></div>
+            <p class="hint" id="add-find-msg">Finds the organization's AI gateways in the Region below (us-east-1 and us-east-2 when it is empty) with this machine's AWS
               credentials, then reads the config of the one you pick (from its Secrets Manager secret, else from the gateway
               node) and saves it in the config folder.</p>
           </div>
