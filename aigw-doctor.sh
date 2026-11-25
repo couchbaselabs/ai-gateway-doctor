@@ -70,7 +70,8 @@
 #                          <name>.config.json (mode 600) and the run continues with it
 #   --name NAME            name for the fetched config (default: gw-<org id start>-<region>)
 #   --config-dir DIR       where a fetched config is saved
-#                          (default: $AIGW_CONFIG_DIR or ~/.aigw-doctor/configs)
+#                          (default: $AIGW_CONFIG_DIR, else the folder in ui/.env,
+#                          else ~/.aigw-doctor/configs)
 #   --fetch-only           with --from and --check: save the config and stop
 #   --list-gateways        with --from and --check: list the tenant's gateways
 #                          (GATEWAY <region> <instance> <ASG> lines) and stop
@@ -170,7 +171,14 @@ SM_REGION=""
 TENANT_ID=""
 FROM=""
 SANDBOX_NAME=""
-CONFIG_DIR="${AIGW_CONFIG_DIR:-$HOME/.aigw-doctor/configs}"
+# The config folder is shared with the UI: $AIGW_CONFIG_DIR, else the folder the UI's
+# settings file (ui/.env next to this script) names, else ~/.aigw-doctor/configs.
+CONFIG_DIR="${AIGW_CONFIG_DIR:-}"
+if [[ -z "$CONFIG_DIR" && -f "$(dirname "$0")/ui/.env" ]]; then
+	CONFIG_DIR=$(sed -n 's/^AIGW_CONFIG_DIR=//p' "$(dirname "$0")/ui/.env" | tail -n 1)
+	CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+fi
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.aigw-doctor/configs}"
 FETCH_ONLY=false
 LIST_GATEWAYS=false
 BUILD_URL=""
@@ -544,8 +552,12 @@ bearer_config() { printf 'header = "Authorization: Bearer %s"\n' "$(curl_escape 
 
 # The tenant lookup finds the gateway instance, whose public DNS (or user data) leads to the
 # gateway URL. It is not needed when the control plane can be asked directly.
-NEED_LOOKUP=false
-[[ -z "$AIGW_URL" && (-n "$TENANT_ID" || -n "$AIGW_INSTANCE") ]] && ! { $CP_AUTH && [[ -n "$CP_URL" ]]; } && NEED_LOOKUP=true
+need_lookup() {
+	NEED_LOOKUP=false
+	[[ -z "$AIGW_URL" && (-n "$TENANT_ID" || -n "$AIGW_INSTANCE") ]] && ! { $CP_AUTH && [[ -n "$CP_URL" ]]; } && NEED_LOOKUP=true
+	return 0
+}
+need_lookup
 # AWS is needed for the infrastructure checks, for --create-api-key (the gateway's admin
 # secret) and for that lookup. Probing the models with your own or a Capella key is not:
 # that works without the AWS CLI and without AWS credentials (e.g. against production).
@@ -943,9 +955,20 @@ curl -fsSI --max-time 15 -o /dev/null '$BUILD_FILE_URL' 2>/dev/null && echo 'REA
 	# service does not come up, the saved binary is put back and the service started again.
 	script="set -e
 unit='$unit'; bin='$bin'
-tmp=\$(sudo mktemp \"\$bin.new.XXXXXX\")
+# One install at a time per binary: the lock folder holds this script's pid and, later, the
+# backup it made. A lock whose owner is gone was left by a killed install and is taken over.
+lock=\"\$bin.install-lock\"
+if ! sudo mkdir \"\$lock\" 2>/dev/null; then
+  owner=\$(sudo cat \"\$lock/pid\" 2>/dev/null)
+  if [ -z \"\$owner\" ] || sudo kill -0 \"\$owner\" 2>/dev/null; then echo \"RESULT busy \$owner\"; exit 0; fi
+  sudo rm -rf \"\$lock\"; sudo sh -c \"rm -f '\$bin'.new.*\"
+  sudo mkdir \"\$lock\" 2>/dev/null || { echo 'RESULT busy'; exit 0; }
+fi
+echo \$\$ | sudo tee \"\$lock/pid\" >/dev/null
+tmp=''
 trap 'exit 143' HUP INT TERM
-trap 'sudo rm -f \"\$tmp\" \"\$tmp.gz\"' EXIT
+trap 'sudo rm -rf \"\$tmp\" \"\$tmp.gz\" \"\$lock\"' EXIT
+tmp=\$(sudo mktemp \"\$bin.new.XXXXXX\")
 __SRC__
 sudo sh -c \"gunzip -c '\$tmp.gz' > '\$tmp'\"
 [ \"\$(sudo head -c 4 \"\$tmp\" | od -An -c | tr -d ' ')\" = '177ELF' ] || { echo 'RESULT notbinary'; exit 0; }
@@ -955,13 +978,14 @@ echo \"NEWSHA \$(sudo sha256sum \"\$tmp\" | cut -c1-64)\"
 sudo chown --reference=\"\$bin\" \"\$tmp\"; sudo chmod --reference=\"\$bin\" \"\$tmp\"
 bak=\"\$bin.bak-\$(date +%Y%m%d-%H%M%S)\"
 sudo cp -p \"\$bin\" \"\$bak\"
+echo \"\$bak\" | sudo tee \"\$lock/bak\" >/dev/null
 echo \"BACKUP \$bak\"
 set +e
 # From here the service is touched: whatever fails, the saved binary goes back and the
 # service is started again (also when this script is ended early).
 phase=stopping
 restore() { sudo systemctl stop \"\$unit\" 2>/dev/null; sudo cp -p \"\$bak\" \"\$bin\"; sudo systemctl start \"\$unit\"; sleep 5; }
-trap 'sudo rm -f \"\$tmp\" \"\$tmp.gz\"; [ \"\$phase\" = done ] || { restore; echo \"RESULT interrupted \$(systemctl is-active \"\$unit\")\"; }' EXIT
+trap 'sudo rm -f \"\$tmp\" \"\$tmp.gz\"; [ \"\$phase\" = done ] || { restore; echo \"RESULT interrupted \$(systemctl is-active \"\$unit\")\"; }; sudo rm -rf \"\$lock\"' EXIT
 if ! sudo systemctl stop \"\$unit\"; then
   sudo systemctl start \"\$unit\"; phase=done
   echo \"RESULT stopfailed \$(systemctl is-active \"\$unit\")\"; exit 0
@@ -981,17 +1005,26 @@ else
   restore; phase=done
   echo \"RESULT rolledback \$(systemctl is-active \"\$unit\")\"
 fi"
-	shown="${script/__SRC__/$shown_src}"
-	script="${script/__SRC__/$src}"
+	# Put in by cutting at the marker: in ${var/pat/rep} bash 5.2 reads each & of a signed
+	# S3 link as "the matched text".
+	shown="${script%%__SRC__*}$shown_src${script#*__SRC__}"
+	script="${script%%__SRC__*}$src${script#*__SRC__}"
 	SSM_WAIT=1200 # download (up to 10 minutes) plus stop, swap and start
 	# If the run is interrupted and the cancelled script could not undo its own work (it was
 	# killed outright), this puts the saved binary back when the service is left stopped.
 	SSM_ON_CANCEL="unit='$unit'; bin='$bin'
+lock=\"\$bin.install-lock\"
+owner=\$(sudo cat \"\$lock/pid\" 2>/dev/null)
+if [ -n \"\$owner\" ] && sudo kill -0 \"\$owner\" 2>/dev/null; then echo \"an install (pid \$owner) is still running on the node; nothing was changed\"; exit 0; fi
+if [ ! -d \"\$lock\" ]; then echo \"\$unit is \$(systemctl is-active \"\$unit\")\"; exit 0; fi
+# The lock is still there: the install was killed before it could undo its work.
+bak=\$(sudo cat \"\$lock/bak\" 2>/dev/null)
 sudo sh -c \"rm -f '\$bin'.new.*\"
-if [ \"\$(systemctl is-active \"\$unit\")\" = active ]; then echo \"\$unit is active\"; exit 0; fi
-bak=\$(sudo sh -c \"ls -t '\$bin'.bak-* 2>/dev/null\" | head -n 1)
-[ -n \"\$bak\" ] && sudo cp -p \"\$bak\" \"\$bin\" && echo \"put back \$bak\"
-sudo systemctl start \"\$unit\"; sleep 5
+if [ \"\$(systemctl is-active \"\$unit\")\" != active ]; then
+  [ -n \"\$bak\" ] && sudo cp -p \"\$bak\" \"\$bin\" && echo \"put back \$bak\"
+  sudo systemctl start \"\$unit\"; sleep 5
+fi
+sudo rm -rf \"\$lock\"
 echo \"\$unit is \$(systemctl is-active \"\$unit\")\""
 	out=$(remote fix "$target" "$script" "$shown")
 	SSM_ON_CANCEL=""
@@ -1014,6 +1047,10 @@ echo \"\$unit is \$(systemctl is-active \"\$unit\")\""
 		fail "build: $unit did not start with the new binary; the earlier one was put back (service now ${result#rolledback })"
 		sed -n 's/^LOG //p' <<<"$out" | indent
 		hint "the lines above are the service's last log lines with the new build"
+		;;
+	busy*)
+		fail "build: another install is running on $(target_label "$target")$([[ "$result" == "busy "* ]] && echo " (pid ${result#busy })"); nothing was changed"
+		hint "wait for it to finish and run this again; if no install is running there, remove $bin.install-lock on the node"
 		;;
 	stopfailed*) fail "build: $unit could not be stopped; nothing was replaced (service now ${result#stopfailed })" ;;
 	swapfailed* | interrupted*)
@@ -3159,7 +3196,12 @@ fi
 if $NEED_AWS; then
 	step_aws
 fi
-$FETCH && step_fetch_config
+# The fetch fills in the tenant and the gateway instance (a bare --from id gives neither
+# beforehand), so whether the gateway URL must be looked up is decided again after it.
+if $FETCH; then
+	step_fetch_config
+	need_lookup
+fi
 if [[ -n "$BUILD_URL" ]]; then
 	# Only the build is installed: find the gateway, then replace its binary.
 	# The config is read only for the deployment id that names the gateway's ASG; its
