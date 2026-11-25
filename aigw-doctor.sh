@@ -193,6 +193,7 @@ ADMIN_URL=""
 AIGW_URL=""
 CP_USER="${CP_USER:-}"
 CP_URL=""
+AWS_PROFILE_ARG=""
 ORG_ID=""
 API_KEY_FILE=""
 CREATE_KEY=false
@@ -236,7 +237,7 @@ while [[ $# -gt 0 ]]; do
 	--build-bucket) BUILD_BUCKET="$2"; shift ;;
 	--aigw-service) AIGW_SERVICE="$2"; shift ;;
 	--yes) ASSUME_YES=true ;;
-	--aws-profile) export AWS_PROFILE="$2"; shift ;;
+	--aws-profile) export AWS_PROFILE="$2"; AWS_PROFILE_ARG="$2"; shift ;;
 	--tenant-id) TENANT_ID="$2"; shift ;;
 	--ds-asg-prefix) DS_ASG_PREFIX="$2"; shift ;;
 	--aigw-asg-prefix) AIGW_ASG_PREFIX="$2"; shift ;;
@@ -306,7 +307,12 @@ if [[ -n "$FROM" ]]; then
 			die "--from: no organization in that URL (expected ...?oid=<org id> or .../organizations/<org id>)"
 		fi
 		if [[ -z "$CP_URL" ]]; then
-			if [[ "$from_host" == api.* ]]; then CP_URL="https://$from_host"; else CP_URL="https://api.$from_host"; fi
+			# cloud.couchbase.com and ui.<env>.<domain> (a sandbox console) both have their API at api.
+			case "$from_host" in
+			api.*) CP_URL="https://$from_host" ;;
+			ui.*) CP_URL="https://api.${from_host#ui.}" ;;
+			*) CP_URL="https://api.$from_host" ;;
+			esac
 		fi
 		ORG_ID="${ORG_ID:-$FROM_ID}"
 		TENANT_ID="${TENANT_ID:-$FROM_ID}"
@@ -440,6 +446,10 @@ ssm_exec() {
 		--document-name AWS-RunShellScript \
 		--parameters "$(jq -n --arg c "$script" --arg t "$SSM_WAIT" '{commands: [$c], executionTimeout: [$t]}')" \
 		--query Command.CommandId --output text) || return 1
+	# Interrupted while the command runs (Ctrl-C, Stop in the UI): cancel it on the node and
+	# wait until it has ended before this run ends and cleans up. This function often runs in
+	# a subshell ($(...)), which does not inherit the main shell's handler.
+	trap 'ssm_interrupted "$inst" "$cid"; exit 130' INT TERM
 	for i in $(seq 1 $((SSM_WAIT / 2 + 15))); do
 		status=$(aws ssm get-command-invocation --region "$REGION" --command-id "$cid" \
 			--instance-id "$inst" --query Status --output text 2>/dev/null || echo Pending)
@@ -459,9 +469,44 @@ ssm_exec() {
 		echo "SSM command $cid on $inst did not finish within ${SSM_WAIT}s; cancelled (status: $status)" >&2
 		;;
 	esac
+	trap 'exit 130' INT TERM
 	aws ssm get-command-invocation --region "$REGION" --command-id "$cid" --instance-id "$inst" \
 		--query '[StandardOutputContent, StandardErrorContent]' --output text
 	[[ "$status" == Success ]]
+}
+
+# ssm_interrupted INSTANCE COMMAND_ID: cancel a running command, wait for its final status,
+# then run SSM_ON_CANCEL (if set) on the node to put right what the command left half done.
+SSM_ON_CANCEL=""
+ssm_interrupted() {
+	local inst="$1" cid="$2" status="" i rid
+	trap '' INT TERM
+	echo "interrupted: cancelling SSM command $cid on $inst" >&2
+	aws ssm cancel-command --region "$REGION" --command-id "$cid" --instance-ids "$inst" >/dev/null 2>&1
+	for i in $(seq 1 45); do
+		status=$(aws ssm get-command-invocation --region "$REGION" --command-id "$cid" \
+			--instance-id "$inst" --query Status --output text 2>/dev/null || echo Pending)
+		case "$status" in Success | Failed | Cancelled | TimedOut) break ;; esac
+		sleep 2
+	done
+	case "$status" in
+	Success | Failed | Cancelled | TimedOut) echo "SSM command $cid ended: $status" >&2 ;;
+	*) echo "SSM command $cid is still $status after 90s: it may still be running on $inst; check with: aws ssm get-command-invocation --region $REGION --command-id $cid --instance-id $inst" >&2 ;;
+	esac
+	[[ -n "$SSM_ON_CANCEL" ]] || return 0
+	rid=$(aws ssm send-command --region "$REGION" --instance-ids "$inst" --document-name AWS-RunShellScript \
+		--parameters "$(jq -n --arg c "$SSM_ON_CANCEL" '{commands: [$c], executionTimeout: ["120"]}')" \
+		--query Command.CommandId --output text 2>/dev/null) || { echo "could not check the node after the cancel; check the service on $inst by hand" >&2; return 0; }
+	status=""
+	for i in $(seq 1 45); do
+		status=$(aws ssm get-command-invocation --region "$REGION" --command-id "$rid" \
+			--instance-id "$inst" --query Status --output text 2>/dev/null || echo Pending)
+		case "$status" in Success | Failed | Cancelled | TimedOut) break ;; esac
+		sleep 2
+	done
+	aws ssm get-command-invocation --region "$REGION" --command-id "$rid" --instance-id "$inst" \
+		--query StandardOutputContent --output text 2>/dev/null | grep '[^[:space:]]' | sed 's/^/after the cancel: /' >&2
+	[[ "$status" == Success ]] || echo "the check after the cancel did not finish ($status); check the service on $inst by hand" >&2
 }
 
 confirm() {
@@ -513,6 +558,12 @@ if $NEED_AWS; then
 	for tool in aws nc; do
 		command -v "$tool" >/dev/null || die "'$tool' is required for the infrastructure checks, --from and --create-api-key (not for --inference-only with --capella-api-key or your own key)"
 	done
+fi
+# --aws-profile is passed to every AWS call as --profile. AWS_PROFILE alone is not enough:
+# access keys exported in the environment would win over it, and the run would work in
+# another account than the one it names.
+if [[ -n "$AWS_PROFILE_ARG" ]]; then
+	aws() { command aws --profile "$AWS_PROFILE_ARG" "$@"; }
 fi
 
 # ---------- 0. AWS credentials ----------
@@ -614,8 +665,15 @@ step_fetch_config() {
 		if $REGION_SET; then
 			regions="$REGION"
 		else
-			regions=$(run check aws ec2 describe-regions --region "$REGION" --query 'Regions[].RegionName' --output text | tr '\t\n' '  ')
-			regions="${regions:-$REGION}"
+			# Without the list of regions the search would cover one region only and could
+			# pick a gateway there as if it were the only one: stop instead.
+			regions=$(run check aws ec2 describe-regions --region "$REGION" --query 'Regions[].RegionName' --output text) || regions=""
+			regions=$(tr '\t\n' '  ' <<<"$regions")
+			if [[ -z "${regions// /}" ]]; then
+				fail "config: the enabled regions could not be listed (ec2:DescribeRegions in $REGION), so the gateways cannot be searched for"
+				hint "pass --region <the gateway's region> to look in that region only, or refresh the AWS credentials"
+				exit 1
+			fi
 		fi
 		resp_init
 		GATEWAY_ERRS="$RESP_DIR/gateway-errors"
@@ -721,6 +779,8 @@ step_fetch_config() {
 	dest="$CONFIG_DIR/$SANDBOX_NAME.config.json"
 	if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
 		rm -f "$tmp"
+		# The kept file may have been copied in by hand with wider permissions.
+		chmod 600 "$dest" || die "cannot set mode 600 on $dest"
 		pass "config: $(jq '[.modelConfig.models[]?] | length' "$dest") model(s) from $src; $dest is already up to date"
 	else
 		[[ -f "$dest" ]] && mv "$dest" "$dest.prev" && info "the earlier $dest is kept as $dest.prev"
@@ -730,6 +790,8 @@ step_fetch_config() {
 	FETCH_TMP=""
 	CONFIG="$dest"
 	if $FETCH_ONLY; then
+		# Shown without --verbose too: the UI saves it with the sandbox it adds.
+		[[ -z "$CP_URL" ]] || note "control plane: $CP_URL"
 		note "Next: $0 -c $(shellquote "$CONFIG") --region $REGION${TENANT_ID:+ --tenant-id $TENANT_ID} --check"
 		exit 0
 	fi
@@ -882,6 +944,7 @@ curl -fsSI --max-time 15 -o /dev/null '$BUILD_FILE_URL' 2>/dev/null && echo 'REA
 	script="set -e
 unit='$unit'; bin='$bin'
 tmp=\$(sudo mktemp \"\$bin.new.XXXXXX\")
+trap 'exit 143' HUP INT TERM
 trap 'sudo rm -f \"\$tmp\" \"\$tmp.gz\"' EXIT
 __SRC__
 sudo sh -c \"gunzip -c '\$tmp.gz' > '\$tmp'\"
@@ -921,7 +984,17 @@ fi"
 	shown="${script/__SRC__/$shown_src}"
 	script="${script/__SRC__/$src}"
 	SSM_WAIT=1200 # download (up to 10 minutes) plus stop, swap and start
+	# If the run is interrupted and the cancelled script could not undo its own work (it was
+	# killed outright), this puts the saved binary back when the service is left stopped.
+	SSM_ON_CANCEL="unit='$unit'; bin='$bin'
+sudo sh -c \"rm -f '\$bin'.new.*\"
+if [ \"\$(systemctl is-active \"\$unit\")\" = active ]; then echo \"\$unit is active\"; exit 0; fi
+bak=\$(sudo sh -c \"ls -t '\$bin'.bak-* 2>/dev/null\" | head -n 1)
+[ -n \"\$bak\" ] && sudo cp -p \"\$bak\" \"\$bin\" && echo \"put back \$bak\"
+sudo systemctl start \"\$unit\"; sleep 5
+echo \"\$unit is \$(systemctl is-active \"\$unit\")\""
 	out=$(remote fix "$target" "$script" "$shown")
+	SSM_ON_CANCEL=""
 	SSM_WAIT=180
 	[[ -z "$BUILD_S3" ]] || { run fix aws s3 rm --region "$REGION" --only-show-errors "$BUILD_S3" && BUILD_S3=""; }
 	allowed fix || return 0

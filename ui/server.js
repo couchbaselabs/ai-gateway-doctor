@@ -281,7 +281,8 @@ function fromParts(raw) {
   const m = text.match(/^https:\/\/([\w.-]+)(?::\d+)?(?:[/?#]|$)/);
   const oid = (text.match(/[?&]oid=([0-9a-fA-F-]{8,64})/) || text.match(/\/organizations\/([0-9a-fA-F-]{8,64})/) || [])[1];
   if (!m || !oid) throw new Error('enter a Capella console URL that has the organization (…?oid=<org id>), or the organization id');
-  const host = m[1].startsWith('api.') ? m[1] : `api.${m[1]}`;
+  // cloud.couchbase.com and ui.<env>.<domain> (a sandbox console) both have their API at api.
+  const host = m[1].startsWith('api.') ? m[1] : `api.${m[1].replace(/^ui\./, '')}`;
   return { arg: `https://${m[1]}/?oid=${oid}`, id: oid, cpUrl: `https://${host}/v2/organizations/${oid}` };
 }
 
@@ -339,7 +340,10 @@ async function addFetchedSandbox(body) {
       '--check', '--fetch-only', '--name', name, '--config-dir', dir]);
     if (!ok) throw doctorError(lines, 'fetching the config');
     const tenant = (lines.join('\n').match(/--tenant-id ([0-9a-fA-F-]{8,64})/) || [])[1] || '';
-    const added = addSandbox({ ...filled, tenantId: String(body.tenantId || '').trim() || tenant }, true);
+    // A bare id carries no control plane: keep the one the script read from the gateway's user data.
+    const found = (lines.join('\n').match(/control plane: (https:\/\/[\w.-]+(?::\d+)?)(?=[\s,]|$)/) || [])[1] || '';
+    const cpUrl = filled.cpUrl || (OPTIONS.cpUrl[1].test(found) ? found : '');
+    const added = addSandbox({ ...filled, cpUrl, tenantId: String(body.tenantId || '').trim() || tenant }, true);
     return { ...added, source: (lines.find((l) => /^PASS config:/.test(l)) || '').replace(/^PASS config:\s*/, '') };
   } finally {
     adding.delete(key);
