@@ -89,8 +89,14 @@
 #                          URL; else by this machine and copied over ssh (--aigw-ssh) or
 #                          through an S3 bucket (--build-bucket)
 #   --build-arch ARCH      arm64 (default) or amd64; must match the gateway node
-#   --build-bucket BUCKET  S3 bucket to pass the build through when the node cannot reach the
-#                          URL: uploaded, fetched by the node with a 15-minute link, deleted
+#                          When the node cannot reach the URL, the build is downloaded here
+#                          and copied to the node with scp through Session Manager (a
+#                          one-minute key from EC2 Instance Connect; needs the Session
+#                          Manager plugin and ssh here), or over --aigw-ssh
+#   --build-bucket BUCKET  S3 bucket to pass the build through when scp is not possible:
+#                          uploaded, fetched by the node with a 15-minute link, deleted
+#   --aigw-os-user NAME    the login on the gateway node for that scp (default: the user the
+#                          binary lives under in /home, else ec2-user)
 #   --aigw-service NAME    the gateway's systemd unit (default: ai-gateway.service)
 #   --yes                  with --install-build --fix: do not ask for confirmation
 #   --aws-profile NAME     AWS CLI profile to use (default: $AWS_PROFILE if it is set, else the
@@ -213,6 +219,7 @@ BUILD_URL=""
 BUILD_ARCH="arm64"
 BUILD_BUCKET=""
 AIGW_SERVICE="ai-gateway.service"
+AIGW_OS_USER=""
 ASSUME_YES=false
 REGION_SET=false
 SM_REGION_SET=false
@@ -272,6 +279,7 @@ while [[ $# -gt 0 ]]; do
 	--build-arch) BUILD_ARCH="$2"; shift ;;
 	--build-bucket) BUILD_BUCKET="$2"; shift ;;
 	--aigw-service) AIGW_SERVICE="$2"; shift ;;
+	--aigw-os-user) AIGW_OS_USER="$2"; shift ;;
 	--yes) ASSUME_YES=true ;;
 	--aws-profile) export AWS_PROFILE="$2"; AWS_PROFILE_ARG="$2"; shift ;;
 	--tenant-id) TENANT_ID="$2"; shift ;;
@@ -872,8 +880,45 @@ build_file() {
 	BUILD_FILE_URL="$base$name"
 }
 
+# Copying a file to the node with scp through Session Manager, with no SSH key set up and no
+# open port: EC2 Instance Connect installs a public key on the node for 60 seconds, and ssh
+# reaches the node's sshd through an SSM session (AWS-StartSSHSession).
+SSM_KEY="" SSM_SCP_ERR=""
+# ssm_ssh_opts INSTANCE: the ssh/scp options, one per line.
+ssm_ssh_opts() {
+	printf '%s\n' -i "$SSM_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=30 -o LogLevel=ERROR \
+		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+		-o "ProxyCommand=aws ssm start-session --region $REGION${AWS_PROFILE_ARG:+ --profile $AWS_PROFILE_ARG} --target $1 --document-name AWS-StartSSHSession --parameters portNumber=%p"
+}
+# ssm_push_key INSTANCE OS_USER: (re)install the one-minute key. Returns 1 with the reason in SSM_SCP_ERR.
+ssm_push_key() {
+	local out
+	resp_init
+	if [[ -z "$SSM_KEY" ]]; then
+		SSM_KEY="$RESP_DIR/node_key"
+		ssh-keygen -q -t ed25519 -N '' -C aigw-doctor -f "$SSM_KEY" >/dev/null 2>&1 || { SSM_SCP_ERR="ssh-keygen failed"; SSM_KEY=""; return 1; }
+	fi
+	out=$(aws ec2-instance-connect send-ssh-public-key --region "$REGION" --instance-id "$1" --instance-os-user "$2" \
+		--ssh-public-key "file://$SSM_KEY.pub" --query Success --output text 2>&1) && [[ "$out" == True ]] && return 0
+	SSM_SCP_ERR="EC2 Instance Connect did not accept a key for $2: $(tail -n 1 <<<"$out" | cut -c1-200)"
+	return 1
+}
+# ssm_scp_ready INSTANCE OS_USER: can a file be copied that way? Tries a login that runs "true".
+ssm_scp_ready() {
+	local opts=() o out
+	SSM_SCP_ERR=""
+	command -v session-manager-plugin >/dev/null || { SSM_SCP_ERR="the Session Manager plugin is not installed here"; return 1; }
+	command -v scp >/dev/null && command -v ssh-keygen >/dev/null || { SSM_SCP_ERR="ssh, scp or ssh-keygen is not installed here"; return 1; }
+	ssm_push_key "$1" "$2" || return 1
+	while IFS= read -r o; do opts+=("$o"); done < <(ssm_ssh_opts "$1")
+	out=$(ssh "${opts[@]}" "$2@$1" true 2>&1 </dev/null) && return 0
+	SSM_SCP_ERR="ssh through Session Manager as $2 failed: $(tail -n 1 <<<"$out" | cut -c1-200)"
+	return 1
+}
+
 step_install_build() {
 	step "Install a gateway build ($BUILD_URL)"
+	local os_user inst bucket_region opts=() o
 	local target out arch node_arch bin sha active reach method="" src shown_src remote_tmp local_gz key link script shown result new_sha backup unit="$AIGW_SERVICE"
 	target=$(target_for "$AIGW_INSTANCE" "$AIGW_SSH")
 	if allowed check && [[ -z "$target" ]]; then
@@ -936,14 +981,25 @@ curl -fsSI --max-time 15 -o /dev/null '$BUILD_FILE_URL' 2>/dev/null && echo 'REA
 		method="downloaded by the gateway node"
 	elif [[ "$target" == ssh:* ]]; then
 		method="downloaded here and copied over ssh"
-	elif [[ -n "$BUILD_BUCKET" ]]; then
-		method="downloaded here and passed through s3://$BUILD_BUCKET"
 	else
-		fail "build: the gateway node cannot reach $BUILD_FILE_URL"
-		hint "pass --build-bucket <S3 bucket you can write to> (the build is uploaded, fetched by the node with a 15-minute link, then deleted), or --aigw-ssh user@host"
-		return 1
+		# Copied straight to the node when that works; an S3 bucket is the fallback.
+		inst="${target#ssm:}"
+		os_user="$AIGW_OS_USER"
+		[[ -n "$os_user" ]] || { [[ "$bin" =~ ^/home/([^/]+)/ ]] && os_user="${BASH_REMATCH[1]}"; }
+		os_user="${os_user:-ec2-user}"
+		info "the gateway node cannot reach the build URL; trying a copy with scp through Session Manager as $os_user"
+		if ssm_scp_ready "$inst" "$os_user"; then
+			method="downloaded here and copied to the node with scp through Session Manager (as $os_user)"
+		elif [[ -n "$BUILD_BUCKET" ]]; then
+			info "scp is not possible ($SSM_SCP_ERR)"
+			method="downloaded here and passed through s3://$BUILD_BUCKET"
+		else
+			fail "build: the gateway node cannot reach $BUILD_FILE_URL, and the build cannot be copied to it: $SSM_SCP_ERR"
+			hint "install the Session Manager plugin and allow ec2-instance-connect:SendSSHPublicKey, or pass --aigw-os-user <login on the node>, --aigw-ssh user@host, or --build-bucket <S3 bucket you can write to>"
+			return 1
+		fi
 	fi
-	info "the build is $method"
+	note "how the build gets there: $method"
 
 	if [[ "$MODE" == check ]]; then
 		note "to install it: stop $unit, save $bin as $bin.bak-<time>, put the new binary in place, start $unit"
@@ -969,11 +1025,24 @@ curl -fsSI --max-time 15 -o /dev/null '$BUILD_FILE_URL' 2>/dev/null && echo 'REA
 			run fix scp -o BatchMode=yes -o ConnectTimeout=10 "$local_gz" "${target#ssh:}:$remote_tmp" || { allowed fix && { fail "build: could not copy the build to ${target#ssh:}"; return 1; }; }
 			src="sudo mv '$remote_tmp' \"\$tmp.gz\""
 			shown_src="$src"
+		elif [[ "$method" == *"scp through Session Manager"* ]]; then
+			remote_tmp="/tmp/aigw-doctor-build.$$.gz"
+			# The key lasts a minute: install it again right before the copy.
+			ssm_push_key "$inst" "$os_user" || { fail "build: $SSM_SCP_ERR"; return 1; }
+			while IFS= read -r o; do opts+=("$o"); done < <(ssm_ssh_opts "$inst")
+			run fix scp "${opts[@]}" "$local_gz" "$os_user@$inst:$remote_tmp" </dev/null || { allowed fix && { fail "build: could not copy the build to $inst with scp"; hint "the copy runs through Session Manager; check the Session Manager plugin, or pass --build-bucket"; return 1; }; }
+			src="sudo mv '$remote_tmp' \"\$tmp.gz\""
+			shown_src="$src"
 		else
 			key="aigw-doctor/$(date +%Y%m%d%H%M%S)-$$/${BUILD_FILE_URL##*/}"
+			# The link must be signed for the bucket's own region, which need not be the
+			# gateway's: a link for another region returns an error page, not the file.
+			bucket_region=$(aws s3api get-bucket-location --bucket "$BUILD_BUCKET" --query LocationConstraint --output text 2>/dev/null)
+			case "$bucket_region" in "" | None | null) bucket_region=us-east-1 ;; EU) bucket_region=eu-west-1 ;; esac
+			BUILD_S3_REGION="$bucket_region"
 			BUILD_S3="s3://$BUILD_BUCKET/$key"
-			run fix aws s3 cp --region "$REGION" --only-show-errors "$local_gz" "$BUILD_S3" || { allowed fix && { BUILD_S3=""; fail "build: could not upload to s3://$BUILD_BUCKET"; hint "you need s3:PutObject on the bucket"; return 1; }; }
-			link=$(run fix aws s3 presign --region "$REGION" --expires-in 900 "$BUILD_S3")
+			run fix aws s3 cp --region "$bucket_region" --only-show-errors "$local_gz" "$BUILD_S3" || { allowed fix && { BUILD_S3=""; fail "build: could not upload to s3://$BUILD_BUCKET"; hint "you need s3:PutObject on the bucket"; return 1; }; }
+			link=$(run fix aws s3 presign --region "$bucket_region" --expires-in 900 "$BUILD_S3")
 			src="sudo curl -fsSL --max-time 600 -o \"\$tmp.gz\" '$link'"
 			shown_src="sudo curl -fsSL --max-time 600 -o \"\$tmp.gz\" '<15-minute link to $BUILD_S3>'"
 		fi
@@ -1000,8 +1069,8 @@ tmp=''
 trap 'exit 143' HUP INT TERM
 trap 'sudo rm -rf \"\$tmp\" \"\$tmp.gz\" \"\$lock\"' EXIT
 tmp=\$(sudo mktemp \"\$bin.new.XXXXXX\")
-__SRC__
-sudo sh -c \"gunzip -c '\$tmp.gz' > '\$tmp'\"
+__SRC__ || { echo 'RESULT nofile'; exit 0; }
+sudo sh -c \"gunzip -c '\$tmp.gz' > '\$tmp'\" 2>/dev/null || { echo \"RESULT notgzip \$(sudo head -c 80 \"\$tmp.gz\" | tr -c '[:alnum:][:punct:]' ' ')\"; exit 0; }
 [ \"\$(sudo head -c 4 \"\$tmp\" | od -An -c | tr -d ' ')\" = '177ELF' ] || { echo 'RESULT notbinary'; exit 0; }
 m=\$(sudo od -An -t u1 -j 18 -N 1 \"\$tmp\" | tr -d ' ')
 case \"\$(uname -m):\$m\" in aarch64:183 | x86_64:62) ;; *) echo \"RESULT wrongarch \$m\"; exit 0 ;; esac
@@ -1064,7 +1133,7 @@ echo \"\$unit is \$(systemctl is-active \"\$unit\")\""
 	out=$(remote fix "$target" "$script" "$shown")
 	SSM_ON_CANCEL=""
 	SSM_WAIT=180
-	[[ -z "$BUILD_S3" ]] || { run fix aws s3 rm --region "$REGION" --only-show-errors "$BUILD_S3" && BUILD_S3=""; }
+	[[ -z "$BUILD_S3" ]] || { run fix aws s3 rm --region "$BUILD_S3_REGION" --only-show-errors "$BUILD_S3" && BUILD_S3=""; }
 	allowed fix || return 0
 
 	result=$(sed -n 's/^RESULT //p' <<<"$out" | tail -n 1)
@@ -1092,6 +1161,14 @@ echo \"\$unit is \$(systemctl is-active \"\$unit\")\""
 		fail "build: the binary could not be replaced; the earlier one was put back (service now ${result#* })"
 		hint "check free space and permissions next to $bin on the node"
 		;;
+	nofile)
+		fail "build: the build file did not arrive on $(target_label "$target"); nothing was changed"
+		hint "the download or the move on the node failed; the output of the run is in the full log"
+		;;
+	notgzip*)
+		fail "build: what arrived on the node is not the .gz build (it starts with: ${result#notgzip }); nothing was changed"
+		hint "a download link that returns an error page gives this; the build can also be copied with scp (the default when the Session Manager plugin is installed)"
+		;;
 	notbinary) fail "build: ${BUILD_FILE_URL##*/} did not unpack to a Linux binary; nothing was changed" ;;
 	wrongarch*) fail "build: the unpacked binary is not built for this node; nothing was changed" ;;
 	*)
@@ -1101,7 +1178,7 @@ echo \"\$unit is \$(systemctl is-active \"\$unit\")\""
 		;;
 	esac
 }
-BUILD_S3=""
+BUILD_S3="" BUILD_S3_REGION=""
 BUILD_INSTALLED=false
 
 # multi_gateway_note: only one instance is changed, and a replaced instance loses the build.
@@ -3210,7 +3287,7 @@ cleanup() {
 	batch_leftovers
 	delete_api_key
 	[[ -z "$FETCH_TMP" ]] || rm -f "$FETCH_TMP"
-	[[ -z "$BUILD_S3" ]] || aws s3 rm --region "$REGION" --only-show-errors "$BUILD_S3" 2>/dev/null
+	[[ -z "$BUILD_S3" ]] || aws s3 rm --region "${BUILD_S3_REGION:-$REGION}" --only-show-errors "$BUILD_S3" 2>/dev/null
 	[[ -z "$RESP_DIR" ]] || rm -rf "$RESP_DIR"
 	[[ -z "$RUN_LOG" ]] || printf '%s# finished: %s, exit %s%s\n' "$MARK" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 		"$rc" "$( ((rc > 128)) && echo ' (interrupted)')"
