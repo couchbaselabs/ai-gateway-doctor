@@ -30,6 +30,12 @@
 #      semantic) and expect X-Cache: HIT on the repeat; needs an API key.
 #      A request refused by a deployment's rate limit is retried after its
 #      Retry-After; spend-cap and guardrail refusals are reported as such.
+#      Every answered probe shows the token usage the gateway reported; an answer
+#      without usage (or with 0 prompt tokens) is a failure: the gateway meters
+#      tokens and spend from it.
+#   7b. read the gateway's request and token counters (its metrics, on the node)
+#      before and after the probes: a model whose requests are counted while its
+#      prompt tokens are not is reported (requests served but not metered).
 #      Optional probes: --probe-guardrails (a prompt attack must be blocked),
 #      --probe-rate-limit (a burst must be refused with 429 and Retry-After) and
 #      --probe-batch (a two-request batch must complete)
@@ -2210,6 +2216,9 @@ call() {
 	done
 	cache=$(resp_header x-cache)
 	exchange_line "$1" "$2" "$3" "${code:-000}" "${cache:--}" "${secs:-0}"
+	# Every answered request is noted with the tokens the gateway reported, for step 7b.
+	[[ "$code" != 200 ]] || printf '%s\t%s\t%s\t%s\n' "$(jq -r '.model // "-"' <<<"$3" 2>/dev/null)" "$1" "${cache:--}" \
+		"$(resp_usage | tr ' ' '\t')" >>"$USAGE_LOG"
 	printf '%s %s %.1f\n' "${code:-000}" "${cache:--}" "${secs:-0}"
 }
 
@@ -2805,6 +2814,142 @@ probe_jailbreak() {
 # "off" when the type is on but cacheConfig.isEnabled is false, or "-" when the type is off.
 # JAILBREAK is "J" when the model has jailbreak detection, GUARD is "G" when it is served
 # with a Bedrock guardrail. Returns 2 when the gateway is unreachable.
+# ---------- token usage (AV-153389) ----------
+# The gateway meters a request (its token counters, spend caps, the usage shown in Capella)
+# from the "usage" object of the model's answer. A provider adapter that does not fill it
+# in serves requests that are counted with 0 tokens, so every probe shows and checks it.
+
+# resp_usage: "<prompt> <completion> <total>" of the last response; "-" where it has none.
+resp_usage() {
+	jq -r '(.usage // {}) | [(.prompt_tokens // .input_tokens), (.completion_tokens // .output_tokens), .total_tokens]
+		| map(if type == "number" then floor else "-" end) | join(" ")' "$RESP_FILE" 2>/dev/null || echo "- - -"
+}
+# usage_text KIND: "tokens: 12 in, 1 out, 13 total" for the PASS line (embeddings have no "out").
+usage_text() {
+	local p c t
+	read -r p c t <<<"$(resp_usage)"
+	if [[ "$p" == - && "$c" == - && "$t" == - ]]; then
+		echo "no token usage"
+	elif [[ "$1" == embeddings ]]; then
+		echo "tokens: ${p/#-/?} in${t:+$([[ "$t" != - && "$t" != "$p" ]] && echo ", $t total")}"
+	else
+		echo "tokens: ${p/#-/?} in, ${c/#-/?} out, ${t/#-/?} total"
+	fi
+}
+# usage_check MODEL KIND SECONDS: the answer to a served request must say how many tokens it
+# used. Returns 1 (after a FAIL) when it does not, so the caller prints no PASS for it.
+usage_check() {
+	local model="$1" kind="$2" p c t wrong=""
+	read -r p c t <<<"$(resp_usage)"
+	if [[ "$p" == - && "$c" == - && "$t" == - ]]; then
+		wrong="has no token usage"
+	elif [[ "$p" == - || "$p" -le 0 ]]; then
+		wrong="reports ${p/#-/no} prompt tokens"
+	elif [[ "$kind" == chat && ("$c" == - || "$c" -le 0) ]]; then
+		wrong="reports ${c/#-/no} completion tokens"
+	fi
+	if [[ -n "$wrong" ]]; then
+		fail "inference: $model $kind answered (${3:-?}s), but the response $wrong (usage: $(jq -c '.usage // "missing"' "$RESP_FILE" 2>/dev/null | cut -c1-120))"
+		hint "the gateway counts tokens, spend and the usage shown in Capella from this, so requests to $model are served but metered as 0 (as in AV-153389); the gateway must fill in usage for this model's provider"
+		return 1
+	fi
+	if [[ "$kind" == chat && "$t" != - && "$t" -ne $((p + c)) ]]; then
+		warn "inference: $model chat usage does not add up: $p prompt + $c completion tokens, total $t"
+		hint "total_tokens should be prompt_tokens + completion_tokens; check how the gateway maps the provider's usage"
+	elif [[ "$kind" == embeddings && "$t" != - && "$t" -lt "$p" ]]; then
+		warn "inference: $model embeddings usage does not add up: $p prompt tokens, total $t"
+		hint "total_tokens should be at least prompt_tokens; check how the gateway maps the provider's usage"
+	fi
+}
+
+# The gateway's own counters per model, read on the node before and after the probes:
+# "TOK <model_name> <model_id> <requests> <errors> <prompt> <completion> <cached prompt>
+# <cached completion>", tab separated, summed over the other labels.
+TOKEN_AWK='/^[a-z_]*(total_requests_count|error_count|prompt_tokens_total|completion_tokens_total)[{]/ {
+	n = $0; sub(/[{].*/, "", n)
+	if (n ~ /cached_prompt_tokens_total$/) k = "cp"; else if (n ~ /cached_completion_tokens_total$/) k = "cc"
+	else if (n ~ /prompt_tokens_total$/) k = "p"; else if (n ~ /completion_tokens_total$/) k = "c"
+	else if (n ~ /total_requests_count$/) k = "r"; else k = "e"
+	name = "-"; id = "-"
+	if (match($0, /model_name="[^"]*"/)) name = substr($0, RSTART + 12, RLENGTH - 13)
+	if (match($0, /model_id="[^"]*"/)) id = substr($0, RSTART + 10, RLENGTH - 11)
+	if (name == "") name = "-"
+	if (id == "") id = "-"
+	if (name == "-" && id == "-") next
+	m = name "\t" id; seen[m] = 1; v[m, k] += $NF
+}
+END { if (NR) print "TOK_END"
+	for (m in seen) printf "TOK\t%s\t%d\t%d\t%d\t%d\t%d\t%d\n", m, v[m, "r"], v[m, "e"], v[m, "p"], v[m, "c"], v[m, "cp"], v[m, "cc"] }'
+# TOK_END marks metrics that were read; a gateway that has served nothing has no rows yet.
+token_counters() {
+	local out
+	out=$(remote check "$AIGW_TARGET" "curl -s --max-time 10 http://127.0.0.1:9090/metrics | awk '$TOKEN_AWK'" 2>/dev/null)
+	allowed check || return 0
+	grep -q '^TOK_END' <<<"$out" || return 1
+	grep "^TOK$(printf '\t')" <<<"$out"
+	return 0
+}
+TOKENS_BEFORE="" TOKENS_READ=false
+token_counters_before() {
+	[[ "$AIGW_TARGET" != local ]] || return 0
+	$SKIP_INFERENCE || [[ -z "$AIGW_URL" ]] || info "reading the gateway's request and token counters before the model probes"
+	TOKENS_BEFORE=$(token_counters) && TOKENS_READ=true
+	return 0
+}
+
+# step 7b: do the gateway's counters agree with what its answers said?
+step_token_usage() {
+	local after model n sum_p row b_row dreq dtok probed=false quiet
+	step "7b. Token usage in the gateway counters"
+	if [[ "$AIGW_TARGET" == local ]]; then
+		skip "token counters: no ai-gateway instance (pass --tenant-id or --aigw-instance); the usage in each response was checked in step 7"
+		return 0
+	fi
+	if ! allowed check; then
+		note "on $(target_label "$AIGW_TARGET"), before and after the model probes: curl -s http://127.0.0.1:9090/metrics (the request and token counters per model)"
+		info "then: per model, compare the requests and prompt tokens the gateway counted with what its answers reported"
+		return 0
+	fi
+	if ! $TOKENS_READ; then
+		skip "token counters: the gateway's metrics (port 9090 on the node) could not be read"
+		return 0
+	fi
+	# Since the gateway started: requests answered, yet not one token counted.
+	quiet=$(awk -F'\t' '$4 - $5 > 0 && $6 + $8 == 0 {printf "%s%s (%d requests, %d errors)", sep, ($2 == "-" ? $3 : $2), $4, $5; sep = ", "}' <<<"$TOKENS_BEFORE")
+	if [[ -n "$quiet" ]]; then
+		warn "token counters: requests were served with 0 prompt tokens counted since this gateway node started: $quiet"
+		hint "this is the AV-153389 pattern (usage missing from the provider's answer); requests refused by a rate limit or a guardrail also count as requests, so compare with the probe result for that model"
+	fi
+	[[ -s "$USAGE_LOG" ]] && probed=true
+	if ! $probed; then
+		[[ -n "$quiet" ]] || pass "token counters: every model that served requests on this node has prompt tokens counted ($(grep -c . <<<"$TOKENS_BEFORE" || true) model(s) with counters)"
+		info "no model request of this run was answered, so there is nothing to compare"
+		return 0
+	fi
+	after=$(token_counters) || { skip "token counters: the gateway's metrics could not be read again after the probes"; return 0; }
+	while IFS=$'\t' read -r model n sum_p; do
+		row=$(awk -F'\t' -v m="$model" '$2 == m || $3 == m' <<<"$after" | head -n 1)
+		if [[ -z "$row" ]]; then
+			skip "token counters: $model has no counters on this node (another gateway instance served the $n request(s), or the gateway names it differently)"
+			continue
+		fi
+		b_row=$(awk -F'\t' -v m="$model" '$2 == m || $3 == m' <<<"$TOKENS_BEFORE" | head -n 1)
+		dreq=$(($(cut -f4 <<<"$row") - $(cut -f4 <<<"${b_row:-0	0	0	0}")))
+		dtok=$(($(awk -F'\t' '{print $6 + $8}' <<<"$row") - $(awk -F'\t' '{print $6 + $8}' <<<"${b_row:-0	0	0	0	0	0	0	0}")))
+		if ((dreq <= 0)); then
+			skip "token counters: $model: this node counted none of the $n request(s) (another gateway instance served them)"
+		elif ((dtok <= 0)); then
+			fail "token counters: $model: the gateway counted $dreq more request(s) but no prompt tokens (its answers reported $sum_p)"
+			hint "requests are served but not metered, as in AV-153389: ai_model_service_gateway_total_requests_count grows while ..._prompt_tokens_total stays; the gateway must take the usage from the provider's answer (Bedrock Cohere embed sends it in the x-amzn-bedrock-input-token-count header)"
+		elif ((dtok < sum_p)); then
+			warn "token counters: $model: the gateway counted $dtok prompt tokens over $dreq request(s), fewer than the $sum_p its answers reported for $n request(s)"
+			hint "some answers were not metered, or another gateway instance served part of them; run again and compare"
+		else
+			pass "token counters: $model: +$dreq request(s), +$dtok prompt tokens counted (the answers to this run's $n request(s) reported $sum_p)"
+		fi
+	done < <(awk -F'\t' '{n[$1]++; if ($4 ~ /^[0-9]+$/) p[$1] += $4} END {for (m in n) printf "%s\t%d\t%d\n", m, n[m], p[m]}' "$USAGE_LOG" | sort)
+}
+
 probe_chat() {
 	local model="$1" std="$2" sem="$3" threshold="$4" jb="${5:--}" guard="${6:--}" code x secs type name
 	read -r code x secs <<<"$(call /v1/chat/completions none "$(chat_body "$model" "Reply with only the word OK.")")"
@@ -2826,10 +2971,12 @@ probe_chat() {
 		fi
 		INFERENCE_RAN=true
 		MODEL_OK=true
-		if [[ "$guard" == G ]]; then
-			pass "inference: $model chat OK (${secs}s, passed its Bedrock guardrail check)"
+		if ! usage_check "$model" chat "$secs"; then
+			:
+		elif [[ "$guard" == G ]]; then
+			pass "inference: $model chat OK (${secs}s, $(usage_text chat), passed its Bedrock guardrail check)"
 		else
-			pass "inference: $model chat OK (${secs}s)"
+			pass "inference: $model chat OK (${secs}s, $(usage_text chat))"
 		fi
 	fi
 	if [[ "$jb" == J ]]; then
@@ -2913,8 +3060,8 @@ probe_embedding() {
 	if [[ "$dims" != - && -n "$n" && "$n" != "$dims" ]]; then
 		warn "inference: $model embeddings returned $n dimensions, config says $dims"
 		hint "set embeddingDimensions in the model config to match, or check which embedding model is deployed"
-	else
-		pass "inference: $model embeddings OK (${n:-?} dimensions, ${secs}s)"
+	elif usage_check "$model" embeddings "$secs"; then
+		pass "inference: $model embeddings OK (${n:-?} dimensions, ${secs}s, $(usage_text embeddings))"
 	fi
 }
 
@@ -3273,7 +3420,13 @@ elif $NEED_LOOKUP; then
 	step_locate_tenant
 fi
 step_cp_endpoint
+# The gateway's token counters are read around the model probes (step 7b).
+resp_init
+USAGE_LOG="$RESP_DIR/usage.tsv"
+: >"$USAGE_LOG"
+$INFRA && allowed check && token_counters_before
 step_inference
+$INFRA && step_token_usage
 $INFRA && step_fix
 
 # ---------- summary ----------

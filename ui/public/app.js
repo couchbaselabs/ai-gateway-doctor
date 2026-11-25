@@ -421,6 +421,8 @@ function playEntry(r) {
       r.stream && el('span', { class: 'chip' },
         `streamed · first token ${r.stream.firstTokenMs === null ? '–' : `${(r.stream.firstTokenMs / 1000).toFixed(2)}s`} · ${r.stream.chunks} chunks`),
       tokens && el('span', { class: 'ex-tokens' }, tokens),
+      r.usageMissing && el('span', { class: 'pill fail', title: 'The gateway meters tokens and spend from the usage in the answer; this request is served but counted as 0 tokens (as in AV-153389).' },
+        tokens ? '0 prompt tokens' : 'no token usage'),
       el('span', { class: 'ex-time' }, `${(r.ms / 1000).toFixed(2)}s · ${new Date(r.at).toLocaleTimeString()}`)),
     el('div', { class: 'ex-body' },
       el('div', { class: 'ex-q' }, el('span', { class: 'ex-label' }, 'Q'), el('span', { class: 'pre-line' }, prompt)),

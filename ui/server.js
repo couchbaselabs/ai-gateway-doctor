@@ -1285,10 +1285,17 @@ function playgroundResult(p, res, text, extra = {}) {
     : p.embedding
       ? json?.data?.[0]?.embedding ? `${json.data[0].embedding.length}-dimension vector: [${json.data[0].embedding.slice(0, 6).map((x) => x.toFixed(4)).join(', ')}, …]` : ''
       : json?.choices?.[0]?.message?.content ?? '';
+  // A served chat or embeddings request must say how many tokens it used: the gateway meters
+  // from this (AV-153389). A streamed answer carries usage only when the client asks for it.
+  const usage = extra.usage || json?.usage || null;
+  const inTokens = usage ? usage.prompt_tokens ?? usage.input_tokens : null;
+  const metered = res.status >= 200 && res.status < 300 && !extra.stream && !extra.batch && p.type !== 'moderations' && p.type !== 'batch';
+  const usageMissing = metered && !(inTokens > 0);
   return {
+    usageMissing,
     endpoint: p.url, keySource: p.source, status: res.status, ms: res.ms,
     xcache: res.headers['x-cache'] || '', cacheType: p.cacheType, model: p.modelName, kind: p.kind,
-    request: p.payload, requestHeaders, responseHeaders, content, usage: extra.usage || json?.usage || null,
+    request: p.payload, requestHeaders, responseHeaders, content, usage,
     insecure: !p.verifyTls, // for the shareable curl command (-k)
     error: extra.error || (res.status >= 300 ? json?.error?.message || json?.message || text.slice(0, 500) : ''),
     raw: text.length > 20000 ? `${text.slice(0, 20000)}…` : text,
