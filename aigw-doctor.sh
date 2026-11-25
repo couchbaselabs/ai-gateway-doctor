@@ -173,10 +173,38 @@ FROM=""
 SANDBOX_NAME=""
 # The config folder is shared with the UI: $AIGW_CONFIG_DIR, else the folder the UI's
 # settings file (ui/.env next to this script) names, else ~/.aigw-doctor/configs.
+# env_file_value FILE KEY: a value from the UI's settings file, read the way the UI reads
+# it (readEnv in ui/server.js): optional "export", spaces around "=", a value in single or
+# double quotes, a trailing " # comment"; the last line for the key wins.
+env_file_value() {
+	local line v q rest inner tail out="" re="^(export[[:space:]]+)?$2[[:space:]]*=[[:space:]]*(.*)\$" found
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		[[ "$line" =~ $re ]] || continue
+		v="${BASH_REMATCH[2]}"
+		q="${v:0:1}"
+		found=false
+		if [[ "$q" == '"' || "$q" == "'" ]]; then
+			# the first closing quote that ends the line, or is followed by a comment
+			rest="${v:1}"
+			inner=""
+			while [[ "$rest" == *"$q"* ]]; do
+				inner+="${rest%%"$q"*}"
+				tail="${rest#*"$q"}"
+				if [[ -z "$tail" || "$tail" =~ ^[[:space:]]+# ]]; then found=true; break; fi
+				inner+="$q"
+				rest="$tail"
+			done
+		fi
+		if $found; then out="$inner"; else out=$(sed -E 's/[[:space:]]+#.*$//' <<<"$v"); fi
+	done <"$1"
+	printf '%s' "$out"
+}
 CONFIG_DIR="${AIGW_CONFIG_DIR:-}"
 if [[ -z "$CONFIG_DIR" && -f "$(dirname "$0")/ui/.env" ]]; then
-	CONFIG_DIR=$(sed -n 's/^AIGW_CONFIG_DIR=//p' "$(dirname "$0")/ui/.env" | tail -n 1)
-	CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+	CONFIG_DIR=$(env_file_value "$(dirname "$0")/ui/.env" AIGW_CONFIG_DIR)
+	[[ "$CONFIG_DIR" == "~/"* ]] && CONFIG_DIR="$HOME/${CONFIG_DIR:2}"
 fi
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.aigw-doctor/configs}"
 FETCH_ONLY=false
