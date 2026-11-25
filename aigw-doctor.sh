@@ -985,12 +985,15 @@ curl -fsSI --max-time 15 -o /dev/null '$BUILD_FILE_URL' 2>/dev/null && echo 'REA
 unit='$unit'; bin='$bin'
 # One install at a time per binary: the lock folder holds this script's pid and, later, the
 # backup it made. A lock whose owner is gone was left by a killed install and is taken over.
+# The lock folder is never removed for that: whoever creates takeover-<dead pid> inside it
+# (mkdir, so only one can) becomes the owner; everyone else sees a lock that is held.
 lock=\"\$bin.install-lock\"
 if ! sudo mkdir \"\$lock\" 2>/dev/null; then
-  owner=\$(sudo cat \"\$lock/pid\" 2>/dev/null)
+  owner=\$(sudo cat \"\$lock/pid\" 2>/dev/null || true) # no pid yet: its owner is just starting
   if [ -z \"\$owner\" ] || sudo kill -0 \"\$owner\" 2>/dev/null; then echo \"RESULT busy \$owner\"; exit 0; fi
-  sudo rm -rf \"\$lock\"; sudo sh -c \"rm -f '\$bin'.new.*\"
-  sudo mkdir \"\$lock\" 2>/dev/null || { echo 'RESULT busy'; exit 0; }
+  sudo mkdir \"\$lock/takeover-\$owner\" 2>/dev/null || { echo 'RESULT busy'; exit 0; }
+  echo \$\$ | sudo tee \"\$lock/pid\" >/dev/null
+  sudo rm -f \"\$lock/bak\"; sudo sh -c \"rm -f '\$bin'.new.*\"
 fi
 echo \$\$ | sudo tee \"\$lock/pid\" >/dev/null
 tmp=''
@@ -1045,7 +1048,11 @@ lock=\"\$bin.install-lock\"
 owner=\$(sudo cat \"\$lock/pid\" 2>/dev/null)
 if [ -n \"\$owner\" ] && sudo kill -0 \"\$owner\" 2>/dev/null; then echo \"an install (pid \$owner) is still running on the node; nothing was changed\"; exit 0; fi
 if [ ! -d \"\$lock\" ]; then echo \"\$unit is \$(systemctl is-active \"\$unit\")\"; exit 0; fi
-# The lock is still there: the install was killed before it could undo its work.
+# The lock is still there: the install was killed before it could undo its work. Take the
+# lock over the same way an install does, so this never works beside one.
+if [ -z \"\$owner\" ]; then echo \"\$lock has no owner; \$unit is \$(systemctl is-active \"\$unit\"); remove the lock by hand if no install is running\"; exit 0; fi
+sudo mkdir \"\$lock/takeover-\$owner\" 2>/dev/null || { echo \"another install has taken over on the node; nothing was changed\"; exit 0; }
+echo \$\$ | sudo tee \"\$lock/pid\" >/dev/null
 bak=\$(sudo cat \"\$lock/bak\" 2>/dev/null)
 sudo sh -c \"rm -f '\$bin'.new.*\"
 if [ \"\$(systemctl is-active \"\$unit\")\" != active ]; then
