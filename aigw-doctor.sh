@@ -61,10 +61,13 @@
 #                          (...?oid=<org id>, or .../organizations/<org id>), or from an id
 #                          that tags the gateway's instances (the org id). Sets --tenant-id,
 #                          --org-id and --cp-url (https://api.<console host>) unless given.
+#                          A URL without the organization, such as the Fleet Manager's
+#                          (https://fm.<env>/), works with --tenant-id <org id>.
 #                          Without -c the config is fetched with your AWS credentials: the
-#                          tenant's gateways are found by their tags, in --region or else in
-#                          every enabled region; with several you are asked which one to use
-#                          (or pass --region); the config is read from the Secrets Manager secret
+#                          tenant's gateways are found by their tags in --region, else in
+#                          us-east-1 and us-east-2 (AIGW_FETCH_REGIONS sets other defaults);
+#                          with several you are asked which one to use; the config is read
+#                          from the Secrets Manager secret
 #                          named in the instance's user data (aigwConfigKey), else from the
 #                          gateway's live config file through SSM. It is saved as
 #                          <name>.config.json (mode 600) and the run continues with it
@@ -73,6 +76,9 @@
 #                          (default: $AIGW_CONFIG_DIR, else the folder in ui/.env,
 #                          else ~/.aigw-doctor/configs)
 #   --fetch-only           with --from and --check: save the config and stop
+#   --list-models          with --from URL (or --cp-url and --org-id), --cp-user and --check:
+#                          list the organization's models and the gateway endpoint of each
+#                          region from the Capella control plane; needs no AWS and no config
 #   --list-gateways        with --from and --check: list the tenant's gateways
 #                          (GATEWAY <region> <instance> <ASG> lines) and stop
 #   --install-build URL    replace the ai-gateway binary on the sandbox gateway with a build, to
@@ -209,6 +215,7 @@ fi
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.aigw-doctor/configs}"
 FETCH_ONLY=false
 LIST_GATEWAYS=false
+LIST_MODELS=false
 BUILD_URL=""
 BUILD_ARCH="arm64"
 BUILD_BUCKET=""
@@ -268,6 +275,7 @@ while [[ $# -gt 0 ]]; do
 	--config-dir) CONFIG_DIR="$2"; shift ;;
 	--fetch-only) FETCH_ONLY=true ;;
 	--list-gateways) LIST_GATEWAYS=true ;;
+	--list-models) LIST_MODELS=true ;;
 	--install-build) BUILD_URL="$2"; shift ;;
 	--build-arch) BUILD_ARCH="$2"; shift ;;
 	--build-bucket) BUILD_BUCKET="$2"; shift ;;
@@ -312,11 +320,16 @@ while [[ $# -gt 0 ]]; do
 	shift
 done
 die() { echo "error: $*" >&2; exit 1; }
-[[ -n "$CONFIG" || -n "$FROM" ]] || { echo "error: -c/--config is required (or --from URL|ID to fetch it)" >&2; usage 1; }
+[[ -n "$CONFIG" || -n "$FROM" ]] || $LIST_MODELS || { echo "error: -c/--config is required (or --from URL|ID to fetch it)" >&2; usage 1; }
 [[ -z "$CONFIG" || -f "$CONFIG" ]] || die "config not found: $CONFIG"
 # --from without -c: the config is fetched from AWS before the run (step 0b).
 FETCH=false
 [[ -n "$FROM" && -z "$CONFIG" ]] && FETCH=true
+# --list-models asks only the Capella control plane: no config, no AWS.
+if $LIST_MODELS; then
+	FETCH=false
+	INFRA=false
+fi
 ! $FETCH_ONLY || $FETCH || die "--fetch-only needs --from, and no -c"
 ! $LIST_GATEWAYS || $FETCH || die "--list-gateways needs --from, and no -c"
 [[ -z "$SANDBOX_NAME" || "$SANDBOX_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "--name may hold letters, digits, dots, dashes and underscores"
@@ -339,14 +352,20 @@ if [[ -n "$FROM" ]]; then
 		from_host="${BASH_REMATCH[1]}"
 		if [[ "$FROM" =~ $from_oid || "$FROM" =~ $from_org ]]; then
 			FROM_ID="${BASH_REMATCH[1]}"
+		elif [[ -n "${TENANT_ID:-$ORG_ID}" ]]; then
+			# A URL without the organization, such as the Fleet Manager's (https://fm.<env>/):
+			# it gives the environment, --tenant-id gives the organization.
+			FROM_ID="${TENANT_ID:-$ORG_ID}"
 		else
-			die "--from: no organization in that URL (expected ...?oid=<org id> or .../organizations/<org id>)"
+			die "--from: no organization in that URL (expected ...?oid=<org id> or .../organizations/<org id>); for a URL without it, such as the Fleet Manager's, add --tenant-id <org id>"
 		fi
 		if [[ -z "$CP_URL" ]]; then
-			# cloud.couchbase.com and ui.<env>.<domain> (a sandbox console) both have their API at api.
+			# cloud.couchbase.com, ui.<env>.<domain> (a sandbox console) and fm.<env>.<domain>
+			# (its Fleet Manager) all have their API at api.
 			case "$from_host" in
 			api.*) CP_URL="https://$from_host" ;;
 			ui.*) CP_URL="https://api.${from_host#ui.}" ;;
+			fm.*) CP_URL="https://api.${from_host#fm.}" ;;
 			*) CP_URL="https://api.$from_host" ;;
 			esac
 		fi
@@ -364,6 +383,9 @@ if [[ -n "$FROM" ]]; then
 		die "--from takes a Capella console URL with the organization, or an id"
 	fi
 fi
+# Where --from looks for the gateways when --region is not given. Not every enabled region:
+# that search hangs for minutes when one regional endpoint cannot be reached.
+FETCH_REGIONS="${AIGW_FETCH_REGIONS:-us-east-1 us-east-2}"
 [[ -z "$API_KEY_FILE" || -f "$API_KEY_FILE" ]] || die "API key file not found: $API_KEY_FILE"
 [[ -z "$SAVE_KEY_FILE" ]] || $CREATE_KEY || die "--save-api-key needs --create-api-key"
 [[ -z "$API_KEY_FILE" ]] || ! $CREATE_KEY || die "use either --api-key-file or --create-api-key"
@@ -372,6 +394,7 @@ fi
 # A control plane session comes from a login (--cp-user) or from a JWT in CP_JWT.
 CP_AUTH=false
 [[ -n "$CP_USER" || -n "${CP_JWT:-}" ]] && CP_AUTH=true
+! $LIST_MODELS || $CP_AUTH || die "--list-models needs a Capella sign-in: --cp-user EMAIL (password in CP_PASSWORD, or a prompt), or a session JWT in CP_JWT"
 ! $CAPELLA_KEY || $CP_AUTH || die "--capella-api-key needs a Capella sign-in: --cp-user EMAIL, or a session JWT in CP_JWT"
 ! $INFRA && $SKIP_INFERENCE && die "--inference-only and --skip-inference leave nothing to run"
 ! $INFRA && [[ "$MODE" == fix ]] && die "--inference-only has nothing to fix; use --check"
@@ -631,9 +654,10 @@ gateway_rows() {
 	allowed check || return 0
 	dir=$(mktemp -d "${TMPDIR:-/tmp}/aigw-doctor.XXXXXX") || return 1
 	for r in "$@"; do
-		aws ec2 describe-instances --region "$r" \
+		# A regional endpoint that does not answer fails within seconds, not minutes.
+		AWS_MAX_ATTEMPTS=2 aws ec2 describe-instances --region "$r" --cli-connect-timeout 10 --cli-read-timeout 30 \
 			--filters "Name=tag-value,Values=$id" "Name=instance-state-name,Values=running" \
-			--query 'Reservations[].Instances[].[InstanceId, Tags[?Key==`aws:autoscaling:groupName`]|[0].Value]' \
+			--query 'Reservations[].Instances[].[InstanceId, Tags[?Key==`aws:autoscaling:groupName`]|[0].Value, PublicDnsName, PrivateIpAddress, InstanceType, LaunchTime]' \
 			--output text >"$dir/$r" 2>"$dir/$r.err" || echo failed >"$dir/$r.failed" &
 	done
 	wait
@@ -643,7 +667,10 @@ gateway_rows() {
 			[[ -z "$GATEWAY_ERRS" ]] || printf '%s\t%s\n' "$r" "$(tail -n 1 "$dir/$r.err" | tr '\t' ' ' | cut -c1-200)" >>"$GATEWAY_ERRS"
 			continue
 		fi
-		awk -F'\t' -v p="$AIGW_ASG_PREFIX" -v r="$r" 'index($2, p) == 1 {print r "\t" $1 "\t" $2}' "$dir/$r" 2>/dev/null
+		# region, instance, ASG, public DNS, private IP, type, launch time ("-" where there is none)
+		awk -F'\t' -v p="$AIGW_ASG_PREFIX" -v r="$r" 'index($2, p) == 1 {
+			for (i = 3; i <= 6; i++) if ($i == "" || $i == "None") $i = "-"
+			print r "\t" $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6}' "$dir/$r" 2>/dev/null
 	done
 	rm -rf "$dir"
 }
@@ -685,10 +712,11 @@ echo \"DATA \$(printf '%s' \"\$b\" | cut -c$((part * 20000 + 1))-$(((part + 1) *
 NODE_WHY="" NODE_FILE=""
 step_fetch_config() {
 	step "0b. Fetch the gateway config (--from $FROM)"
-	local rows="" regions n pick row ud key ud_region tmp dest src="" why="" old_umask node_ok=false skipped=0 incomplete=false secret_region
+	local rows="" regions n pick row gw_dns gw_more="" ud key ud_region tmp dest src="" why="" old_umask node_ok=false skipped=0 incomplete=false secret_region
 
 	if ! allowed check; then
-		[[ -n "$AIGW_INSTANCE" ]] || gateway_rows "$FROM_ID" "$($REGION_SET && echo "$REGION" || echo "every-enabled-region")" >/dev/null
+		# shellcheck disable=SC2086
+		[[ -n "$AIGW_INSTANCE" ]] || gateway_rows "$FROM_ID" $($REGION_SET && echo "$REGION" || echo "$FETCH_REGIONS") >/dev/null
 		info "then: with several gateways, ask which one to use (by region)"
 		info "then: read tenantId, region, api and aigwConfigKey from the gateway instance's user data"
 		info "then: aws secretsmanager get-secret-value --secret-id <aigwConfigKey>, else the gateway's config file through SSM"
@@ -699,22 +727,11 @@ step_fetch_config() {
 	fi
 
 	# 1. the tenant's gateways: running instances tagged with the id, in an ASG named
-	# <gateway prefix>..., in --region or else in every enabled region. One line per gateway
-	# (region and ASG); with several, the user picks.
+	# <gateway prefix>..., in --region, else in the default regions (us-east-1 and us-east-2).
+	# One line per gateway (region and ASG); with several, the user picks.
 	if [[ -z "$AIGW_INSTANCE" ]]; then
-		if $REGION_SET; then
-			regions="$REGION"
-		else
-			# Without the list of regions the search would cover one region only and could
-			# pick a gateway there as if it were the only one: stop instead.
-			regions=$(run check aws ec2 describe-regions --region "$REGION" --query 'Regions[].RegionName' --output text) || regions=""
-			regions=$(tr '\t\n' '  ' <<<"$regions")
-			if [[ -z "${regions// /}" ]]; then
-				fail "config: the enabled regions could not be listed (ec2:DescribeRegions in $REGION), so the gateways cannot be searched for"
-				hint "pass --region <the gateway's region> to look in that region only, or refresh the AWS credentials"
-				exit 1
-			fi
-		fi
+		regions="$REGION"
+		$REGION_SET || regions="$FETCH_REGIONS"
 		resp_init
 		GATEWAY_ERRS="$RESP_DIR/gateway-errors"
 		: >"$GATEWAY_ERRS"
@@ -728,13 +745,14 @@ step_fetch_config() {
 				awk -F'\t' '{printf "%s: %s\n", $1, $2}' "$GATEWAY_ERRS" | indent
 				hint "refresh the AWS credentials or pass --region <the gateway's region>"
 			else
-				fail "config: no running ${AIGW_ASG_PREFIX}* instance is tagged $FROM_ID in $($REGION_SET && echo "$REGION" || echo "any enabled region")"
-				hint "check the id and the AWS account (${CALLER:-unknown identity}); or pass --aigw-instance <id> to name the gateway"
+				fail "config: no running ${AIGW_ASG_PREFIX}* instance is tagged $FROM_ID in ${regions// /, }"
+				hint "pass --region <the gateway's region> when it is in another region; check the id and the AWS account (${CALLER:-unknown identity}); or pass --aigw-instance <id> to name the gateway"
 			fi
 			exit 1
 		fi
 		if $LIST_GATEWAYS; then
-			awk -F'\t' '{printf "   GATEWAY %s %s %s\n", $1, $2, $3}' <<<"$rows"
+			# region, instance, ASG, then the details: public DNS, private IP, type, launch time
+			awk -F'\t' '{printf "   GATEWAY %s %s %s %s %s %s %s\n", $1, $2, $3, $4, $5, $6, $7}' <<<"$rows"
 			awk -F'\t' '{printf "   UNSEARCHED %s %s\n", $1, $2}' "$GATEWAY_ERRS"
 			exit 0
 		fi
@@ -749,7 +767,7 @@ step_fetch_config() {
 		pick=1
 		if [[ "$n" -gt 1 ]] || $incomplete; then
 			note "$n AI gateway(s) found tagged $FROM_ID:"
-			awk -F'\t' '{printf "      %d) %-16s %s  %s\n", NR, $1, $3, $2}' <<<"$rows"
+			awk -F'\t' '{printf "      %d) %-16s %s  %s  %s\n", NR, $1, $3, $2, ($4 == "-" ? "no public DNS, " $5 : "https://" $4 ":8081")}' <<<"$rows"
 			if { : >/dev/tty; } 2>/dev/null; then
 				printf '   %s?%s Which one? [1-%s] ' "$YEL" "$RST" "$n" >/dev/tty
 				read -r pick </dev/tty || pick=""
@@ -764,10 +782,12 @@ step_fetch_config() {
 		REGION=$(cut -f1 <<<"$row")
 		AIGW_INSTANCE=$(cut -f2 <<<"$row")
 		AIGW_ASG=$(cut -f3 <<<"$row")
+		gw_dns=$(cut -f4 <<<"$row")
+		gw_more="$([[ "$gw_dns" == - ]] && echo "no public DNS" || echo "https://$gw_dns:8081"), private IP $(cut -f5 <<<"$row"), $(cut -f6 <<<"$row"), started $(cut -f7 <<<"$row")"
 	fi
 	$SM_REGION_SET || SM_REGION="$REGION"
 	AIGW_TARGET=$(target_for "$AIGW_INSTANCE" "$AIGW_SSH" local)
-	pass "gateway: $AIGW_INSTANCE${AIGW_ASG:+ ($AIGW_ASG)} in $REGION"
+	pass "gateway: $AIGW_INSTANCE${AIGW_ASG:+ ($AIGW_ASG)} in $REGION${gw_more:+: $gw_more}"
 
 	# 2. its user data. Only four fields are kept; the certificate and key in it are dropped.
 	ud=$(run check aws ec2 describe-instance-attribute --region "$REGION" --instance-id "$AIGW_INSTANCE" \
@@ -2131,28 +2151,22 @@ cp_session() {
 	info "logged in to $CP_URL as $CP_USER"
 }
 
-step_cp_endpoint() {
-	[[ -z "$AIGW_URL" ]] && $CP_AUTH || return 0
-	$SKIP_INFERENCE && return 0
-	step "7a. Gateway endpoint from the Capella control plane"
-	local org jwt code page last all="[]" endpoints n
-	cp_resolve || return 0
-	org="$CP_ORG"
-	cp_session || return 0
-	jwt="$CP_SESSION"
+# cp_models ORG JWT: the organization's language models from the control plane, as a JSON
+# array in CP_MODELS. Returns 1 (after a FAIL) when they cannot be listed.
+CP_MODELS="[]"
+cp_models() {
+	local org="$1" jwt="$2" code page=1 last=1 all="[]"
 	printf '   %s[check] $ curl -sk %s/v2/organizations/%s/languagemodels?page=1\&perPage=100 -H %s%s\n' \
 		"$DIM" "$CP_URL" "$org" "'Authorization: Bearer <session jwt>'" "$RST" | show check
 	allowed check || return 0
 	resp_init
-
-	page=1 last=1
 	while ((page <= last && page <= 50)); do
 		code=$(curl -sk --max-time 30 -K <(bearer_config "$jwt") -o "$RESP_FILE" -w '%{http_code}' \
 			"$CP_URL/v2/organizations/$org/languagemodels?page=$page&perPage=100")
 		if [[ "$code" != 200 ]]; then
 			fail "control plane: listing language models in org $org returned HTTP $code: $(resp_error)"
 			hint "HTTP 403/404: the org id may be wrong; pass --org-id <the UUID after /organizations/ in the console URL>"
-			return 0
+			return 1
 		fi
 		# Items are wrapped as {"data": {...model...}}; accept unwrapped items too.
 		all=$(jq -s '.[0] + [.[1].data[]? | (.data // .)]' <(printf '%s' "$all") "$RESP_FILE")
@@ -2161,6 +2175,44 @@ step_cp_endpoint() {
 		page=$((page + 1))
 	done
 	: >"$RESP_FILE"
+	CP_MODELS="$all"
+}
+
+# step_list_models (--list-models): the organization's models and the gateway endpoint each
+# region serves them from, read from the Capella control plane alone (no AWS, no config).
+# One "MODEL <region> <status> <endpoint> <id> <name>" line per model, "-" where there is none.
+step_list_models() {
+	step "Models of the organization (Capella control plane)"
+	local n
+	cp_resolve || return 0
+	cp_session || return 0
+	cp_models "$CP_ORG" "$CP_SESSION" || return 0
+	allowed check || return 0
+	n=$(jq 'length' <<<"$CP_MODELS")
+	if [[ "$n" -eq 0 ]]; then
+		fail "control plane: organization $CP_ORG has no language models"
+		hint "deploy a model in the Capella console (AI Services, Models), or check the organization id"
+		return 0
+	fi
+	jq -r '.[] | ["   MODEL", (.modelConfig.cloudConfig.region.name // "-"), (.modelConfig.status // "-" | gsub("\\s"; "_")),
+		(.network.endpoint // "-" | if . == "" then "-" else . end), (.id // .modelConfig.id // "-"),
+		(.modelConfig.modelName // .name // "-")] | join(" ")' <<<"$CP_MODELS"
+	pass "control plane: $n model(s) in $CP_ORG; gateway endpoints: $(jq -r '[.[] | select((.network.endpoint // "") != "") |
+		"\(.modelConfig.cloudConfig.region.name // "?") \(.network.endpoint)"] | unique | join(", ") | if . == "" then "none yet" else . end' <<<"$CP_MODELS")"
+}
+
+step_cp_endpoint() {
+	[[ -z "$AIGW_URL" ]] && $CP_AUTH || return 0
+	$SKIP_INFERENCE && return 0
+	step "7a. Gateway endpoint from the Capella control plane"
+	local org jwt all="[]" endpoints n
+	cp_resolve || return 0
+	org="$CP_ORG"
+	cp_session || return 0
+	jwt="$CP_SESSION"
+	cp_models "$org" "$jwt" || return 0
+	allowed check || return 0
+	all="$CP_MODELS"
 
 	jq -r '.[] | "\(.modelConfig.modelName // .name // "-")  region=\(.modelConfig.cloudConfig.region.name // "-")  status=\(.modelConfig.status // "-")  endpoint=\(.network.endpoint // "-")"' \
 		<<<"$all" | vindent
@@ -3228,6 +3280,10 @@ elif ! $VERBOSE; then
 	note "${DIM}--verbose shows commands and details${RST}"
 fi
 
+if $LIST_MODELS; then
+	step_list_models
+	exit "$FAILED"
+fi
 if $NEED_AWS; then
 	step_aws
 fi

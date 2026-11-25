@@ -274,22 +274,30 @@ function newSandboxLines(body) {
 // fromParts: what "Capella URL or id" names. A console URL carries the organization
 // (?oid=<org id>, or /organizations/<org id>) and gives the control plane (api.<host>); a
 // bare id is looked up as a tag on the gateway's instances. Only the host and id go on.
-function fromParts(raw) {
+function fromParts(raw, tenantId = '') {
   const text = String(raw || '').trim();
   const id = /^[0-9a-fA-F-]{8,64}$/;
   if (id.test(text)) return { arg: text, id: text, cpUrl: '' };
   const m = text.match(/^https:\/\/([\w.-]+)(?::\d+)?(?:[/?#]|$)/);
-  const oid = (text.match(/[?&]oid=([0-9a-fA-F-]{8,64})/) || text.match(/\/organizations\/([0-9a-fA-F-]{8,64})/) || [])[1];
-  if (!m || !oid) throw new Error('enter a Capella console URL that has the organization (…?oid=<org id>), or the organization id');
-  // cloud.couchbase.com and ui.<env>.<domain> (a sandbox console) both have their API at api.
-  const host = m[1].startsWith('api.') ? m[1] : `api.${m[1].replace(/^ui\./, '')}`;
+  // A URL without the organization, such as the Fleet Manager's (https://fm.<env>/), gives
+  // the environment; the Tenant (org) id field then gives the organization.
+  const tenant = String(tenantId || '').trim();
+  const oid = (text.match(/[?&]oid=([0-9a-fA-F-]{8,64})/) || text.match(/\/organizations\/([0-9a-fA-F-]{8,64})/) || [])[1]
+    || (id.test(tenant) ? tenant : '');
+  if (!m) throw new Error('enter a Capella console URL that has the organization (…?oid=<org id>), or the organization id');
+  if (!oid) throw new Error('that URL does not name the organization: use a Capella URL with ?oid=<org id>, or fill in Tenant (org) id');
+  // cloud.couchbase.com, ui.<env>.<domain> (a sandbox console) and fm.<env>.<domain> (its
+  // Fleet Manager) all have their API at api.
+  const host = m[1].startsWith('api.') ? m[1] : `api.${m[1].replace(/^(ui|fm)\./, '')}`;
   return { arg: `https://${m[1]}/?oid=${oid}`, id: oid, cpUrl: `https://${host}/v2/organizations/${oid}` };
 }
 
 // doctor: run the doctor script to the end and resolve to its output lines (no shell).
-function doctor(args, timeout = 180000) {
+// extraEnv carries a secret (CP_PASSWORD) to the script without putting it on a command line.
+function doctor(args, timeout = 180000, extraEnv = null) {
   return new Promise((resolve) => {
-    execFile('bash', [SCRIPT, ...args, '--no-log'], { timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const opts = { timeout, maxBuffer: 4 * 1024 * 1024, ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}) };
+    execFile('bash', [SCRIPT, ...args, '--no-log'], opts, (err, stdout, stderr) => {
       const lines = `${stdout}\n${stderr}`.split('\n').map((l) => l.trim()).filter(Boolean);
       resolve({ ok: !err, lines });
     });
@@ -301,17 +309,22 @@ function doctorError(lines, what) {
   return new Error(said.length ? said.join(' ') : `${what} failed: ${lines.slice(-1)[0] || 'no output'}`);
 }
 
-// findGateways: the AI gateways of a tenant in every enabled region, found by the script
-// with this machine's AWS credentials.
+// findGateways: the AI gateways of a tenant, found by the script with this machine's AWS
+// credentials: in the given region, else in the script's default regions (us-east-1 and
+// us-east-2). Not in every region: that hangs for minutes when one cannot be reached.
 async function findGateways(body) {
-  const from = fromParts(body.from);
+  const from = fromParts(body.from, body.tenantId);
   const region = String(body.region || '').trim();
   if (region && !OPTIONS.region[1].test(region)) throw new Error(`invalid region: ${region}`);
-  const { ok, lines } = await doctor(['--from', from.arg, '--check', '--list-gateways', ...(region ? ['--region', region] : [])]);
+  const { ok, lines } = await doctor(['--from', from.arg, '--check', '--list-gateways', ...(region ? ['--region', region] : [])], 90000);
   if (!ok) throw doctorError(lines, 'the gateway lookup');
+  // GATEWAY <region> <instance> <ASG> [<public DNS> <private IP> <type> <launch time>], "-" where there is none.
   const gateways = lines.flatMap((l) => {
-    const m = l.match(/^GATEWAY (\S+) (i-[0-9a-f]+) (\S+)$/);
-    return m ? [{ region: m[1], instance: m[2], asg: m[3] }] : [];
+    const m = l.match(/^GATEWAY (\S+) (i-[0-9a-f]+) (\S+)(?: (\S+) (\S+) (\S+) (\S+))?$/);
+    if (!m) return [];
+    const val = (v) => (v && v !== '-' ? v : '');
+    const dns = /^[\w.-]+$/.test(val(m[4])) ? m[4] : '';
+    return [{ region: m[1], instance: m[2], asg: m[3], url: dns ? `https://${dns}:8081` : '', privateIp: val(m[5]), type: val(m[6]), launched: val(m[7]) }];
   });
   // Regions the lookup could not search (no permission there, throttling): the list may be incomplete.
   const unsearched = lines.flatMap((l) => {
@@ -321,10 +334,46 @@ async function findGateways(body) {
   return { id: from.id, cpUrl: from.cpUrl, gateways, unsearched };
 }
 
+// findModels: the second way to find a tenant's gateways: its models, from the Capella
+// control plane (AI Services, Models), with the gateway endpoint each region serves them
+// from. It needs a Capella sign-in: the login and password typed in the form, else CP_USER
+// and CP_PASSWORD from .env. The password goes to the script in its environment only.
+async function findModels(body) {
+  const env = readEnv();
+  const typedCp = String(body.cpUrl || '').trim().replace(/\/+$/, '');
+  if (typedCp && !OPTIONS.cpUrl[1].test(typedCp)) throw new Error('invalid Control plane URL');
+  const from = fromParts(body.from, body.tenantId);
+  const cpUrl = typedCp || from.cpUrl;
+  if (!cpUrl) throw new Error('an organization id alone does not name the Capella environment: paste a Capella URL, or fill in Control plane URL');
+  const user = String(body.cpUser || '').trim() || envValue(env, '', 'CP_USER');
+  const password = (typeof body.cpPassword === 'string' && body.cpPassword) || envValue(env, '', 'CP_PASSWORD');
+  if (!user || !password) {
+    throw new Error(`the Capella lookup needs the Capella login and password: ${!user ? 'type the login (email)' : 'type the password'}, or set CP_USER and CP_PASSWORD in .env`);
+  }
+  if (!OPTIONS.cpUser[1].test(user)) throw new Error('the Capella login must be an email address');
+  const { ok, lines } = await doctor(['--list-models', '--check', '--cp-url', cpUrl, '--org-id', from.id, '--cp-user', user], 90000, { CP_PASSWORD: password });
+  if (!ok) throw doctorError(lines, 'the Capella lookup');
+  // MODEL <region> <status> <endpoint> <id> <name>, "-" where there is none.
+  const models = lines.flatMap((l) => {
+    const m = l.match(/^MODEL (\S+) (\S+) (\S+) (\S+) (.+)$/);
+    const val = (v) => (v !== '-' ? v : '');
+    return m ? [{ region: val(m[1]), status: val(m[2]), endpoint: /^https?:\/\/[\w.:/-]+$/.test(m[3]) ? m[3] : '', id: val(m[4]), name: m[5] }] : [];
+  });
+  // One gateway per region and endpoint, with the models it serves.
+  const byKey = new Map();
+  for (const m of models) {
+    if (!m.region) continue;
+    const key = `${m.region} ${m.endpoint}`;
+    if (!byKey.has(key)) byKey.set(key, { region: m.region, url: m.endpoint, models: [] });
+    byKey.get(key).models.push({ name: m.name, status: m.status });
+  }
+  return { id: from.id, cpUrl, user, models, gateways: [...byKey.values()].sort((a, b) => a.region.localeCompare(b.region)) };
+}
+
 // addFetchedSandbox: add a sandbox whose config the script fetches from AWS: from the
 // secret named in the gateway's user data, else from the gateway's live config file.
 async function addFetchedSandbox(body) {
-  const from = fromParts(body.from);
+  const from = fromParts(body.from, body.tenantId);
   const region = String(body.gatewayRegion || '').trim();
   const instance = String(body.gatewayInstance || '').trim();
   if (!OPTIONS.region[1].test(region) || !/^i-[0-9a-f]{8,17}$/.test(instance)) throw new Error('find the gateways first and pick one');
@@ -1990,6 +2039,14 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, saveSettings(await readJson(req)));
     } catch (err) {
       return send(res, 400, { error: err.message });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/models') {
+    try {
+      return send(res, 200, await findModels(await readJson(req)));
+    } catch (err) {
+      return send(res, err.status || 400, { error: err.message });
     }
   }
 

@@ -983,6 +983,7 @@ function showAdd(show) {
     setGateways([]);
     foundFor = '';
     autoFilled = {};
+    $('add-models').hidden = true;
     $('add-find-msg').textContent = FIND_HINT;
     $('add-error').textContent = '';
     updateAddVisibility();
@@ -1018,6 +1019,7 @@ function setGateways(list) {
   const select = $('add-gateway');
   select.replaceChildren(...list.map((g, i) => el('option', { value: String(i) }, `${g.region}  ·  ${g.asg}  ·  ${g.instance}`)));
   $('add-gateway-label').hidden = list.length === 0;
+  showGatewayDetails();
 }
 
 // findGateways: look up the organization's gateways; fills region, tenant id and control
@@ -1029,11 +1031,15 @@ async function findGateways() {
     msg.textContent = 'Paste the Capella URL of the organization (it has ?oid=<org id>), or the organization id.';
     return null;
   }
+  // The Region field narrows the search. A value the last lookup filled in is not a choice
+  // of the user's, so it does not narrow the next one. Without it: us-east-1 and us-east-2.
+  const typed = addForm.elements.region.value.trim();
+  const region = typed && typed !== autoFilled.region ? typed : '';
   $('add-find').disabled = true;
-  msg.textContent = 'Looking for AI gateways in every AWS region…';
+  msg.textContent = `Looking for AI gateways in ${region || 'us-east-1 and us-east-2'}…`;
   let resp; let data;
   try {
-    resp = await fetch('/api/gateways', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from }) });
+    resp = await fetch('/api/gateways', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from, region, tenantId: addForm.elements.tenantId.value.trim() }) });
     data = await resp.json();
   } catch (err) {
     data = { error: err.message };
@@ -1060,19 +1066,86 @@ async function findGateways() {
   syncGatewayRegion();
   const missed = (data.unsearched || []).map((u) => u.region).join(', ');
   msg.textContent = (data.gateways.length === 1 ? 'Found one AI gateway.' : `Found ${data.gateways.length} AI gateways: pick the one for this sandbox.`)
+    + (region ? '' : ' Searched us-east-1 and us-east-2; for another region, type it in Region and search again.')
     + (missed ? ` Could not search ${missed}, so the list may be incomplete.` : '');
   updateAddVisibility();
   return data.gateways;
 }
 
+// showGatewayDetails: the picked gateway's URL and instance details, under the list.
+function showGatewayDetails() {
+  const g = foundGateways[Number($('add-gateway').value)];
+  const box = $('add-gateway-details');
+  box.hidden = !g;
+  if (!g) return;
+  const started = g.launched ? new Date(g.launched) : null;
+  box.replaceChildren(
+    el('div', {}, el('strong', {}, 'Gateway URL: '), g.url || 'no public DNS name (reached through its load balancer)'),
+    el('div', {}, [`Instance ${g.instance}`, g.type, g.privateIp && `private IP ${g.privateIp}`,
+      started && !Number.isNaN(started.getTime()) && `started ${started.toLocaleString()}`].filter(Boolean).join('  ·  ')),
+    el('div', {}, `Auto Scaling group ${g.asg}  ·  ${g.region}`));
+}
+
 function syncGatewayRegion() {
+  showGatewayDetails();
   const g = foundGateways[Number($('add-gateway').value)];
   if (g) {
     addForm.elements.region.value = g.region;
     autoFilled.region = g.region;
   }
 }
+// findThroughCapella: the second way to find the gateways: the organization's models from
+// the Capella control plane, with the gateway URL of each region. It needs the Capella login
+// and password (typed, or CP_USER and CP_PASSWORD from .env). The AWS instance, which the
+// config fetch needs, is then looked up in the region the models are served from.
+async function findThroughCapella() {
+  const f = addForm.elements;
+  const msg = $('add-find-msg');
+  const box = $('add-models');
+  const from = f.from.value.trim();
+  if (!from) {
+    msg.textContent = 'Paste the Capella URL of the organization (it has ?oid=<org id>) first.';
+    return;
+  }
+  $('add-find-cp').disabled = true;
+  msg.textContent = 'Signing in to Capella and listing the organization\'s models…';
+  let resp; let data;
+  try {
+    resp = await fetch('/api/models', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, tenantId: f.tenantId.value.trim(), cpUrl: f.cpUrl.value.trim(), cpUser: f.cpUser.value.trim(), cpPassword: f.cpPassword.value }),
+    });
+    data = await resp.json();
+  } catch (err) {
+    data = { error: err.message };
+  }
+  $('add-find-cp').disabled = false;
+  if (!resp?.ok) {
+    box.hidden = true;
+    msg.textContent = data.error || 'the Capella lookup failed';
+    return;
+  }
+  box.hidden = false;
+  box.replaceChildren(
+    el('div', {}, el('strong', {}, `${data.models.length} model(s) in Capella, signed in as ${data.user}`)),
+    ...data.gateways.map((g) => el('div', {},
+      el('strong', {}, `${g.region}: `), g.url || 'no gateway URL yet',
+      el('div', {}, g.models.map((m) => (m.status ? `${m.name} (${m.status})` : m.name)).join(', ')))));
+  if (!f.cpUrl.value.trim()) f.cpUrl.value = data.cpUrl;
+  if (!f.tenantId.value.trim()) f.tenantId.value = data.id;
+  // The models say where the gateway runs: look for its instance there.
+  const regions = [...new Set(data.gateways.map((g) => g.region))];
+  if (regions.length === 1) {
+    f.region.value = regions[0];
+    autoFilled.region = ''; // a region to search, as if typed
+  } else if (regions.some((r) => r !== 'us-east-1' && r !== 'us-east-2')) {
+    msg.textContent = `Models are served in ${regions.join(', ')}. Type the Region of the gateway you want and press Find gateways.`;
+    return;
+  }
+  await findGateways();
+}
 $('add-find').addEventListener('click', findGateways);
+$('add-find-cp').addEventListener('click', findThroughCapella);
 $('add-gateway').addEventListener('change', syncGatewayRegion);
 
 $('add-btn').addEventListener('click', () => showAdd(true));
